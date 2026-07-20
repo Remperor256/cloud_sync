@@ -43,6 +43,11 @@ from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
 from flask import Flask, request, jsonify, session, send_file, Response, g
 import base64
 
+# Created here (rather than further down) because some decorators/routes
+# below (e.g. @app.before_request for the CLOUD_MODE gate) reference `app`
+# before the file reaches the "Flask app + REST API" section.
+app = Flask(__name__)
+
 try:
     import qrcode
     QRCODE_OK = True
@@ -1298,7 +1303,8 @@ def get_watchlist_tenants(tenants, max_days=10):
 # =========================================================================
 #  SECTION 2 -- Flask app + REST API
 # =========================================================================
-app = Flask(__name__)
+# (app itself is created near the top of the file, before the CLOUD_MODE
+# gate's @app.before_request decorator needs it)
 
 # ── device roster + secret key persistence ─────────────────────────────
 # Everything about "who is paired" used to live only in this process's
