@@ -1762,8 +1762,8 @@ WAITING_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, viewport-fit=cover">
 <title>Tenant Management</title>
 <meta name="theme-color" content="#0E4F4F">
-<link rel="icon" href="/icon-192.png">
-<link rel="apple-touch-icon" href="/icon-256.png">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-256.png">
 <style>
   html,body{margin:0;padding:0;background:#0E4F4F;color:#fff;font-family:-apple-system,'Segoe UI',Inter,sans-serif;}
   .wrap{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;}
@@ -1829,15 +1829,21 @@ def manifest():
         "name": "Tenant Management",
         "short_name": "Tenant Management",
         "description": "Manage tenants, payments, and units on the go.",
-        "start_url": "/",
-        "scope": "/",
+        # Relative, not "/": per the manifest spec these all resolve
+        # against the manifest's OWN url, not the page's. Root-absolute
+        # values here used to make "Add to Home Screen" installs launch at
+        # the relay's bare domain root instead of back into this session's
+        # "/s/<session_id>/" tunnel -- breaking the installed icon the
+        # moment it was opened away from the PC's own LAN.
+        "start_url": ".",
+        "scope": ".",
         "display": "standalone",
         "orientation": "portrait",
         "background_color": "#0E4F4F",
         "theme_color": "#0E4F4F",
         "icons": [
-            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
-            {"src": "/icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any maskable"},
+            {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any maskable"},
         ],
     })
 
@@ -1850,7 +1856,10 @@ def service_worker():
     # the whole app, not just its own folder.
     js = """
 const CACHE = 'rental-app-shell-v4';
-const SHELL_URLS = ['/', '/manifest.json', '/icon-192.png'];
+// Relative, not root-absolute: resolved against this script's own URL, so
+// these correctly point at "…/s/<session_id>/…" when this worker was
+// registered from a relay-tunneled page, and at "/…" on LAN like before.
+const SHELL_URLS = ['./', './manifest.json', './icon-192.png'];
 
 self.addEventListener('install', (evt) => {
   self.skipWaiting();
@@ -1867,10 +1876,12 @@ self.addEventListener('activate', (evt) => {
 
 self.addEventListener('fetch', (evt) => {
   const url = new URL(evt.request.url);
-  if (url.pathname.startsWith('/api/')) return; // the app's own api() layer
-                                                   // below already caches and
-                                                   // handles offline for
-                                                   // these -- see CACHE_KEY
+  // .includes, not .startsWith: under the relay, the real request path is
+  // "/s/<session_id>/api/…", not "/api/…" -- a startsWith check here would
+  // miss every API call and let this shell-caching logic run on live
+  // tenant data instead of skipping it (the app's own api() layer already
+  // caches and handles offline for these -- see CACHE_KEY).
+  if (url.pathname.includes('/api/')) return;
 
   // Network-first for the app shell: whenever the phone can reach the PC,
   // it always gets whatever HTML/JS is currently running there, so edits
@@ -1892,8 +1903,8 @@ self.addEventListener('fetch', (evt) => {
         // app isn't connected" gateway page (PC off, no internet on
         // that end) or our own not-yet-paired waiting page. Prefer the
         // last cached shell if there is one, so the app still opens.
-        return caches.match(evt.request).then((cached) => cached || caches.match('/') || resp);
-      }).catch(() => caches.match(evt.request).then((cached) => cached || caches.match('/')))
+        return caches.match(evt.request).then((cached) => cached || caches.match(self.registration.scope) || resp);
+      }).catch(() => caches.match(evt.request).then((cached) => cached || caches.match(self.registration.scope)))
     );
   }
 });
@@ -2777,10 +2788,10 @@ INDEX_HTML = """<!DOCTYPE html>
      desktop browser (Chrome/Edge install icon, Safari "Add to Home
      Screen") so it launches full-screen with its own icon, for easy
      repeat access without re-typing the LAN address each time. -->
-<link rel="manifest" href="/manifest.json">
+<link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#0E4F4F">
-<link rel="icon" href="/icon-192.png">
-<link rel="apple-touch-icon" href="/icon-256.png">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-256.png">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -3521,7 +3532,18 @@ async function flushQueue() {
 // Settings button instead of only appearing as a small address-bar icon.
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(()=>{});
+    // Relative, not '/sw.js': when this page was loaded through the cloud
+    // relay, the document's own URL is "…/s/<session_id>/", so a relative
+    // registration resolves to "…/s/<session_id>/sw.js" -- which the relay
+    // correctly tunnels through to the desktop app's /sw.js route, with a
+    // scope of "…/s/<session_id>/" to match. An absolute '/sw.js' would
+    // instead hit the relay server's own root, which has no such route,
+    // 404 silently (.catch swallows it), and leave this phone with NO
+    // service worker at all -- no offline cache, no fallback shell, just
+    // a raw "Desktop app is not connected" page on every refresh while
+    // the PC/relay is down. This one line is what the SHELL_URLS /
+    // fetch-handler machinery below actually depends on being installed.
+    navigator.serviceWorker.register('sw.js').catch(()=>{});
   });
 }
 let deferredInstallPrompt = null;
@@ -3645,6 +3667,40 @@ async function api(path, opts={}) {
       if (cached !== undefined) return cached;
       return { error: 'not_found' };
     }
+
+    // ── Cloud-first ──────────────────────────────────────────────────
+    // Reads are served from the cloud database whenever it's reachable,
+    // full stop -- not just as a fallback once the PC/relay fails. The
+    // PC is what WRITES into the cloud after every local save, so this
+    // is never more than one save cycle stale, and it means data loads
+    // consistently regardless of whether the PC happens to be awake or
+    // the relay tunnel happens to be up at this exact moment. Every
+    // successful read here refreshes the local cache too, so the app
+    // still has something to show even with no connectivity at all.
+    //
+    // loadCloudConfig() otherwise only ever ran once, at boot() -- if
+    // that single attempt missed (PC/relay briefly unreachable at that
+    // exact moment), cloudCfg stayed unconfigured for the whole session.
+    // Retrying it here, every time it's missing, means a later reconnect
+    // to the PC actually gets picked up instead of needing a reload.
+    if (!cloudCfg || !cloudCfg.configured) {
+      await loadCloudConfig();
+    }
+    if (cloudCfg && cloudCfg.configured) {
+      try {
+        const cloudData = await cloudFetch(path);
+        if (cloudData && cloudData.ok !== false) {
+          cacheSet(path, cloudData);
+          return cloudData;
+        }
+      } catch (e) { /* cloud unreachable right now -- fall back to the PC/relay below */ }
+    }
+
+    // ── PC / relay fallback ─────────────────────────────────────────
+    // Only reached when the cloud isn't configured yet or isn't
+    // reachable right now. Still responsible for the isOnline flag --
+    // that badge specifically tracks "is the PC reachable", which is
+    // exactly what pingServer() also polls independently every 6s.
     try {
       const res = await fetchTimeout(path, {headers:{'Content-Type':'application/json','X-Device-Id':DEVICE_ID}, ...opts}, 4000);
       if (res.status === 401) { showLock(); throw new Error('locked'); }
@@ -3677,15 +3733,6 @@ async function api(path, opts={}) {
     } catch (err) {
       if (err && (err.message === 'locked' || err.message === 'device_limit' || err.message === 'kicked' || err.message === 'pending_approval')) throw err;
       setOnline(false);
-      if (cloudCfg && cloudCfg.configured) {
-        try {
-          const cloudData = await cloudFetch(path);
-          if (cloudData && cloudData.ok !== false) {
-            cacheSet(path, cloudData);
-            return cloudData;
-          }
-        } catch (e2) { /* cloud unreachable too -- fall through to local cache */ }
-      }
       const cached = cacheGet(path);
       if (cached !== undefined) return cached;
       return offlineDefaultFor(path);
@@ -3721,6 +3768,9 @@ async function api(path, opts={}) {
   } catch (err) {
     if (err && (err.message === 'locked' || err.message === 'device_limit' || err.message === 'kicked' || err.message === 'pending_approval')) throw err;
     setOnline(false);
+    if (!cloudCfg || !cloudCfg.configured) {
+      await loadCloudConfig();
+    }
     if (cloudCfg && cloudCfg.configured) {
       try {
         const cloudData = await cloudFetch(path, { method, body: opts.body });
@@ -4513,8 +4563,8 @@ async function renderSettings() {
     </div>
     <div class="section-title">Reports</div>
     <div class="card">
-      <a class="linklike" href="/api/export/excel">⬇ Download Excel (.xlsx)</a><br><br>
-      <a class="linklike" href="/api/export/pdf">⬇ Download PDF Report</a>
+      <a class="linklike" href="api/export/excel">⬇ Download Excel (.xlsx)</a><br><br>
+      <a class="linklike" href="api/export/pdf">⬇ Download PDF Report</a>
     </div>
     <div class="section-title">About</div>
     <div class="card sub" style="color:var(--muted);font-size:12.5px;">
@@ -4566,7 +4616,7 @@ async function generateMonthlyReport() {
         <div><b style="color:var(--danger);">${fmt(report.grand_cancelled)}</b><div style="color:var(--muted);">Cancelled</div></div>
       </div>
       ${rowsHtml}
-      <a class="linklike" style="display:block;margin-top:12px;" href="/api/export/monthly-excel?year=${year}&month=${month}">⬇ Download Monthly Excel (.xlsx)</a>
+      <a class="linklike" style="display:block;margin-top:12px;" href="api/export/monthly-excel?year=${year}&month=${month}">⬇ Download Monthly Excel (.xlsx)</a>
     `;
   } catch (e) {
     box.innerHTML = `<div class="sub" style="color:var(--danger);">Couldn't generate the report — check the connection and try again.</div>`;
