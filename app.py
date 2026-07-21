@@ -1431,8 +1431,25 @@ def _pairing_ok(device_id=""):
     """True if this request may load the app shell -- see the module
     comment above. Consumes the active token on a successful match so it
     can never work a second time for anyone else it gets forwarded to."""
+    # The session cookie alone used to be enough to short-circuit
+    # everything below and return True. That silently broke reconnection:
+    # once a device is kicked, its browser still holds the old (up to
+    # 180-day) "paired" session cookie from before the kick, so the very
+    # first check here returned True and the request never got anywhere
+    # near the token match / _readmit_device() below -- meaning a rescanned
+    # QR code's token was never even inspected, let alone consumed, and the
+    # kicked flag could never clear. known_device_id remembers which
+    # device this session belongs to (see the two places below that set
+    # session["device_id"]) so a kicked session can be told apart from a
+    # legitimately-still-paired one, even on a plain top-level navigation
+    # that carries no X-Device-Id header at all.
+    known_device_id = device_id or session.get("device_id", "")
     if session.get("paired"):
-        return True
+        if not (known_device_id and _device_was_kicked(known_device_id)):
+            return True
+        # Falls through to the token check below instead of returning --
+        # this is what lets a rescanned QR code actually re-admit a kicked
+        # device rather than looping forever on the stale cookie.
     if device_id and _device_known(device_id):
         # Recognized via X-Device-Id (e.g. the waiting page's background
         # retry, or an /api/ call) rather than the one-time token. Set the
@@ -1441,6 +1458,7 @@ def _pairing_ok(device_id=""):
         # via session.get("paired") above instead of falling through to
         # the waiting page again.
         session["paired"] = True
+        session["device_id"] = device_id
         session.permanent = True
         return True
     token = request.args.get("pt", "")
@@ -1452,8 +1470,15 @@ def _pairing_ok(device_id=""):
     if matched:
         session["paired"] = True
         session.permanent = True
-        if device_id:
-            _readmit_device(device_id)
+        # A rescan's top-level navigation never carries X-Device-Id
+        # (browsers don't attach custom headers to plain navigations), so
+        # device_id is usually empty right here -- fall back to what this
+        # session already remembers about itself so the SAME kicked device
+        # gets un-kicked instead of silently doing nothing.
+        readmit_id = device_id or known_device_id
+        if readmit_id:
+            session["device_id"] = readmit_id
+            _readmit_device(readmit_id)
     return matched
 
 
