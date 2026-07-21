@@ -252,6 +252,19 @@ def _cloud_gate():
     if not CLOUD_MODE:
         return None
 
+    if request.method == "OPTIONS":
+        # A browser's CORS preflight for a genuine cross-origin request
+        # (see cloudFetch() in the companion's JS -- the page is loaded
+        # from the desktop's LAN/relay origin, but this fallback talks
+        # straight to THIS service's own origin) never carries the real
+        # X-Session-Id/X-Secret-Key headers, only lists them in
+        # Access-Control-Request-Headers. Gating this like a normal
+        # request would 401 the preflight itself, which makes the
+        # browser block the real request entirely -- silently, with no
+        # visible error, just a fall-through to stale local cache. Let
+        # it through here; _cors_headers below decorates the response.
+        return None
+
     path = request.path
     pc_only_prefixes = (
         "/api/lock-status", "/api/device-count", "/api/devices",
@@ -290,6 +303,27 @@ def _cloud_gate():
         return jsonify({"ok": False, "error": "bad_secret"}), 403
     g.session_id, g.secret_key = session_id, secret_key
     return None
+
+
+@app.after_request
+def _cors_headers(resp):
+    """CLOUD_MODE only: cloudFetch() in the companion's JS is a genuine
+    cross-origin request -- the page is loaded from the desktop's
+    LAN/relay origin, but this fallback fetch goes straight to this
+    cloud service's own origin so it keeps working once the PC/relay is
+    unreachable. Without these headers the browser silently blocks it
+    (no visible error -- api() just falls through to a stale local
+    cache), which is exactly the "shows old data instead of live cloud
+    data while offline" symptom this fixes. A wildcard origin is safe
+    here: these routes authenticate via the explicit X-Session-Id /
+    X-Secret-Key headers above, never via cookies, so there's no
+    session/cookie for a hostile origin to ride along on."""
+    if CLOUD_MODE:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id")
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return resp
 
 
 # ── low level helpers ───────────────────────────────────────────────────
@@ -1400,6 +1434,14 @@ def _pairing_ok(device_id=""):
     if session.get("paired"):
         return True
     if device_id and _device_known(device_id):
+        # Recognized via X-Device-Id (e.g. the waiting page's background
+        # retry, or an /api/ call) rather than the one-time token. Set the
+        # session cookie here too, so the NEXT plain top-level navigation
+        # (which can't carry the X-Device-Id header at all) is recognized
+        # via session.get("paired") above instead of falling through to
+        # the waiting page again.
+        session["paired"] = True
+        session.permanent = True
         return True
     token = request.args.get("pt", "")
     with _pairing_lock:
