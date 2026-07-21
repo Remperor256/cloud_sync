@@ -1452,7 +1452,33 @@ def _pairing_ok(device_id=""):
     if matched:
         session["paired"] = True
         session.permanent = True
+        if device_id:
+            _readmit_device(device_id)
     return matched
+
+
+def _readmit_device(device_id):
+    """Clears a device's 'kicked' flag if -- and only if -- it just
+    matched a fresh, valid, single-use pairing token (see the caller
+    above): that can only happen because the desktop app explicitly
+    showed a new QR code and this device scanned it, i.e. an admin
+    re-invited it. Nothing else (a lingering session cookie, a replayed
+    /api/ call, the device's own retry loop) can undo a kick this way --
+    without this, a disconnected device stayed blocked forever even
+    after scanning a brand-new code, since nothing else ever cleared the
+    flag. Still respects MAX_DEVICES: if the cap is already full, it
+    stays kicked until a slot is freed."""
+    import time
+    with _devices_lock:
+        devices = _devices_dict()
+        rec = devices.get(device_id)
+        if rec is None or not rec.get("kicked"):
+            return
+        if sum(1 for r in devices.values() if not r.get("kicked")) >= MAX_DEVICES:
+            return
+        rec["kicked"] = False
+        rec["last_seen"] = time.time()
+        _save_devices_locked()
 
 # Tracks which phones/browsers have ever paired with this app, persisted
 # to disk (DEVICES_FILE) so the roster survives the companion process
