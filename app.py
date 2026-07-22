@@ -275,17 +275,16 @@ def _cloud_gate():
     )
     if path.startswith(pc_only_prefixes):
         return Response("", status=404, mimetype="text/plain")
-    # NOTE: the PWA shell (/, /manifest.json, /sw.js, /icon-*) used to be
-    # 404'd here in CLOUD_MODE, on the assumption the phone would only
-    # ever load the app through the PC/relay tunnel and fall back to the
-    # cloud for data only. That's exactly the dependency this fix
-    # removes: these routes now fall through to their normal handlers
-    # below in both modes, so a phone that has this service's own URL
-    # can load the entire app -- shell included -- with the PC fully
-    # off. They contain no tenant data (that's still only ever served
-    # from /api/* behind the session/secret check below), so serving
-    # them with no auth here is no different from serving sw.js/manifest
-    # unauthenticated in PC mode already.
+    if path in ("/manifest.json", "/sw.js") or path.startswith("/icon-"):
+        # These carry no tenant data, so there's nothing to gate -- let
+        # their own routes below answer regardless of mode.
+        return None
+    if path == "/":
+        # Handled entirely by index() below (it checks ?sid=&key= itself
+        # in CLOUD_MODE), so a phone that scanned the direct-cloud QR code
+        # (see get_direct_cloud_pairing_url()) can load the app shell
+        # straight from this service with no PC/relay involved.
+        return None
 
     if not path.startswith("/api/"):
         return None
@@ -329,26 +328,6 @@ def _cors_headers(resp):
         resp.headers["Access-Control-Allow-Headers"] = (
             "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id")
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    return resp
-
-
-@app.after_request
-def _no_cache_headers(resp):
-    """Every /api/* response is live tenant data and must never be reused
-    from any cache -- the phone's own HTTP cache, a carrier/transparent
-    proxy sitting between the phone and Render, or Render's own edge.
-    Without these headers a GET request can be served stale even though
-    the JS fetch logic asked for fresh data (fetch()'s default cache mode
-    still consults/writes the HTTP cache). This is intentionally on
-    every /api/* response including PUT/POST/DELETE, so error/edit
-    responses aren't cached either. `Vary: *` additionally stops any
-    CDN in front of the Render service from serving one session's
-    cached response to a different X-Session-Id/X-Secret-Key."""
-    if request.path.startswith("/api/"):
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        resp.headers["Pragma"] = "no-cache"
-        resp.headers["Expires"] = "0"
-        resp.headers["Vary"] = "*"
     return resp
 
 
@@ -1823,7 +1802,28 @@ WAITING_HTML = """<!DOCTYPE html>
 # ── page ─────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    if not CLOUD_MODE and not _pairing_ok(request.headers.get("X-Device-Id", "")):
+    if CLOUD_MODE:
+        # No PC/relay involved at all here -- this is the pure "Scan once
+        # for cloud access" QR code (get_direct_cloud_pairing_url()). The
+        # link itself, not a cookie or device roster, is the credential:
+        # anyone with the sid+key can load the app, same as anyone with
+        # the old relay QR code could. Missing or wrong values get the
+        # same bare 404 the rest of this service already gives out for
+        # anything unauthenticated, so a forwarded/guessed link can't even
+        # tell this is a rental-management app.
+        session_id = request.args.get("sid", "")
+        secret_key = request.args.get("key", "")
+        row = _cloud_get_row(session_id) if session_id else None
+        if not session_id or not secret_key or not row or row["secret_key"] != secret_key:
+            return Response("", status=404, mimetype="text/plain")
+        bootstrap = (
+            "<script>window.__CLOUD_DIRECT__=" + json.dumps({
+                "sessionId": session_id, "secretKey": secret_key,
+            }) + ";</script>\n"
+        )
+        html = INDEX_HTML.replace("<head>", "<head>\n" + bootstrap, 1)
+        return Response(html, mimetype="text/html")
+    if not _pairing_ok(request.headers.get("X-Device-Id", "")):
         # No token, a stale/wrong one, or one already used once -- this
         # used to be a totally bare, unlabelled 404 so a forwarded/copied
         # link couldn't even tell this was a rental-management app. That
@@ -1834,15 +1834,7 @@ def index():
         # Tenant Management name/icon instead of the bare link, and
         # quietly retries in the background until it's admitted.
         return Response(WAITING_HTML, status=404, mimetype="text/html")
-    resp = Response(INDEX_HTML, mimetype="text/html")
-    # The service worker (sw.js) is what keeps the shell fresh (network-first,
-    # see below) -- but that only helps once it's installed. Until then (or on
-    # browsers where installation failed/was skipped) mobile Safari especially
-    # will happily cache this raw HTML GET with no explicit signal telling it
-    # not to, which is how a phone can keep opening an old build of the app.
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    return resp
+    return Response(INDEX_HTML, mimetype="text/html")
 
 
 # ── PWA: manifest, service worker, icon ───────────────────────────────────
@@ -1889,7 +1881,7 @@ def service_worker():
     # served stale. Scope is "/" via the header below so it can control
     # the whole app, not just its own folder.
     js = """
-const CACHE = 'rental-app-shell-v5';
+const CACHE = 'rental-app-shell-v4';
 // Relative, not root-absolute: resolved against this script's own URL, so
 // these correctly point at "…/s/<session_id>/…" when this worker was
 // registered from a relay-tunneled page, and at "/…" on LAN like before.
@@ -1944,9 +1936,7 @@ self.addEventListener('fetch', (evt) => {
 });
 """
     return Response(js, mimetype="application/javascript",
-                     headers={"Service-Worker-Allowed": "/",
-                               "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                               "Pragma": "no-cache"})
+                     headers={"Service-Worker-Allowed": "/"})
 
 
 # ── cloud durability / sync ─────────────────────────────────────────────
@@ -3244,30 +3234,6 @@ function loadCache() { try { return JSON.parse(localStorage.getItem(CACHE_KEY)) 
 function saveCache(c) { try { localStorage.setItem(CACHE_KEY, JSON.stringify(c)); } catch(e) {} }
 function cacheGet(path) { return loadCache()[path]; }
 function cacheSet(path, data) { const c = loadCache(); c[path] = data; saveCache(c); }
-
-// One-time manual escape hatch for a phone that's already stuck showing
-// old data from before this fix: wipes the localStorage snapshot cache
-// this app writes (CACHE_KEY), every Cache Storage bucket any past
-// service-worker version left behind, and unregisters+re-registers the
-// service worker so the next load re-installs sw.js fresh. Bind this to
-// a button, or run window.__hardRefreshApp() from the phone browser's
-// address bar / a bookmarklet once, then reload the page.
-window.__hardRefreshApp = async function () {
-  try { localStorage.removeItem(CACHE_KEY); } catch (e) {}
-  try {
-    if ('caches' in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.map((k) => caches.delete(k)));
-    }
-  } catch (e) {}
-  try {
-    if ('serviceWorker' in navigator) {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
-    }
-  } catch (e) {}
-  location.reload();
-};
 function cacheDeletePrefix(prefix) {
   const c = loadCache();
   Object.keys(c).forEach(k => { if (k.indexOf(prefix) === 0) delete c[k]; });
@@ -3449,33 +3415,18 @@ async function fetchTimeout(path, opts={}, ms=4000) {
   // here once means every request tags along the model-guessing hint
   // without having to touch every fetchTimeout(...) call individually.
   const headers = { ...(opts.headers || {}), 'X-Device-Screen': DEVICE_SCREEN_HINT };
-  // Default every request to cache:'no-store' unless a call site
-  // explicitly overrides it. Previously only the /api/lock-status call
-  // set this, so every other GET (dashboard, tenants, units, cloud
-  // fetches, ...) went through with the browser's default cache mode,
-  // which still allows a phone's HTTP cache (or a carrier/transparent
-  // proxy) to hand back an old response without ever reaching this
-  // function's fetch() call at all. Combined with the server's new
-  // Cache-Control: no-store headers, this closes both ends.
-  const cache = opts.cache || 'no-store';
-  // Belt-and-suspenders: append a cache-busting query param to GET
-  // requests too, since some carrier-network transparent caching
-  // proxies on mobile data ignore Cache-Control/Pragma entirely but do
-  // key on the URL. Harmless no-op for the server, which ignores
-  // unknown query params.
-  const method = (opts.method || 'GET').toUpperCase();
-  const bustedUrl = (method === 'GET')
-    ? url + (url.includes('?') ? '&' : '?') + '_=' + Date.now()
-    : url;
+  if (CLOUD_DIRECT && path.charAt(0) === '/' && path.indexOf('/api/') === 0) {
+    headers['X-Session-Id'] = CLOUD_DIRECT.sessionId;
+    headers['X-Secret-Key'] = CLOUD_DIRECT.secretKey;
+  }
   try {
-    return await fetch(bustedUrl, {...opts, headers, cache, signal: ctrl.signal});
+    return await fetch(url, {...opts, headers, signal: ctrl.signal});
   } finally {
     clearTimeout(timer);
   }
 }
 
 async function pingServer() {
-  if (DIRECT_CLOUD_PAIR) { setOnline(true); return true; }
   try {
     const res = await fetchTimeout('/api/lock-status',
       {cache:'no-store', headers: {'X-Device-Id': DEVICE_ID}}, 3500);
@@ -3699,52 +3650,27 @@ function offlineDefaultFor(path) {
 }
 
 // ── cloud fallback (works even with the PC fully off) ─────────────────
-// Two ways cloudCfg gets populated, in priority order:
-//
-// 1) DIRECT CLOUD PAIRING -- the phone's URL IS this cloud service's own
-//    URL (e.g. https://<app>.onrender.com/?sid=...&key=...), scanned once
-//    from a QR code the desktop app generates from its already-existing
-//    per-install session id/secret (see _ensure_cloud_sync_state() /
-//    cloud_sync.json on the PC side). Captured once, stored permanently,
-//    then stripped from the address bar so it doesn't linger in history/
-//    screenshots. From then on this phone talks straight to whichever
-//    origin served this page -- which, in this mode, already IS the
-//    cloud -- for every single request, forever, completely independent
-//    of the PC's power state. This is what actually decouples the phone
-//    from the PC: it never has to ask the PC anything, not even where
-//    the cloud lives.
-// 2) LEGACY PC-BROKERED CONFIG -- the phone loaded the page through the
-//    PC/relay tunnel instead, which serves /api/cloud-config telling us
-//    where a *separate* cloud service lives. Kept for existing installs
-//    that pair this way; superseded by (1) once a phone also scans the
-//    direct cloud QR code.
-const CLOUD_PAIR_KEY = 'rm_cloud_pair_v1';
+// The PC serves /api/cloud-config while it's reachable, telling us where
+// its cloud database service lives and how to authenticate to it. We
+// cache that response like any other GET (see cacheSet below) so it's
+// still known even once the PC goes away -- that's what lets US keep
+// reading AND writing directly against the cloud once the tunnel dies,
+// instead of only ever showing a stale read-only snapshot.
+// Set only when this page was loaded straight from the cloud service via
+// the direct-cloud QR code (?sid=&key=) -- see index()'s CLOUD_MODE branch
+// in app.py, which embeds this before anything else in <head>. Absent
+// entirely on a normal PC/relay-served page load.
+const CLOUD_DIRECT = window.__CLOUD_DIRECT__ || null;
 
-function _captureDirectCloudPairing() {
-  const params = new URLSearchParams(window.location.search);
-  const sid = params.get('sid'), key = params.get('key');
-  if (sid && key) {
-    const pair = { session_id: sid, secret_key: key, cloud_base_url: window.location.origin };
-    try { localStorage.setItem(CLOUD_PAIR_KEY, JSON.stringify(pair)); } catch (e) {}
-    // Remove the credentials from the visible URL/history now that
-    // they're saved -- functionally a no-op for future loads (loadCloudConfig
-    // reads from localStorage), just hygiene.
-    params.delete('sid'); params.delete('key');
-    const clean = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
-    try { history.replaceState(null, '', clean); } catch (e) {}
-    return pair;
-  }
-  try { return JSON.parse(localStorage.getItem(CLOUD_PAIR_KEY)); } catch (e) { return null; }
-}
-// True whenever this phone is directly paired to the cloud -- used by
-// init() below to skip the PC-only /api/lock-status round trip entirely,
-// since a direct pairing needs no PC-issued unlock state at all.
-const DIRECT_CLOUD_PAIR = _captureDirectCloudPairing();
-
-let cloudCfg = DIRECT_CLOUD_PAIR ? { ...DIRECT_CLOUD_PAIR, configured: true } : null;
+let cloudCfg = CLOUD_DIRECT ? {
+  configured: true,
+  cloud_base_url: window.location.origin,
+  session_id: CLOUD_DIRECT.sessionId,
+  secret_key: CLOUD_DIRECT.secretKey,
+} : null;
 
 async function loadCloudConfig() {
-  if (DIRECT_CLOUD_PAIR) return; // already fully configured, nothing to fetch
+  if (CLOUD_DIRECT) return; // already configured above; nothing to fetch
   const cached = cacheGet('/api/cloud-config');
   if (cached && cached.configured) cloudCfg = cached;
   try {
@@ -3856,20 +3782,6 @@ async function api(path, opts={}) {
   }
 
   // Mutating request (POST/PUT/DELETE)
-  if (DIRECT_CLOUD_PAIR) {
-    // Same-origin here already IS the cloud, but without X-Session-Id/
-    // X-Secret-Key headers a bare fetch would 401 as "session_required"
-    // -- easily confused with a PIN lock. cloudFetch() is the one call
-    // site that already attaches those headers, so use it directly.
-    try {
-      const cloudData = await cloudFetch(path, { method, body: opts.body });
-      setOnline(true);
-      return cloudData;
-    } catch (err) {
-      setOnline(false);
-      return { ok: false, offline: true, queued: true, error: 'cloud_unreachable' };
-    }
-  }
   try {
     const res = await fetchTimeout(path, {headers:{'Content-Type':'application/json','X-Device-Id':DEVICE_ID}, ...opts}, 6000);
     if (res.status === 401) { showLock(); throw new Error('locked'); }
@@ -4814,16 +4726,6 @@ async function boot() {
   switchTab('dashboard');
 }
 async function init() {
-  if (DIRECT_CLOUD_PAIR) {
-    // No PC involved at all in this mode -- the session/secret pairing
-    // IS the credential. Go straight to the app; every subsequent read
-    // and write authenticates itself via cloudFetch()'s headers.
-    setOnline(true);
-    hideLock();
-    boot();
-    updateSyncBadge();
-    return;
-  }
   let ls;
   try {
     const res = await fetchTimeout('/api/lock-status', {headers: {'X-Device-Id': DEVICE_ID}}, 3500);
