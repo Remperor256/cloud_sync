@@ -3446,6 +3446,22 @@ async function pingServer() {
   return false;
 }
 setInterval(pingServer, 6000);
+
+// Keeps the visible screen in sync with changes made elsewhere (the PC,
+// or another phone) without needing a manual reload/tab-switch. Read-only
+// re-render via the same render() used everywhere else, so it goes
+// through the normal cloud-first api() path above. Skipped whenever it
+// could disrupt someone actively typing/editing, or when there's nothing
+// to refresh anyway.
+setInterval(function () {
+  if (document.hidden) return;
+  const lockEl = $('#lockscreen');
+  if (lockEl && lockEl.style.display !== 'none') return;
+  const modalEl = $('#modalRoot');
+  if (modalEl && modalEl.innerHTML.trim() !== '') return;
+  if (state.tab === 'add-tenant') return;
+  render();
+}, 20000);
 window.addEventListener('online', pingServer);
 window.addEventListener('offline', () => setOnline(false));
 
