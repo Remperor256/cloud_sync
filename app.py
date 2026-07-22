@@ -246,9 +246,41 @@ if CLOUD_MODE:
                     token       TEXT
                 )
             """)
+            # Holds the Flask session-signing secret itself. This used to
+            # only ever live in a local devices.json file next to the
+            # process -- fine on the desktop app, but on a Render (or
+            # similar) web service the filesystem is ephemeral: every
+            # restart/redeploy/free-tier spin-down wiped it, so a brand
+            # new random secret got generated each time, silently
+            # invalidating every phone's pairing cookie (see
+            # _cloud_pairing_ok) and dropping them back to the "Waiting
+            # to connect" screen even though nothing about their pairing
+            # actually changed. Storing it here instead means it survives
+            # restarts exactly like cloud_sessions/cloud_pairing already
+            # do. Single fixed row (id=1) -- one secret for the whole
+            # service, same as before.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cloud_app_secret (
+                    id          INTEGER PRIMARY KEY,
+                    secret_key  TEXT NOT NULL
+                )
+            """)
             conn.commit()
 
     _cloud_ensure_schema()
+
+    def _cloud_get_or_create_secret():
+        """Race-safe get-or-create: if two workers boot at once, only one
+        INSERT wins and both end up reading the same row back."""
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cloud_app_secret (id, secret_key)
+                VALUES (1, %s)
+                ON CONFLICT (id) DO NOTHING
+            """, (secrets.token_hex(32),))
+            conn.commit()
+            cur.execute("SELECT secret_key FROM cloud_app_secret WHERE id = 1")
+            return cur.fetchone()[0]
 
     def _cloud_get_row(session_id):
         with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1583,13 +1615,25 @@ _devices_state = _load_devices_file()
 # file's source (it ships as plain .py, not compiled/obfuscated) --
 # which would let them forge a validly-signed session cookie without
 # ever entering the PIN or scanning a QR code. So it's still generated
-# randomly -- just once, the first time this ever runs, then reused on
-# every later restart (persisted in devices.json) so existing session
-# cookies and paired devices don't all become invalid just because the
-# desktop app was closed and reopened. RENTAL_APP_SECRET still overrides
-# it for anyone who wants to manage that themselves.
+# randomly -- just once, then reused on every later restart so existing
+# session cookies and paired devices don't all become invalid just
+# because the process restarted. RENTAL_APP_SECRET still overrides it
+# for anyone who wants to manage that themselves.
+#
+# WHERE it's persisted differs by mode:
+#   - CLOUD_MODE: in Postgres (cloud_app_secret table), NOT the local
+#     devices.json file -- a Render (or similar) web service's local disk
+#     is wiped on every restart/redeploy/free-tier spin-down, which used
+#     to silently rotate this secret each time, invalidating every
+#     phone's pairing cookie and sending them back to the "Waiting to
+#     connect" screen for no visible reason.
+#   - PC-local mode: devices.json next to the process, as before -- the
+#     desktop app's own disk is not ephemeral, so this was never broken
+#     there.
 if os.environ.get("RENTAL_APP_SECRET"):
     app.secret_key = os.environ["RENTAL_APP_SECRET"]
+elif CLOUD_MODE:
+    app.secret_key = _cloud_get_or_create_secret()
 else:
     if not _devices_state.get("secret_key"):
         _devices_state["secret_key"] = secrets.token_hex(32)
