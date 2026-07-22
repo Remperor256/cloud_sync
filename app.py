@@ -20,6 +20,7 @@ import os
 import re
 import io
 import json
+import time
 import shutil
 import socket
 import hashlib
@@ -215,6 +216,25 @@ if CLOUD_MODE:
                     updated_by   TEXT
                 )
             """)
+            # Per-device roster for the cloud-direct pairing path -- the
+            # counterpart to the LAN model's devices.json, just keyed by
+            # session_id since one Postgres row backs every household's
+            # phones instead of one file per install. last_seen/first_seen
+            # are epoch floats (not TIMESTAMPTZ) so they drop straight into
+            # _list_devices()-style "online = now - last_seen <= timeout"
+            # math and the desktop's _format_last_synced() with no
+            # conversion either side.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cloud_devices (
+                    session_id   TEXT NOT NULL,
+                    device_id    TEXT NOT NULL,
+                    label        TEXT,
+                    first_seen   DOUBLE PRECISION NOT NULL,
+                    last_seen    DOUBLE PRECISION NOT NULL,
+                    kicked       BOOLEAN NOT NULL DEFAULT false,
+                    PRIMARY KEY (session_id, device_id)
+                )
+            """)
             conn.commit()
 
     _cloud_ensure_schema()
@@ -242,6 +262,103 @@ if CLOUD_MODE:
             """, (session_id, g.secret_key, json.dumps(data), updated_by))
             conn.commit()
 
+    def _cloud_touch_device(session_id, device_id, user_agent=None, screen_hint=""):
+        """Cloud-mode counterpart to the LAN model's _touch_device(): same
+        semantics (immediate admit, no separate approval step, label
+        re-derived on every poll so it can upgrade from a generic
+        'iPhone'/'Android' to a specific model, MAX_DEVICES cap per
+        session) but backed by Postgres so the roster is shared by every
+        phone hitting this session_id directly -- no PC involved -- and
+        survives Render worker restarts. Returns True if this device_id
+        is now tracked (and therefore admitted), False only if the cap is
+        full or it's kicked."""
+        if not device_id:
+            return True
+        now = time.time()
+        with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT kicked FROM cloud_devices WHERE session_id=%s AND device_id=%s",
+                (session_id, device_id))
+            rec = cur.fetchone()
+            if rec is not None:
+                if rec["kicked"]:
+                    return False  # not admitted -- caller also checks this directly
+                label = _label_for_user_agent(user_agent, screen_hint)
+                if label and label != "Device":
+                    cur.execute(
+                        "UPDATE cloud_devices SET last_seen=%s, label=%s "
+                        "WHERE session_id=%s AND device_id=%s",
+                        (now, label, session_id, device_id))
+                else:
+                    cur.execute(
+                        "UPDATE cloud_devices SET last_seen=%s "
+                        "WHERE session_id=%s AND device_id=%s",
+                        (now, session_id, device_id))
+                conn.commit()
+                return True
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM cloud_devices WHERE session_id=%s AND kicked=false",
+                (session_id,))
+            if cur.fetchone()["n"] >= MAX_DEVICES:
+                return False
+            cur.execute("""
+                INSERT INTO cloud_devices (session_id, device_id, label, first_seen, last_seen, kicked)
+                VALUES (%s, %s, %s, %s, %s, false)
+                ON CONFLICT (session_id, device_id) DO NOTHING
+            """, (session_id, device_id, _label_for_user_agent(user_agent, screen_hint), now, now))
+            conn.commit()
+            return True
+
+    def _cloud_device_kicked(session_id, device_id):
+        if not device_id:
+            return False
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT kicked FROM cloud_devices WHERE session_id=%s AND device_id=%s",
+                (session_id, device_id))
+            row = cur.fetchone()
+            return bool(row and row[0])
+
+    def _cloud_list_devices(session_id):
+        """Snapshot for the desktop app's admin list -- same shape as the
+        LAN model's _list_devices() so _render_connected_devices_list()
+        on the desktop side needs no changes: device_id, short_id, label,
+        last_seen (epoch), online."""
+        now = time.time()
+        with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT device_id, label, last_seen FROM cloud_devices
+                WHERE session_id=%s AND kicked=false
+                ORDER BY last_seen DESC
+            """, (session_id,))
+            rows = cur.fetchall()
+        return [
+            {
+                "device_id": r["device_id"],
+                "short_id": r["device_id"][:8],
+                "label": r["label"] or "Unknown device",
+                "last_seen": r["last_seen"],
+                "online": (now - r["last_seen"]) <= ONLINE_TIMEOUT,
+            }
+            for r in rows
+        ]
+
+    def _cloud_kick_device(session_id, device_id):
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cloud_devices (session_id, device_id, label, first_seen, last_seen, kicked)
+                VALUES (%s, %s, 'Unknown device', %s, %s, true)
+                ON CONFLICT (session_id, device_id) DO UPDATE SET kicked=true
+            """, (session_id, device_id, time.time(), time.time()))
+            conn.commit()
+
+    def _cloud_active_device_count(session_id):
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM cloud_devices WHERE session_id=%s AND kicked=false",
+                (session_id,))
+            return cur.fetchone()[0]
+
 
 @app.before_request
 def _cloud_gate():
@@ -267,12 +384,21 @@ def _cloud_gate():
 
     path = request.path
     pc_only_prefixes = (
-        "/api/lock-status", "/api/device-count", "/api/devices",
+        "/api/device-count",
         "/api/pairing-token", "/api/announce-disconnect",
         "/api/unlock", "/api/lock", "/api/settings/pin",
         "/api/settings/reset", "/api/shutdown", "/connect", "/qr.png",
         "/api/cloud-config",
     )
+    # /api/lock-status and /api/devices(/…/kick) used to be blanket-404'd
+    # here along with the rest of this list -- they made sense only for
+    # the PC-hosted LAN companion. Now that cloud-direct pairing has its
+    # own device roster (cloud_devices table) they're real, session-
+    # authenticated endpoints instead: /api/lock-status is what a
+    # cloud-direct phone's pingServer() polls to know the cloud service
+    # itself is reachable (see the CLOUD_MODE branch in lock_status()
+    # below), and /api/devices is how the desktop app manages that
+    # roster the same way it manages the LAN one.
     if path.startswith(pc_only_prefixes):
         return Response("", status=404, mimetype="text/plain")
     if path in ("/manifest.json", "/sw.js") or path.startswith("/icon-"):
@@ -307,6 +433,20 @@ def _cloud_gate():
     if not row or row["secret_key"] != secret_key:
         return jsonify({"ok": False, "error": "bad_secret"}), 403
     g.session_id, g.secret_key = session_id, secret_key
+
+    # Presence tracking for the cloud device roster -- every authenticated
+    # request from a phone (not the PC's own push above, which never sends
+    # X-Device-Id) refreshes its last-seen time here, not just its polls
+    # to /api/lock-status, so "last synced" reflects real activity.
+    device_id = request.headers.get("X-Device-Id", "")
+    if device_id:
+        if _cloud_device_kicked(session_id, device_id):
+            return jsonify({"ok": False, "error": "kicked"}), 403
+        if not _cloud_touch_device(session_id, device_id,
+                                    request.headers.get("User-Agent"),
+                                    request.headers.get("X-Device-Screen", "")):
+            return jsonify({"ok": False, "error": "device_limit_reached",
+                             "max_devices": MAX_DEVICES}), 403
     return None
 
 
@@ -2026,6 +2166,23 @@ def cloud_sync():
 
 @app.route("/api/lock-status")
 def lock_status():
+    if CLOUD_MODE:
+        # No PC in the loop here at all -- this only ever confirms the
+        # cloud service itself is reachable (which is what a cloud-direct
+        # phone's isOnline badge actually means: "works with the PC off"),
+        # plus this device's own kicked/roster status. _cloud_gate already
+        # ran the touch/kicked check above before this handler is reached.
+        device_id = request.headers.get("X-Device-Id", "")
+        return jsonify({
+            "pin_set": False,
+            "unlocked": True,
+            "app_name": APP_NAME,
+            "disconnecting": False,
+            "kicked": _cloud_device_kicked(g.session_id, device_id),
+            "device_count": _cloud_active_device_count(g.session_id),
+            "max_devices": MAX_DEVICES,
+            "device_limit_reached": False,
+        })
     data = load_state()
     device_id = request.headers.get("X-Device-Id", "")
     kicked = _device_was_kicked(device_id)
@@ -2059,20 +2216,31 @@ def device_count():
 
 @app.route("/api/devices")
 def devices_list():
-    """Loopback-only: the desktop app's Connect Phone card admin list --
-    which phones/browsers are currently connected, with enough of an id
-    shown (short_id) and a friendly label to tell them apart, plus a
-    device_id to target with /api/devices/<id>/kick."""
+    """The desktop app's Connect Phone card admin list -- which phones/
+    browsers are currently connected, with enough of an id shown
+    (short_id) and a friendly label to tell them apart, plus a device_id
+    to target with /api/devices/<id>/kick. In CLOUD_MODE this is
+    session-authenticated (X-Session-Id/X-Secret-Key) rather than
+    loopback-only, since the desktop app reaches it over the same public
+    URL every phone does -- there's no "same machine" signal to check
+    instead, the household's secret_key IS the admin credential here,
+    same as it already is for every other cloud endpoint."""
+    if CLOUD_MODE:
+        return jsonify({"devices": _cloud_list_devices(g.session_id)})
     return jsonify({"devices": _list_devices()})
 
 
 @app.route("/api/devices/<device_id>/kick", methods=["POST"])
 def devices_kick(device_id):
-    """Loopback-only: forcibly disconnects one specific phone/browser --
-    the admin 'Disconnect' action next to a device in the desktop app's
-    Connect Phone card, as opposed to the single Disconnect button that
-    tears the whole companion down for every device."""
-    _kick_device(device_id)
+    """Forcibly disconnects one specific phone/browser -- the admin
+    'Disconnect' action next to a device in the desktop app's Connect
+    Phone card, as opposed to the single Disconnect button that tears
+    the whole companion down for every device. See devices_list() above
+    re: CLOUD_MODE auth."""
+    if CLOUD_MODE:
+        _cloud_kick_device(g.session_id, device_id)
+    else:
+        _kick_device(device_id)
     return jsonify({"ok": True})
 
 
@@ -3705,6 +3873,8 @@ async function cloudFetch(path, opts = {}) {
     'Content-Type': 'application/json',
     'X-Session-Id': cloudCfg.session_id,
     'X-Secret-Key': cloudCfg.secret_key,
+    'X-Device-Id': DEVICE_ID,
+    'X-Device-Screen': DEVICE_SCREEN_HINT,
     ...(opts.headers || {}),
   };
   const res = await fetchTimeout(cloudCfg.cloud_base_url + path, { ...opts, headers }, 6000);
