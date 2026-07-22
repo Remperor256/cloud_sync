@@ -235,6 +235,18 @@ if CLOUD_MODE:
                     PRIMARY KEY (session_id, device_id)
                 )
             """)
+            # The one-time pairing token that gates "/" -- see
+            # _cloud_pairing_ok() below. A NULL token means nothing is
+            # currently scannable; the desktop pushes a fresh one via
+            # /api/pairing-token every time it (re)shows the QR code, and
+            # it's cleared the instant it's consumed, same single-use
+            # guarantee the LAN model already had.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cloud_pairing (
+                    session_id  TEXT PRIMARY KEY,
+                    token       TEXT
+                )
+            """)
             conn.commit()
 
     _cloud_ensure_schema()
@@ -359,6 +371,51 @@ if CLOUD_MODE:
                 (session_id,))
             return cur.fetchone()[0]
 
+    def _cloud_set_pairing_token(session_id, token):
+        """Desktop calls this every time it (re)shows the QR code --
+        immediately replaces whatever token was active before, so an old
+        screenshot or a link copied from an earlier QR code stops working
+        the moment a new one is shown, not just when it's actually used."""
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cloud_pairing (session_id, token) VALUES (%s, %s)
+                ON CONFLICT (session_id) DO UPDATE SET token = EXCLUDED.token
+            """, (session_id, token))
+            conn.commit()
+
+    def _cloud_check_and_consume_pairing_token(session_id, token):
+        """Single-use, race-safe: the UPDATE only matches (and clears) the
+        token if it's still exactly what's stored, so two near-simultaneous
+        requests for the same forwarded link can't both succeed -- only
+        whichever one reaches Postgres first."""
+        if not token:
+            return False
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE cloud_pairing SET token = NULL
+                WHERE session_id = %s AND token = %s
+            """, (session_id, token))
+            matched = cur.rowcount > 0
+            conn.commit()
+            return matched
+
+    def _cloud_pairing_ok(session_id, token):
+        """Cloud-mode counterpart of the LAN model's _pairing_ok(): '/'
+        may only bootstrap the app shell for (a) a browser that already
+        paired successfully before -- a persistent cookie, so reopening
+        an already-installed PWA doesn't demand a fresh scan every time
+        -- or (b) a request presenting the current, unconsumed token. A
+        plain forwarded link (sid+key with no valid token, from a
+        browser that never scanned) gets neither."""
+        cookie_key = "cloud_paired_" + session_id
+        if session.get(cookie_key):
+            return True
+        if _cloud_check_and_consume_pairing_token(session_id, token):
+            session[cookie_key] = True
+            session.permanent = True
+            return True
+        return False
+
 
 @app.before_request
 def _cloud_gate():
@@ -385,20 +442,21 @@ def _cloud_gate():
     path = request.path
     pc_only_prefixes = (
         "/api/device-count",
-        "/api/pairing-token", "/api/announce-disconnect",
+        "/api/announce-disconnect",
         "/api/unlock", "/api/lock", "/api/settings/pin",
         "/api/settings/reset", "/api/shutdown", "/connect", "/qr.png",
         "/api/cloud-config",
     )
-    # /api/lock-status and /api/devices(/…/kick) used to be blanket-404'd
-    # here along with the rest of this list -- they made sense only for
-    # the PC-hosted LAN companion. Now that cloud-direct pairing has its
-    # own device roster (cloud_devices table) they're real, session-
-    # authenticated endpoints instead: /api/lock-status is what a
-    # cloud-direct phone's pingServer() polls to know the cloud service
-    # itself is reachable (see the CLOUD_MODE branch in lock_status()
-    # below), and /api/devices is how the desktop app manages that
-    # roster the same way it manages the LAN one.
+    # /api/lock-status, /api/devices(/…/kick), and /api/pairing-token used
+    # to be blanket-404'd here along with the rest of this list -- they
+    # made sense only for the PC-hosted LAN companion. Now that cloud-
+    # direct pairing has its own device roster (cloud_devices) and its
+    # own single-use scan token (cloud_pairing), they're real, session-
+    # authenticated endpoints instead: /api/lock-status is what a cloud-
+    # direct phone's pingServer() polls to know the cloud service itself
+    # is reachable, /api/devices is how the desktop manages that roster,
+    # and /api/pairing-token is how the desktop pushes a fresh scan token
+    # every time it (re)shows the QR code -- see _cloud_pairing_ok().
     if path.startswith(pc_only_prefixes):
         return Response("", status=404, mimetype="text/plain")
     if path in ("/manifest.json", "/sw.js") or path.startswith("/icon-"):
@@ -1943,19 +2001,24 @@ WAITING_HTML = """<!DOCTYPE html>
 @app.route("/")
 def index():
     if CLOUD_MODE:
-        # No PC/relay involved at all here -- this is the pure "Scan once
-        # for cloud access" QR code (get_direct_cloud_pairing_url()). The
-        # link itself, not a cookie or device roster, is the credential:
-        # anyone with the sid+key can load the app, same as anyone with
-        # the old relay QR code could. Missing or wrong values get the
-        # same bare 404 the rest of this service already gives out for
-        # anything unauthenticated, so a forwarded/guessed link can't even
-        # tell this is a rental-management app.
+        # sid+key identify WHICH household's data this is and are what
+        # every subsequent /api/ call authenticates with going forward --
+        # they can't be single-use themselves, or the phone couldn't keep
+        # syncing after this first load. Getting INTO the app the first
+        # time is gated separately, by pt: the one-time token the desktop
+        # pushes every time it (re)shows the QR code (see
+        # _cloud_pairing_ok() above). A link with valid sid+key but no
+        # valid pt -- forwarded, screenshotted, or just reopened by
+        # someone who was never shown the QR -- gets the same branded
+        # waiting page a stale LAN link gets, never the app shell.
         session_id = request.args.get("sid", "")
         secret_key = request.args.get("key", "")
+        pt = request.args.get("pt", "")
         row = _cloud_get_row(session_id) if session_id else None
         if not session_id or not secret_key or not row or row["secret_key"] != secret_key:
             return Response("", status=404, mimetype="text/plain")
+        if not _cloud_pairing_ok(session_id, pt):
+            return Response(WAITING_HTML, status=404, mimetype="text/html")
         bootstrap = (
             "<script>window.__CLOUD_DIRECT__=" + json.dumps({
                 "sessionId": session_id, "secretKey": secret_key,
@@ -2246,14 +2309,17 @@ def devices_kick(device_id):
 
 @app.route("/api/pairing-token", methods=["POST"])
 def set_pairing_token():
-    """Loopback-only: the desktop app calls this every time it displays a
-    QR code, handing over the one token that will be accepted by "/" --
-    see _pairing_ok() above. Immediately invalidates whatever token was
-    active before, so an old screenshot or a link copied from an earlier
-    QR code stops working the moment a new one is shown, not just when
-    it's actually used."""
+    """The desktop app calls this every time it displays a QR code,
+    handing over the one token that will be accepted by '/' -- see
+    _pairing_ok() / _cloud_pairing_ok() above. Immediately invalidates
+    whatever token was active before, so an old screenshot or a link
+    copied from an earlier QR code stops working the moment a new one is
+    shown, not just when it's actually used."""
     body = request.get_json(force=True) or {}
     token = (body.get("token") or "").strip()
+    if CLOUD_MODE:
+        _cloud_set_pairing_token(g.session_id, token or None)
+        return jsonify({"ok": True})
     with _pairing_lock:
         _pairing_state["token"] = token or None
         _pairing_state["consumed"] = False
