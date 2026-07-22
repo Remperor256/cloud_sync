@@ -177,14 +177,13 @@ PERIOD_LABELS = {"current": "Current Month", "next": "Next Month",
 
 # ── cloud mode ───────────────────────────────────────────────────────────
 # This exact same file can run two ways:
-#   1) PC-local (default): spawned by the desktop app, reads/writes the
-#      local ~/.rental_manager/data.json, reachable via the relay tunnel.
+#   1) PC-local (default): can be run for local testing, reads/writes the
+#      local ~/.rental_manager/data.json file directly.
 #   2) Cloud (CLOUD_MODE=1 + DATABASE_URL set): deployed as its own
-#      always-on Render web service, storing each paired app's data as a
-#      row in Postgres instead of a local file, keyed by a session id. The
-#      phone falls back to calling THIS service directly (bypassing the
-#      PC/tunnel entirely) whenever the PC is unreachable, so reads and
-#      writes both keep working with the PC fully off.
+#      always-on Render web service, storing each paired install's data as
+#      a row in Postgres instead of a local file, keyed by a session id.
+#      Phones/browsers pair straight to this service and read/write it
+#      directly, so tenant data stays reachable with the PC fully off.
 # Nothing about the business logic below (routes, status/deposit-cycle
 # calculations, etc.) changes between the two modes -- only where the
 # `data` dict backing it comes from is swapped out.
@@ -428,9 +427,9 @@ def _cloud_gate():
 
     if request.method == "OPTIONS":
         # A browser's CORS preflight for a genuine cross-origin request
-        # (see cloudFetch() in the companion's JS -- the page is loaded
-        # from the desktop's LAN/relay origin, but this fallback talks
-        # straight to THIS service's own origin) never carries the real
+        # (see cloudFetch() in the companion's JS -- reached when a page
+        # is running locally with no direct-cloud pairing and falls back
+        # to this service's own origin) never carries the real
         # X-Session-Id/X-Secret-Key headers, only lists them in
         # Access-Control-Request-Headers. Gating this like a normal
         # request would 401 the preflight itself, which makes the
@@ -467,7 +466,7 @@ def _cloud_gate():
         # Handled entirely by index() below (it checks ?sid=&key= itself
         # in CLOUD_MODE), so a phone that scanned the direct-cloud QR code
         # (see get_direct_cloud_pairing_url()) can load the app shell
-        # straight from this service with no PC/relay involved.
+        # straight from this service with the PC not involved at all.
         return None
 
     if not path.startswith("/api/"):
@@ -511,16 +510,16 @@ def _cloud_gate():
 @app.after_request
 def _cors_headers(resp):
     """CLOUD_MODE only: cloudFetch() in the companion's JS is a genuine
-    cross-origin request -- the page is loaded from the desktop's
-    LAN/relay origin, but this fallback fetch goes straight to this
-    cloud service's own origin so it keeps working once the PC/relay is
-    unreachable. Without these headers the browser silently blocks it
-    (no visible error -- api() just falls through to a stale local
-    cache), which is exactly the "shows old data instead of live cloud
-    data while offline" symptom this fixes. A wildcard origin is safe
-    here: these routes authenticate via the explicit X-Session-Id /
-    X-Secret-Key headers above, never via cookies, so there's no
-    session/cookie for a hostile origin to ride along on."""
+    cross-origin request whenever a page is running locally with no
+    direct-cloud pairing and falls back to reading/writing this cloud
+    service's own origin for durability. Without these headers the
+    browser silently blocks it (no visible error -- api() just falls
+    through to a stale local cache), which is exactly the "shows old
+    data instead of live cloud data while offline" symptom this fixes.
+    A wildcard origin is safe here: these routes authenticate via the
+    explicit X-Session-Id / X-Secret-Key headers above, never via
+    cookies, so there's no session/cookie for a hostile origin to ride
+    along on."""
     if CLOUD_MODE:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = (
@@ -2031,7 +2030,7 @@ def index():
         # used to be a totally bare, unlabelled 404 so a forwarded/copied
         # link couldn't even tell this was a rental-management app. That
         # also meant the browser tab (and "Add to Home Screen") had no
-        # <title> to show and fell back to displaying the raw relay URL
+        # <title> to show and fell back to displaying the raw URL
         # instead. This branded waiting page keeps the same "no tenant
         # data leaks to an unpaired visitor" guarantee, but shows the
         # Tenant Management name/icon instead of the bare link, and
@@ -2059,11 +2058,7 @@ def manifest():
         "short_name": "Tenant Management",
         "description": "Manage tenants, payments, and units on the go.",
         # Relative, not "/": per the manifest spec these all resolve
-        # against the manifest's OWN url, not the page's. Root-absolute
-        # values here used to make "Add to Home Screen" installs launch at
-        # the relay's bare domain root instead of back into this session's
-        # "/s/<session_id>/" tunnel -- breaking the installed icon the
-        # moment it was opened away from the PC's own LAN.
+        # against the manifest's OWN url, not the page's.
         "start_url": ".",
         "scope": ".",
         "display": "standalone",
@@ -2085,9 +2080,7 @@ def service_worker():
     # the whole app, not just its own folder.
     js = """
 const CACHE = 'rental-app-shell-v4';
-// Relative, not root-absolute: resolved against this script's own URL, so
-// these correctly point at "…/s/<session_id>/…" when this worker was
-// registered from a relay-tunneled page, and at "/…" on LAN like before.
+// Relative, not root-absolute: resolved against this script's own URL.
 const SHELL_URLS = ['./', './manifest.json', './icon-192.png'];
 
 self.addEventListener('install', (evt) => {
@@ -2105,17 +2098,12 @@ self.addEventListener('activate', (evt) => {
 
 self.addEventListener('fetch', (evt) => {
   const url = new URL(evt.request.url);
-  // .includes, not .startsWith: under the relay, the real request path is
-  // "/s/<session_id>/api/…", not "/api/…" -- a startsWith check here would
-  // miss every API call and let this shell-caching logic run on live
-  // tenant data instead of skipping it (the app's own api() layer already
-  // caches and handles offline for these -- see CACHE_KEY).
   if (url.pathname.includes('/api/')) return;
 
-  // Network-first for the app shell: whenever the phone can reach the PC,
-  // it always gets whatever HTML/JS is currently running there, so edits
-  // to this app show up the next time it's opened. Falls back to cache
-  // whenever the network request fails outright (PC off, no Wi-Fi/data,
+  // Network-first for the app shell: whenever the phone can reach the
+  // server, it always gets whatever HTML/JS is currently running there,
+  // so edits to this app show up the next time it's opened. Falls back
+  // to cache whenever the network request fails outright (no Wi-Fi/data,
   // or the browser was closed and reopened somewhere without a
   // connection) so the app keeps opening instead of showing nothing --
   // and if even THIS exact request was never cached before, falls back
@@ -2128,10 +2116,9 @@ self.addEventListener('fetch', (evt) => {
           caches.open(CACHE).then((c) => c.put(evt.request, resp.clone()));
           return resp;
         }
-        // Not a real page -- could be the relay's own 502/504 "desktop
-        // app isn't connected" gateway page (PC off, no internet on
-        // that end) or our own not-yet-paired waiting page. Prefer the
-        // last cached shell if there is one, so the app still opens.
+        // Not a real page -- our own not-yet-paired waiting page, or a
+        // genuine server error. Prefer the last cached shell if there is
+        // one, so the app still opens.
         return caches.match(evt.request).then((cached) => cached || caches.match(self.registration.scope) || resp);
       }).catch(() => caches.match(evt.request).then((cached) => cached || caches.match(self.registration.scope)))
     );
@@ -3005,8 +2992,8 @@ CONNECT_PAGE = """<!DOCTYPE html>
 @app.route("/connect")
 def connect_page():
     # Leftover from an older LAN-only pairing flow, superseded by the
-    # desktop app's own relay+token QR code (see _make_phone_qr_image /
-    # /api/pairing-token) -- kept only so nothing breaks if this script
+    # desktop app's own direct-cloud QR code (see get_direct_cloud_pairing_url
+    # / _make_phone_qr_image) -- kept only so nothing breaks if this script
     # is ever run standalone outside the desktop app. Gated the same as
     # "/" so it can't be used to route around the pairing token: without
     # that, it would reveal this app exists (and its LAN address) to
@@ -3447,19 +3434,6 @@ const DEVICE_ID = getDeviceId();
 // perfect (several generations share the same screen size) but enough
 // for the server to make a reasonable guess instead of just "iPhone".
 const DEVICE_SCREEN_HINT = `${screen.width}x${screen.height}@${window.devicePixelRatio || 1}`;
-// When this page is loaded through the cloud relay tunnel (see
-// RelaySync / relay_server.py), the whole app lives under a
-// "/s/<session_id>/" prefix instead of at the domain root. Every call
-// in this file targets root-absolute paths like "/api/...", which
-// would otherwise miss that prefix and 404 against the relay itself
-// instead of reaching the tunneled local server. BASE_PATH captures
-// that prefix once at load time (empty string when there isn't one,
-// e.g. on LAN) so fetchTimeout() below can transparently route every
-// request through it.
-const BASE_PATH = (function () {
-  var m = window.location.pathname.match(/^(\/s\/[^\/]+\/)/);
-  return m ? m[1].slice(0, -1) : '';
-})();
 let isOnline = true;
 let syncing = false;
 let tempIdCounter = 0;
@@ -3641,10 +3615,6 @@ function scheduleBlockedRetry() {
 async function fetchTimeout(path, opts={}, ms=4000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
-  // Root-absolute paths (e.g. "/api/...") need the relay's session
-  // prefix stitched back on when this page was loaded via the relay
-  // (BASE_PATH is '' on LAN, so this is a no-op there).
-  const url = (BASE_PATH && path.charAt(0) === '/') ? BASE_PATH + path : path;
   // Every call site already sends X-Device-Id; adding the screen hint
   // here once means every request tags along the model-guessing hint
   // without having to touch every fetchTimeout(...) call individually.
@@ -3654,7 +3624,7 @@ async function fetchTimeout(path, opts={}, ms=4000) {
     headers['X-Secret-Key'] = CLOUD_DIRECT.secretKey;
   }
   try {
-    return await fetch(url, {...opts, headers, signal: ctrl.signal});
+    return await fetch(path, {...opts, headers, signal: ctrl.signal});
   } finally {
     clearTimeout(timer);
   }
@@ -3812,17 +3782,8 @@ async function flushQueue() {
 // Settings button instead of only appearing as a small address-bar icon.
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    // Relative, not '/sw.js': when this page was loaded through the cloud
-    // relay, the document's own URL is "…/s/<session_id>/", so a relative
-    // registration resolves to "…/s/<session_id>/sw.js" -- which the relay
-    // correctly tunnels through to the desktop app's /sw.js route, with a
-    // scope of "…/s/<session_id>/" to match. An absolute '/sw.js' would
-    // instead hit the relay server's own root, which has no such route,
-    // 404 silently (.catch swallows it), and leave this phone with NO
-    // service worker at all -- no offline cache, no fallback shell, just
-    // a raw "Desktop app is not connected" page on every refresh while
-    // the PC/relay is down. This one line is what the SHELL_URLS /
-    // fetch-handler machinery below actually depends on being installed.
+    // Relative registration/scope keeps this correct regardless of what
+    // path the app happens to be served under.
     navigator.serviceWorker.register('sw.js').catch(()=>{});
   });
 }
@@ -3899,17 +3860,18 @@ function offlineDefaultFor(path) {
   return { ...base, tenants: [], units: [] };
 }
 
-// ── cloud fallback (works even with the PC fully off) ─────────────────
-// The PC serves /api/cloud-config while it's reachable, telling us where
-// its cloud database service lives and how to authenticate to it. We
-// cache that response like any other GET (see cacheSet below) so it's
-// still known even once the PC goes away -- that's what lets US keep
-// reading AND writing directly against the cloud once the tunnel dies,
-// instead of only ever showing a stale read-only snapshot.
-// Set only when this page was loaded straight from the cloud service via
-// the direct-cloud QR code (?sid=&key=) -- see index()'s CLOUD_MODE branch
-// in app.py, which embeds this before anything else in <head>. Absent
-// entirely on a normal PC/relay-served page load.
+// ── cloud fallback ──────────────────────────────────────────────────
+// When this page was loaded straight from the cloud service via the
+// direct-cloud QR code (?sid=&key=), CLOUD_DIRECT is embedded before
+// anything else in <head> -- see index()'s CLOUD_MODE branch in app.py
+// -- and cloudCfg below is configured immediately from it, so every
+// read/write always targets the cloud service, with the PC out of the
+// picture entirely. If this page was instead loaded directly against a
+// PC running app.py locally (e.g. for local testing) with no cloud
+// pairing, /api/cloud-config tells us where a configured cloud service
+// lives so reads/writes can still reach it once learned. We cache that
+// response like any other GET (see cacheSet below) so it's still known
+// even once the PC that served it goes away.
 const CLOUD_DIRECT = window.__CLOUD_DIRECT__ || null;
 
 let cloudCfg = CLOUD_DIRECT ? {
@@ -3964,19 +3926,17 @@ async function api(path, opts={}) {
 
     // ── Cloud-first ──────────────────────────────────────────────────
     // Reads are served from the cloud database whenever it's reachable,
-    // full stop -- not just as a fallback once the PC/relay fails. The
-    // PC is what WRITES into the cloud after every local save, so this
-    // is never more than one save cycle stale, and it means data loads
-    // consistently regardless of whether the PC happens to be awake or
-    // the relay tunnel happens to be up at this exact moment. Every
-    // successful read here refreshes the local cache too, so the app
-    // still has something to show even with no connectivity at all.
+    // full stop. When this page was loaded via the direct-cloud QR code,
+    // that's the only path that's ever configured, so it's also the
+    // only place reads ever come from. Every successful read here
+    // refreshes the local cache too, so the app still has something to
+    // show even with no connectivity at all.
     //
     // loadCloudConfig() otherwise only ever ran once, at boot() -- if
-    // that single attempt missed (PC/relay briefly unreachable at that
-    // exact moment), cloudCfg stayed unconfigured for the whole session.
-    // Retrying it here, every time it's missing, means a later reconnect
-    // to the PC actually gets picked up instead of needing a reload.
+    // that single attempt missed (briefly unreachable at that exact
+    // moment), cloudCfg stayed unconfigured for the whole session.
+    // Retrying it here, every time it's missing, means a later
+    // reconnect actually gets picked up instead of needing a reload.
     if (!cloudCfg || !cloudCfg.configured) {
       await loadCloudConfig();
     }
@@ -3987,13 +3947,15 @@ async function api(path, opts={}) {
           cacheSet(path, cloudData);
           return cloudData;
         }
-      } catch (e) { /* cloud unreachable right now -- fall back to the PC/relay below */ }
+      } catch (e) { /* cloud unreachable right now -- fall back below */ }
     }
 
-    // ── PC / relay fallback ─────────────────────────────────────────
+    // ── Local/PC fallback ────────────────────────────────────────────
     // Only reached when the cloud isn't configured yet or isn't
-    // reachable right now. Still responsible for the isOnline flag --
-    // that badge specifically tracks "is the PC reachable", which is
+    // reachable right now -- e.g. this page is running directly against
+    // a local app.py instance with no cloud pairing set up. Still
+    // responsible for the isOnline flag -- that badge specifically
+    // tracks "is the server this page came from reachable", which is
     // exactly what pingServer() also polls independently every 6s.
     try {
       const res = await fetchTimeout(path, {headers:{'Content-Type':'application/json','X-Device-Id':DEVICE_ID}, ...opts}, 4000);
@@ -4011,12 +3973,10 @@ async function api(path, opts={}) {
         }
       }
       if (res.status === 502 || res.status === 503 || res.status === 504) {
-        // Not a real answer from the app -- this is the relay itself
-        // saying the desktop app isn't currently connected (PC off, app
-        // closed, or no internet on that end) or timed out reaching it.
-        // Treat exactly like a network failure below: fall back to
-        // cache, don't let this gateway page overwrite the real cached
-        // data or get reported as "Online".
+        // A genuine gateway/server error, not a real answer from the
+        // app. Treat exactly like a network failure below: fall back to
+        // cache, don't let this overwrite the real cached data or get
+        // reported as "Online".
         throw new Error('gateway_unreachable');
       }
       const data = await res.json().catch(()=>({}));
@@ -4050,7 +4010,7 @@ async function api(path, opts={}) {
       }
     }
     if (res.status === 502 || res.status === 503 || res.status === 504) {
-      // Relay says the desktop app isn't reachable right now -- same
+      // A genuine gateway/server error, not a real answer -- same
       // situation as a network failure, so fall into the catch block
       // below and queue this change to sync once reconnected.
       throw new Error('gateway_unreachable');
