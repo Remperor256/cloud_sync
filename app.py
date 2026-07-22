@@ -275,11 +275,17 @@ def _cloud_gate():
     )
     if path.startswith(pc_only_prefixes):
         return Response("", status=404, mimetype="text/plain")
-    if path in ("/", "/manifest.json", "/sw.js") or path.startswith("/icon-"):
-        # The PWA shell/service worker/manifest are only ever served by the
-        # PC (through the tunnel) or from the phone's own cache -- this
-        # cloud service only answers /api/* data requests.
-        return Response("", status=404, mimetype="text/plain")
+    # NOTE: the PWA shell (/, /manifest.json, /sw.js, /icon-*) used to be
+    # 404'd here in CLOUD_MODE, on the assumption the phone would only
+    # ever load the app through the PC/relay tunnel and fall back to the
+    # cloud for data only. That's exactly the dependency this fix
+    # removes: these routes now fall through to their normal handlers
+    # below in both modes, so a phone that has this service's own URL
+    # can load the entire app -- shell included -- with the PC fully
+    # off. They contain no tenant data (that's still only ever served
+    # from /api/* behind the session/secret check below), so serving
+    # them with no auth here is no different from serving sw.js/manifest
+    # unauthenticated in PC mode already.
 
     if not path.startswith("/api/"):
         return None
@@ -1817,7 +1823,7 @@ WAITING_HTML = """<!DOCTYPE html>
 # ── page ─────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    if not _pairing_ok(request.headers.get("X-Device-Id", "")):
+    if not CLOUD_MODE and not _pairing_ok(request.headers.get("X-Device-Id", "")):
         # No token, a stale/wrong one, or one already used once -- this
         # used to be a totally bare, unlabelled 404 so a forwarded/copied
         # link couldn't even tell this was a rental-management app. That
@@ -3469,6 +3475,7 @@ async function fetchTimeout(path, opts={}, ms=4000) {
 }
 
 async function pingServer() {
+  if (DIRECT_CLOUD_PAIR) { setOnline(true); return true; }
   try {
     const res = await fetchTimeout('/api/lock-status',
       {cache:'no-store', headers: {'X-Device-Id': DEVICE_ID}}, 3500);
@@ -3692,15 +3699,52 @@ function offlineDefaultFor(path) {
 }
 
 // ── cloud fallback (works even with the PC fully off) ─────────────────
-// The PC serves /api/cloud-config while it's reachable, telling us where
-// its cloud database service lives and how to authenticate to it. We
-// cache that response like any other GET (see cacheSet below) so it's
-// still known even once the PC goes away -- that's what lets US keep
-// reading AND writing directly against the cloud once the tunnel dies,
-// instead of only ever showing a stale read-only snapshot.
-let cloudCfg = null;
+// Two ways cloudCfg gets populated, in priority order:
+//
+// 1) DIRECT CLOUD PAIRING -- the phone's URL IS this cloud service's own
+//    URL (e.g. https://<app>.onrender.com/?sid=...&key=...), scanned once
+//    from a QR code the desktop app generates from its already-existing
+//    per-install session id/secret (see _ensure_cloud_sync_state() /
+//    cloud_sync.json on the PC side). Captured once, stored permanently,
+//    then stripped from the address bar so it doesn't linger in history/
+//    screenshots. From then on this phone talks straight to whichever
+//    origin served this page -- which, in this mode, already IS the
+//    cloud -- for every single request, forever, completely independent
+//    of the PC's power state. This is what actually decouples the phone
+//    from the PC: it never has to ask the PC anything, not even where
+//    the cloud lives.
+// 2) LEGACY PC-BROKERED CONFIG -- the phone loaded the page through the
+//    PC/relay tunnel instead, which serves /api/cloud-config telling us
+//    where a *separate* cloud service lives. Kept for existing installs
+//    that pair this way; superseded by (1) once a phone also scans the
+//    direct cloud QR code.
+const CLOUD_PAIR_KEY = 'rm_cloud_pair_v1';
+
+function _captureDirectCloudPairing() {
+  const params = new URLSearchParams(window.location.search);
+  const sid = params.get('sid'), key = params.get('key');
+  if (sid && key) {
+    const pair = { session_id: sid, secret_key: key, cloud_base_url: window.location.origin };
+    try { localStorage.setItem(CLOUD_PAIR_KEY, JSON.stringify(pair)); } catch (e) {}
+    // Remove the credentials from the visible URL/history now that
+    // they're saved -- functionally a no-op for future loads (loadCloudConfig
+    // reads from localStorage), just hygiene.
+    params.delete('sid'); params.delete('key');
+    const clean = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+    try { history.replaceState(null, '', clean); } catch (e) {}
+    return pair;
+  }
+  try { return JSON.parse(localStorage.getItem(CLOUD_PAIR_KEY)); } catch (e) { return null; }
+}
+// True whenever this phone is directly paired to the cloud -- used by
+// init() below to skip the PC-only /api/lock-status round trip entirely,
+// since a direct pairing needs no PC-issued unlock state at all.
+const DIRECT_CLOUD_PAIR = _captureDirectCloudPairing();
+
+let cloudCfg = DIRECT_CLOUD_PAIR ? { ...DIRECT_CLOUD_PAIR, configured: true } : null;
 
 async function loadCloudConfig() {
+  if (DIRECT_CLOUD_PAIR) return; // already fully configured, nothing to fetch
   const cached = cacheGet('/api/cloud-config');
   if (cached && cached.configured) cloudCfg = cached;
   try {
@@ -3812,6 +3856,20 @@ async function api(path, opts={}) {
   }
 
   // Mutating request (POST/PUT/DELETE)
+  if (DIRECT_CLOUD_PAIR) {
+    // Same-origin here already IS the cloud, but without X-Session-Id/
+    // X-Secret-Key headers a bare fetch would 401 as "session_required"
+    // -- easily confused with a PIN lock. cloudFetch() is the one call
+    // site that already attaches those headers, so use it directly.
+    try {
+      const cloudData = await cloudFetch(path, { method, body: opts.body });
+      setOnline(true);
+      return cloudData;
+    } catch (err) {
+      setOnline(false);
+      return { ok: false, offline: true, queued: true, error: 'cloud_unreachable' };
+    }
+  }
   try {
     const res = await fetchTimeout(path, {headers:{'Content-Type':'application/json','X-Device-Id':DEVICE_ID}, ...opts}, 6000);
     if (res.status === 401) { showLock(); throw new Error('locked'); }
@@ -4756,6 +4814,16 @@ async function boot() {
   switchTab('dashboard');
 }
 async function init() {
+  if (DIRECT_CLOUD_PAIR) {
+    // No PC involved at all in this mode -- the session/secret pairing
+    // IS the credential. Go straight to the app; every subsequent read
+    // and write authenticates itself via cloudFetch()'s headers.
+    setOnline(true);
+    hideLock();
+    boot();
+    updateSyncBadge();
+    return;
+  }
   let ls;
   try {
     const res = await fetchTimeout('/api/lock-status', {headers: {'X-Device-Id': DEVICE_ID}}, 3500);
