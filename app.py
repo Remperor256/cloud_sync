@@ -659,7 +659,64 @@ def _raw_load():
         return {"units": {}, "tenants": [], "settings": {}}
 
 
+def _record_content_equal(a, b):
+    """True if two tenant/unit records are the same ignoring the
+    `_updated_at` bookkeeping field itself (added by
+    _stamp_changed_records below), so re-saving an unchanged record
+    never looks like an edit. Mirrors the identically-named helper in
+    the desktop app (updates.py) so both sides stamp records the same
+    way."""
+    a2 = {k: v for k, v in (a or {}).items() if k != "_updated_at"}
+    b2 = {k: v for k, v in (b or {}).items() if k != "_updated_at"}
+    return a2 == b2
+
+
+def _tenant_key(t):
+    return (t.get("name"), t.get("unit"), t.get("entry_date"))
+
+
+def _stamp_changed_records(new_data, old_data):
+    """Stamps `_updated_at` (ISO now) onto every tenant/unit record in
+    new_data that's brand new or whose content actually changed versus
+    old_data; unchanged records keep whatever `_updated_at` they
+    already had. Mutates new_data in place and returns it.
+
+    Mirrors the desktop app's identically-named helper -- this is what
+    lets the PC's cloud-merge logic (_merge_cloud_data in updates.py)
+    tell, record by record, whether its own copy or the phone's is
+    actually newer, instead of only being able to compare whole
+    snapshots (which is what used to let one side's edit to a shared
+    record get silently discarded whenever the other side's snapshot
+    was picked as "the base")."""
+    now_iso = datetime.now().isoformat()
+
+    old_tenants = {_tenant_key(t): t for t in (old_data.get("tenants") or [])}
+    for t in (new_data.get("tenants") or []):
+        old_t = old_tenants.get(_tenant_key(t))
+        if old_t is None or not _record_content_equal(t, old_t):
+            t["_updated_at"] = now_iso
+        elif "_updated_at" not in t and old_t.get("_updated_at"):
+            t["_updated_at"] = old_t["_updated_at"]
+
+    old_units = old_data.get("units") or {}
+    for uk, uv in (new_data.get("units") or {}).items():
+        if not isinstance(uv, dict):
+            continue
+        old_u = old_units.get(uk)
+        if old_u is None or not _record_content_equal(uv, old_u):
+            uv["_updated_at"] = now_iso
+        elif "_updated_at" not in uv and isinstance(old_u, dict) and old_u.get("_updated_at"):
+            uv["_updated_at"] = old_u["_updated_at"]
+
+    return new_data
+
+
 def save_raw(data, updated_by=None):
+    try:
+        old_data = _raw_load()
+    except Exception:
+        old_data = {"units": {}, "tenants": [], "settings": {}}
+    _stamp_changed_records(data, old_data)
     if CLOUD_MODE:
         _cloud_save(g.session_id, data, updated_by=updated_by or "cloud")
         return
