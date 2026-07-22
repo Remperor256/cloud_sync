@@ -326,6 +326,26 @@ def _cors_headers(resp):
     return resp
 
 
+@app.after_request
+def _no_cache_headers(resp):
+    """Every /api/* response is live tenant data and must never be reused
+    from any cache -- the phone's own HTTP cache, a carrier/transparent
+    proxy sitting between the phone and Render, or Render's own edge.
+    Without these headers a GET request can be served stale even though
+    the JS fetch logic asked for fresh data (fetch()'s default cache mode
+    still consults/writes the HTTP cache). This is intentionally on
+    every /api/* response including PUT/POST/DELETE, so error/edit
+    responses aren't cached either. `Vary: *` additionally stops any
+    CDN in front of the Render service from serving one session's
+    cached response to a different X-Session-Id/X-Secret-Key."""
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        resp.headers["Vary"] = "*"
+    return resp
+
+
 # ── low level helpers ───────────────────────────────────────────────────
 def parse_amount(value):
     if value is None:
@@ -1431,25 +1451,8 @@ def _pairing_ok(device_id=""):
     """True if this request may load the app shell -- see the module
     comment above. Consumes the active token on a successful match so it
     can never work a second time for anyone else it gets forwarded to."""
-    # The session cookie alone used to be enough to short-circuit
-    # everything below and return True. That silently broke reconnection:
-    # once a device is kicked, its browser still holds the old (up to
-    # 180-day) "paired" session cookie from before the kick, so the very
-    # first check here returned True and the request never got anywhere
-    # near the token match / _readmit_device() below -- meaning a rescanned
-    # QR code's token was never even inspected, let alone consumed, and the
-    # kicked flag could never clear. known_device_id remembers which
-    # device this session belongs to (see the two places below that set
-    # session["device_id"]) so a kicked session can be told apart from a
-    # legitimately-still-paired one, even on a plain top-level navigation
-    # that carries no X-Device-Id header at all.
-    known_device_id = device_id or session.get("device_id", "")
     if session.get("paired"):
-        if not (known_device_id and _device_was_kicked(known_device_id)):
-            return True
-        # Falls through to the token check below instead of returning --
-        # this is what lets a rescanned QR code actually re-admit a kicked
-        # device rather than looping forever on the stale cookie.
+        return True
     if device_id and _device_known(device_id):
         # Recognized via X-Device-Id (e.g. the waiting page's background
         # retry, or an /api/ call) rather than the one-time token. Set the
@@ -1458,7 +1461,6 @@ def _pairing_ok(device_id=""):
         # via session.get("paired") above instead of falling through to
         # the waiting page again.
         session["paired"] = True
-        session["device_id"] = device_id
         session.permanent = True
         return True
     token = request.args.get("pt", "")
@@ -1470,15 +1472,8 @@ def _pairing_ok(device_id=""):
     if matched:
         session["paired"] = True
         session.permanent = True
-        # A rescan's top-level navigation never carries X-Device-Id
-        # (browsers don't attach custom headers to plain navigations), so
-        # device_id is usually empty right here -- fall back to what this
-        # session already remembers about itself so the SAME kicked device
-        # gets un-kicked instead of silently doing nothing.
-        readmit_id = device_id or known_device_id
-        if readmit_id:
-            session["device_id"] = readmit_id
-            _readmit_device(readmit_id)
+        if device_id:
+            _readmit_device(device_id)
     return matched
 
 
@@ -1833,7 +1828,15 @@ def index():
         # Tenant Management name/icon instead of the bare link, and
         # quietly retries in the background until it's admitted.
         return Response(WAITING_HTML, status=404, mimetype="text/html")
-    return Response(INDEX_HTML, mimetype="text/html")
+    resp = Response(INDEX_HTML, mimetype="text/html")
+    # The service worker (sw.js) is what keeps the shell fresh (network-first,
+    # see below) -- but that only helps once it's installed. Until then (or on
+    # browsers where installation failed/was skipped) mobile Safari especially
+    # will happily cache this raw HTML GET with no explicit signal telling it
+    # not to, which is how a phone can keep opening an old build of the app.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 # ── PWA: manifest, service worker, icon ───────────────────────────────────
@@ -1880,7 +1883,7 @@ def service_worker():
     # served stale. Scope is "/" via the header below so it can control
     # the whole app, not just its own folder.
     js = """
-const CACHE = 'rental-app-shell-v4';
+const CACHE = 'rental-app-shell-v5';
 // Relative, not root-absolute: resolved against this script's own URL, so
 // these correctly point at "…/s/<session_id>/…" when this worker was
 // registered from a relay-tunneled page, and at "/…" on LAN like before.
@@ -1935,7 +1938,9 @@ self.addEventListener('fetch', (evt) => {
 });
 """
     return Response(js, mimetype="application/javascript",
-                     headers={"Service-Worker-Allowed": "/"})
+                     headers={"Service-Worker-Allowed": "/",
+                               "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                               "Pragma": "no-cache"})
 
 
 # ── cloud durability / sync ─────────────────────────────────────────────
@@ -3233,6 +3238,30 @@ function loadCache() { try { return JSON.parse(localStorage.getItem(CACHE_KEY)) 
 function saveCache(c) { try { localStorage.setItem(CACHE_KEY, JSON.stringify(c)); } catch(e) {} }
 function cacheGet(path) { return loadCache()[path]; }
 function cacheSet(path, data) { const c = loadCache(); c[path] = data; saveCache(c); }
+
+// One-time manual escape hatch for a phone that's already stuck showing
+// old data from before this fix: wipes the localStorage snapshot cache
+// this app writes (CACHE_KEY), every Cache Storage bucket any past
+// service-worker version left behind, and unregisters+re-registers the
+// service worker so the next load re-installs sw.js fresh. Bind this to
+// a button, or run window.__hardRefreshApp() from the phone browser's
+// address bar / a bookmarklet once, then reload the page.
+window.__hardRefreshApp = async function () {
+  try { localStorage.removeItem(CACHE_KEY); } catch (e) {}
+  try {
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+  } catch (e) {}
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+  } catch (e) {}
+  location.reload();
+};
 function cacheDeletePrefix(prefix) {
   const c = loadCache();
   Object.keys(c).forEach(k => { if (k.indexOf(prefix) === 0) delete c[k]; });
@@ -3414,8 +3443,26 @@ async function fetchTimeout(path, opts={}, ms=4000) {
   // here once means every request tags along the model-guessing hint
   // without having to touch every fetchTimeout(...) call individually.
   const headers = { ...(opts.headers || {}), 'X-Device-Screen': DEVICE_SCREEN_HINT };
+  // Default every request to cache:'no-store' unless a call site
+  // explicitly overrides it. Previously only the /api/lock-status call
+  // set this, so every other GET (dashboard, tenants, units, cloud
+  // fetches, ...) went through with the browser's default cache mode,
+  // which still allows a phone's HTTP cache (or a carrier/transparent
+  // proxy) to hand back an old response without ever reaching this
+  // function's fetch() call at all. Combined with the server's new
+  // Cache-Control: no-store headers, this closes both ends.
+  const cache = opts.cache || 'no-store';
+  // Belt-and-suspenders: append a cache-busting query param to GET
+  // requests too, since some carrier-network transparent caching
+  // proxies on mobile data ignore Cache-Control/Pragma entirely but do
+  // key on the URL. Harmless no-op for the server, which ignores
+  // unknown query params.
+  const method = (opts.method || 'GET').toUpperCase();
+  const bustedUrl = (method === 'GET')
+    ? url + (url.includes('?') ? '&' : '?') + '_=' + Date.now()
+    : url;
   try {
-    return await fetch(url, {...opts, headers, signal: ctrl.signal});
+    return await fetch(bustedUrl, {...opts, headers, cache, signal: ctrl.signal});
   } finally {
     clearTimeout(timer);
   }
