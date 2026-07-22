@@ -28,6 +28,7 @@ import secrets
 import calendar
 import threading
 import webbrowser
+from urllib.parse import quote
 from datetime import datetime, date
 
 import openpyxl
@@ -2068,6 +2069,16 @@ def index():
             }) + ";</script>\n"
         )
         html = INDEX_HTML.replace("<head>", "<head>\n" + bootstrap, 1)
+        # Carry sid/key onto the manifest request too. manifest.json's
+        # start_url is resolved against the MANIFEST's own URL, not this
+        # page's -- so without this, an installed home-screen icon always
+        # launches a bare "/" with no sid/key at all. index() then 404s
+        # with an EMPTY body (see the sid/key check above), which is
+        # exactly the blank white page on launch. Passing them through
+        # here lets manifest() below bake them into start_url itself.
+        qs = f"sid={quote(session_id)}&key={quote(secret_key)}"
+        html = html.replace(
+            'href="manifest.json"', f'href="manifest.json?{qs}"', 1)
         return Response(html, mimetype="text/html")
     if not _pairing_ok(request.headers.get("X-Device-Id", "")):
         # No token, a stale/wrong one, or one already used once -- this
@@ -2097,13 +2108,23 @@ def app_icon(size):
 
 @app.route("/manifest.json")
 def manifest():
+    # In CLOUD_MODE, index() now forwards this page's sid/key onto the
+    # manifest request (see its "?sid=&key=" href rewrite above) so they
+    # can be baked into start_url here. Without this, start_url resolves
+    # to a bare "/" -- valid per spec, since these fields resolve against
+    # the MANIFEST's own URL rather than the page's -- and a home-screen
+    # launch of that bare "/" gets index()'s empty-body 404 (no session
+    # means no household to show), i.e. the reported blank white page.
+    sid = request.args.get("sid", "")
+    key = request.args.get("key", "")
+    start_url = f"./?sid={quote(sid)}&key={quote(key)}" if (CLOUD_MODE and sid and key) else "."
     return jsonify({
         "name": "Tenant Management",
         "short_name": "Tenant Management",
         "description": "Manage tenants, payments, and units on the go.",
         # Relative, not "/": per the manifest spec these all resolve
         # against the manifest's OWN url, not the page's.
-        "start_url": ".",
+        "start_url": start_url,
         "scope": ".",
         "display": "standalone",
         "orientation": "portrait",
@@ -2123,9 +2144,19 @@ def service_worker():
     # served stale. Scope is "/" via the header below so it can control
     # the whole app, not just its own folder.
     js = """
-const CACHE = 'rental-app-shell-v4';
+// Bumped so every existing install picks up this fix on its next
+// activate() instead of continuing to serve a stale precached "./" that
+// (pre-fix) never had sid/key on it in the first place.
+const CACHE = 'rental-app-shell-v5';
+// sid/key travel here via this script's OWN url (see the
+// navigator.serviceWorker.register('sw.js?sid=...&key=...') call) --
+// self.location.search is that query string, readable from inside the
+// worker regardless of which page registered it.
+const PARAMS = self.location.search;
+const ROOT_URL = './' + PARAMS;
+const MANIFEST_URL = './manifest.json' + PARAMS;
 // Relative, not root-absolute: resolved against this script's own URL.
-const SHELL_URLS = ['./', './manifest.json', './icon-192.png'];
+const SHELL_URLS = [ROOT_URL, MANIFEST_URL, './icon-192.png'];
 
 self.addEventListener('install', (evt) => {
   self.skipWaiting();
@@ -2151,8 +2182,10 @@ self.addEventListener('fetch', (evt) => {
   // or the browser was closed and reopened somewhere without a
   // connection) so the app keeps opening instead of showing nothing --
   // and if even THIS exact request was never cached before, falls back
-  // to whatever copy of the app shell IS cached, so a missing icon or
-  // font never blanks the whole page.
+  // to ROOT_URL (the paired shell, WITH sid/key) rather than the bare
+  // worker scope, which used to have no session on it at all and is
+  // what produced the blank white page after installing to the home
+  // screen.
   if (evt.request.method === 'GET') {
     evt.respondWith(
       fetch(evt.request).then((resp) => {
@@ -2163,8 +2196,8 @@ self.addEventListener('fetch', (evt) => {
         // Not a real page -- our own not-yet-paired waiting page, or a
         // genuine server error. Prefer the last cached shell if there is
         // one, so the app still opens.
-        return caches.match(evt.request).then((cached) => cached || caches.match(self.registration.scope) || resp);
-      }).catch(() => caches.match(evt.request).then((cached) => cached || caches.match(self.registration.scope)))
+        return caches.match(evt.request).then((cached) => cached || caches.match(ROOT_URL) || resp);
+      }).catch(() => caches.match(evt.request).then((cached) => cached || caches.match(ROOT_URL)))
     );
   }
 });
@@ -3827,8 +3860,16 @@ async function flushQueue() {
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     // Relative registration/scope keeps this correct regardless of what
-    // path the app happens to be served under.
-    navigator.serviceWorker.register('sw.js').catch(()=>{});
+    // path the app happens to be served under. sid/key are forwarded
+    // onto the SW script's own URL (readable inside it as
+    // self.location.search) so the worker can precache -- and fall back
+    // to -- the actual paired root instead of a bare "/", which is what
+    // caused the blank white page after installing to the home screen.
+    const cd = window.__CLOUD_DIRECT__;
+    const swUrl = cd
+      ? 'sw.js?sid=' + encodeURIComponent(cd.sessionId) + '&key=' + encodeURIComponent(cd.secretKey)
+      : 'sw.js';
+    navigator.serviceWorker.register(swUrl).catch(()=>{});
   });
 }
 let deferredInstallPrompt = null;
