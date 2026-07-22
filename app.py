@@ -3461,7 +3461,7 @@ setInterval(function () {
   if (modalEl && modalEl.innerHTML.trim() !== '') return;
   if (state.tab === 'add-tenant') return;
   render();
-}, 20000);
+}, 90000);
 window.addEventListener('online', pingServer);
 window.addEventListener('offline', () => setOnline(false));
 
