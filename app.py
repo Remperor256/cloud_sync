@@ -29,7 +29,7 @@ import calendar
 import threading
 import webbrowser
 from urllib.parse import quote
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -191,6 +191,48 @@ PERIOD_LABELS = {"current": "Current Month", "next": "Next Month",
 CLOUD_MODE = os.environ.get("CLOUD_MODE") == "1"
 _cloud_pool = None
 
+
+def _parse_iso_dt(s):
+    """Parses an ISO-8601 timestamp string into a timezone-AWARE datetime,
+    treating a naive string (no offset) as UTC. Returns None if `s` is
+    falsy or unparseable.
+
+    This exists because timestamps compared for "which edit is newer"
+    come from two different clocks: the PC's own `datetime.now()` (naive,
+    in whatever timezone the PC's OS is set to) and Postgres's `now()`
+    (UTC). Comparing those two ISO strings directly with `>=` -- which
+    /api/_sync used to do -- is only valid when both strings use the same
+    UTC offset. For a PC in a timezone ahead of UTC, its naive local-time
+    string sorts as lexically LATER than a genuinely more recent UTC
+    string, so every push looked artificially "current" and, worse, the
+    PC's own bookkeeping of "the last cloud state I've seen" got stamped
+    with that inflated local time -- silently masking every real edit
+    made elsewhere for the rest of that UTC offset window. Parsing both
+    into actual datetimes and comparing those (Python compares
+    timezone-aware datetimes correctly, honoring the offset) fixes it."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _iso_ge(a, b):
+    """True if timestamp string `a` is >= timestamp string `b`, comparing
+    as actual datetimes (see _parse_iso_dt) rather than raw strings. A
+    missing/unparseable `b` loses (anything real beats nothing); a
+    missing/unparseable `a` never wins."""
+    da, db = _parse_iso_dt(a), _parse_iso_dt(b)
+    if da is None:
+        return False
+    if db is None:
+        return True
+    return da >= db
+
 if CLOUD_MODE:
     import psycopg2
     import psycopg2.extras
@@ -295,6 +337,12 @@ if CLOUD_MODE:
         return row["data"]
 
     def _cloud_save(session_id, data, updated_by=None):
+        """Always stamps updated_at with the DATABASE's own now() -- never
+        a client-supplied value -- so it's authoritative regardless of
+        which device's clock/timezone triggered the write. Returns that
+        timestamp (ISO, UTC) so callers (notably /api/_sync below) can
+        hand it back to whoever pushed, instead of them relying on their
+        own local clock for bookkeeping."""
         with _cloud_conn() as conn, conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO cloud_sessions (session_id, secret_key, data, updated_at, updated_by)
@@ -303,8 +351,11 @@ if CLOUD_MODE:
                     SET data = EXCLUDED.data,
                         updated_at = now(),
                         updated_by = EXCLUDED.updated_by
+                RETURNING updated_at
             """, (session_id, g.secret_key, json.dumps(data), updated_by))
+            row = cur.fetchone()
             conn.commit()
+            return row[0].isoformat() if row else None
 
     def _cloud_touch_device(session_id, device_id, user_agent=None, screen_hint=""):
         """Cloud-mode counterpart to the LAN model's _touch_device(): same
@@ -688,8 +739,7 @@ def _stamp_changed_records(new_data, old_data):
     snapshots (which is what used to let one side's edit to a shared
     record get silently discarded whenever the other side's snapshot
     was picked as "the base")."""
-    now_iso = datetime.now().isoformat()
-
+    now_iso = datetime.now(timezone.utc).isoformat()
     old_tenants = {_tenant_key(t): t for t in (old_data.get("tenants") or [])}
     for t in (new_data.get("tenants") or []):
         old_t = old_tenants.get(_tenant_key(t))
@@ -718,8 +768,7 @@ def save_raw(data, updated_by=None):
         old_data = {"units": {}, "tenants": [], "settings": {}}
     _stamp_changed_records(data, old_data)
     if CLOUD_MODE:
-        _cloud_save(g.session_id, data, updated_by=updated_by or "cloud")
-        return
+        return _cloud_save(g.session_id, data, updated_by=updated_by or "cloud")
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     try:
@@ -730,6 +779,7 @@ def save_raw(data, updated_by=None):
         export_pdf(data)
     except Exception:
         pass
+    return None
 
 
 def load_state():
@@ -2332,7 +2382,7 @@ def cloud_sync():
         return jsonify({"ok": False, "error": "bad_request"}), 400
 
     row = _cloud_get_row(g.session_id)
-    if row and row["updated_at"].isoformat() >= incoming_updated_at:
+    if row and _iso_ge(row["updated_at"].isoformat(), incoming_updated_at):
         # Server already has something at least as new (e.g. the phone
         # wrote directly to the cloud after this snapshot was taken) --
         # last-edit-wins means the incoming (older) push loses; hand back
@@ -2343,8 +2393,8 @@ def cloud_sync():
             "current": {"data": row["data"], "updated_at": row["updated_at"].isoformat()},
         })
 
-    save_raw(incoming_data, updated_by=updated_by)
-    return jsonify({"ok": True, "stored": True})
+    server_updated_at = save_raw(incoming_data, updated_by=updated_by)
+    return jsonify({"ok": True, "stored": True, "updated_at": server_updated_at})
 
 
 
