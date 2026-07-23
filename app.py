@@ -5178,3 +5178,157 @@ const MONTH_NAMES = ['January','February','March','April','May','June','July',
 
 function populateMonthlyPickers() {
   const now = new Date();
+  const monthSel = $('#mrMonth'), yearSel = $('#mrYear');
+  if (!monthSel || !yearSel) return;
+  monthSel.innerHTML = MONTH_NAMES.map((m, i) =>
+    `<option value="${i+1}" ${i === now.getMonth() ? 'selected' : ''}>${m}</option>`).join('');
+  const startYear = now.getFullYear() - 3;
+  let yearsHtml = '';
+  for (let y = startYear; y <= now.getFullYear() + 1; y++) {
+    yearsHtml += `<option value="${y}" ${y === now.getFullYear() ? 'selected' : ''}>${y}</option>`;
+  }
+  yearSel.innerHTML = yearsHtml;
+}
+
+async function generateMonthlyReport() {
+  const month = $('#mrMonth').value, year = $('#mrYear').value;
+  const box = $('#mrResults');
+  box.innerHTML = `<div class="sub" style="color:var(--muted);">Generating…</div>`;
+  try {
+    const res = await fetchTimeout(`/api/monthly-report?year=${year}&month=${month}`, {}, 6000);
+    const report = await res.json();
+    if (report.error) { box.innerHTML = `<div class="sub" style="color:var(--danger);">${escapeHtml(report.error)}</div>`; return; }
+    const rowsHtml = report.tenant_rows.length
+      ? report.tenant_rows.map(r => `
+        <div class="hist-row">
+          <div>${escapeHtml(r.name)} <span style="color:var(--muted);">(${escapeHtml(r.unit)})</span></div>
+          <div style="text-align:right;font-weight:700;">${fmt(r.pay_active + r.dep_active)}</div>
+        </div>`).join('')
+      : `<div class="hist-empty">No transactions in ${escapeHtml(report.month_label)}.</div>`;
+    box.innerHTML = `
+      <div style="font-family:'Space Grotesk';font-size:20px;font-weight:700;color:var(--teal-deep);margin-top:6px;">
+        ${fmt(report.grand_combined)}
+      </div>
+      <div style="display:flex;gap:16px;margin:6px 0 12px;font-size:12px;">
+        <div><b style="color:var(--good);">${fmt(report.grand_pay)}</b><div style="color:var(--muted);">Full</div></div>
+        <div><b style="color:var(--teal-deep);">${fmt(report.grand_dep)}</b><div style="color:var(--muted);">Deposits</div></div>
+        <div><b style="color:var(--danger);">${fmt(report.grand_cancelled)}</b><div style="color:var(--muted);">Cancelled</div></div>
+      </div>
+      ${rowsHtml}
+      <a class="linklike" style="display:block;margin-top:12px;" href="api/export/monthly-excel?year=${year}&month=${month}">⬇ Download Monthly Excel (.xlsx)</a>
+    `;
+  } catch (e) {
+    box.innerHTML = `<div class="sub" style="color:var(--danger);">Couldn't generate the report — check the connection and try again.</div>`;
+  }
+}
+
+// ── pull-to-refresh ──────────────────────────────────────────────────
+// Only engages when the page is scrolled all the way to the top (so it
+// never fights with normal scrolling further down), and re-runs whatever
+// tab is currently showing by re-dispatching switchTab, which re-fetches
+// from the server (bypassing nothing — /api/* is never cached by the
+// service worker, see sw.js above) and re-renders with fresh data.
+(function setupPullToRefresh() {
+  const main = $('#main');
+  const indicator = $('#ptrIndicator');
+  if (!main || !indicator) return;
+  const THRESHOLD = 70;
+  let startY = null, pulling = false, refreshing = false;
+
+  main.addEventListener('touchstart', (e) => {
+    if (refreshing || main.scrollTop > 0) { startY = null; return; }
+    startY = e.touches[0].clientY;
+    pulling = true;
+  }, { passive: true });
+
+  main.addEventListener('touchmove', (e) => {
+    if (!pulling || startY === null || refreshing) return;
+    const dy = e.touches[0].clientY - startY;
+    if (dy <= 0) return;
+    indicator.classList.add('visible');
+    if (dy > THRESHOLD) {
+      indicator.classList.add('ready');
+      indicator.textContent = '↑ Release to refresh';
+    } else {
+      indicator.classList.remove('ready');
+      indicator.textContent = '↓ Pull to refresh';
+    }
+  }, { passive: true });
+
+  main.addEventListener('touchend', async (e) => {
+    if (!pulling || startY === null || refreshing) { pulling = false; return; }
+    const ready = indicator.classList.contains('ready');
+    pulling = false;
+    startY = null;
+    if (!ready) {
+      indicator.classList.remove('visible', 'ready');
+      return;
+    }
+    refreshing = true;
+    indicator.textContent = '⟳ Refreshing…';
+    indicator.classList.add('spinning');
+    await pingServer();
+    switchTab(state.tab);
+    setTimeout(() => {
+      indicator.classList.remove('visible', 'ready', 'spinning');
+      refreshing = false;
+    }, 400);
+  });
+})();
+
+// ── boot ─────────────────────────────────────────────────────────────
+async function boot() {
+  booted = true;
+  loadCloudConfig();
+  switchTab('dashboard');
+}
+async function init() {
+  let ls;
+  try {
+    const res = await fetchTimeout('/api/lock-status', {headers: {'X-Device-Id': DEVICE_ID}}, 3500);
+    ls = await res.json();
+    adoptCanonicalDeviceId(ls && ls.canonical_device_id);
+    if (ls && (ls.kicked || ls.disconnecting || ls.pending_approval || ls.device_limit_reached)) {
+      enterBlockedState(ls);
+      return;
+    }
+    cacheSet('/api/lock-status', ls);
+    setOnline(true);
+  } catch (err) {
+    setOnline(false);
+    ls = cacheGet('/api/lock-status') || { pin_set: false, unlocked: true };
+  }
+  if (ls.pin_set && !ls.unlocked) { showLock(); }
+  else { hideLock(); boot(); }
+  updateSyncBadge();
+}
+init();
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    no_browser = os.environ.get("RM_NO_BROWSER") == "1"
+    lan_ip = get_lan_ip()
+    print(f"\n  {APP_NAME} -- web edition (single file)")
+    print(f"  Data file: {DATA_FILE}")
+    print(f"  On this PC:      http://127.0.0.1:{port}")
+    print(f"  On your phone:   http://{lan_ip}:{port}   (same Wi-Fi)")
+    print(f"  Or just scan the QR code at: http://127.0.0.1:{port}/connect\n")
+
+    if not no_browser:
+        # Standalone run (person double-clicked/ran this file themselves) —
+        # open the "Connect Your Phone" page on this PC as a convenience.
+        def _open_connect_page():
+            try:
+                webbrowser.open(f"http://127.0.0.1:{port}/connect")
+            except Exception:
+                pass
+        threading.Timer(1.0, _open_connect_page).start()
+    # else: launched from the desktop app's Settings → Connect Phone, which
+    # already shows its own QR code in-window — nothing should open on the PC.
+
+    app.run(host="0.0.0.0", port=port, debug=False)
