@@ -50,6 +50,24 @@ import base64
 # before the file reaches the "Flask app + REST API" section.
 app = Flask(__name__)
 
+
+@app.errorhandler(Exception)
+def _api_error_handler(err):
+    """Without this, any unhandled exception in a route (a bug, a bad
+    Postgres value, whatever) falls through to Flask's default error
+    page -- plain HTML, not JSON. The frontend's api() helper can't
+    parse that as JSON, so it silently swallows the real cause and
+    just shows the generic 'Request failed.' toast, which is exactly
+    what makes bugs like this hard to track down from a bug report
+    alone. Logging the real traceback server-side and returning it as
+    JSON means the *next* time this fires, the toast (and the server
+    log) shows what actually broke instead of a dead end."""
+    import traceback
+    traceback.print_exc()
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": f"{type(err).__name__}: {err}"}), 500
+    raise err
+
 try:
     import qrcode
     QRCODE_OK = True
@@ -1288,19 +1306,15 @@ def cancel_transaction(t, h_key, idx):
     if pre_state is not None:
         restore_tenant_state(t, pre_state)
     else:
-        old_due = rec.get("_pre_due_date")  # not tracked in legacy records; best effort
-        if h_key == "payment":
-            t["status"] = "Pending"
-            t.pop("pay_date", None)
-            t.pop("locked_periods", None)
-        elif h_key == "deposit":
+        # Legacy record saved before _pre_state existed -- best effort.
+        if h_key == "deposit_history":
             cycle_start = t.get("deposit_cycle_start", 0)
             if isinstance(cycle_start, int) and cycle_start > idx:
                 prev_start = rec.get("_cycle_start_before_clear", idx)
                 t["deposit_cycle_start"] = prev_start
-            t["status"] = "Pending"
-            t.pop("pay_date", None)
-            t.pop("locked_periods", None)
+        t["status"] = "Pending"
+        t.pop("pay_date", None)
+        t.pop("locked_periods", None)
 
     total_amt = sum(float(r.get("amount", 0)) for _, _, r in linked)
     return {"n_records": len(linked), "total_amount": total_amt}
