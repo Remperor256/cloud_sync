@@ -274,8 +274,14 @@ if CLOUD_MODE:
                     first_seen   DOUBLE PRECISION NOT NULL,
                     last_seen    DOUBLE PRECISION NOT NULL,
                     kicked       BOOLEAN NOT NULL DEFAULT false,
+                    fingerprint  TEXT,
                     PRIMARY KEY (session_id, device_id)
                 )
+            """)
+            # fingerprint didn't exist on tables created before this change --
+            # add it if missing so upgrades don't need a manual migration.
+            cur.execute("""
+                ALTER TABLE cloud_devices ADD COLUMN IF NOT EXISTS fingerprint TEXT
             """)
             # The one-time pairing token that gates "/" -- see
             # _cloud_pairing_ok() below. A NULL token means nothing is
@@ -357,18 +363,33 @@ if CLOUD_MODE:
             conn.commit()
             return row[0].isoformat() if row else None
 
-    def _cloud_touch_device(session_id, device_id, user_agent=None, screen_hint=""):
+    def _cloud_touch_device(session_id, device_id, user_agent=None, screen_hint="", fingerprint=""):
         """Cloud-mode counterpart to the LAN model's _touch_device(): same
         semantics (immediate admit, no separate approval step, label
         re-derived on every poll so it can upgrade from a generic
         'iPhone'/'Android' to a specific model, MAX_DEVICES cap per
         session) but backed by Postgres so the roster is shared by every
         phone hitting this session_id directly -- no PC involved -- and
-        survives Render worker restarts. Returns True if this device_id
-        is now tracked (and therefore admitted), False only if the cap is
-        full or it's kicked."""
+        survives Render worker restarts.
+
+        Returns (admitted, canonical_device_id). admitted is False only if
+        the cap is full or it's kicked. canonical_device_id is normally
+        just `device_id` echoed back -- except when `device_id` is brand
+        new here but its `fingerprint` (stable hardware/browser signals,
+        not tied to any one storage context -- see DEVICE_FINGERPRINT in
+        the JS below) matches an ALREADY-known device on this roster. That
+        happens whenever the same physical phone shows up through a
+        storage context that doesn't share localStorage with wherever it
+        was recognized before -- most commonly, iOS treats a web app
+        "Added to Home Screen" as a separate storage silo from Safari
+        itself, and some in-app/QR-scanner browsers do the same, even
+        though it's the identical device. Rather than registering a
+        second roster entry for what's really one phone, this reuses the
+        existing device's row and hands its id back so the caller can
+        tell the client to adopt it -- from then on that context IS that
+        device, not a new one."""
         if not device_id:
-            return True
+            return True, device_id
         now = time.time()
         with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -377,32 +398,60 @@ if CLOUD_MODE:
             rec = cur.fetchone()
             if rec is not None:
                 if rec["kicked"]:
-                    return False  # not admitted -- caller also checks this directly
+                    return False, device_id  # not admitted -- caller also checks this directly
                 label = _label_for_user_agent(user_agent, screen_hint)
                 if label and label != "Device":
                     cur.execute(
-                        "UPDATE cloud_devices SET last_seen=%s, label=%s "
+                        "UPDATE cloud_devices SET last_seen=%s, label=%s, fingerprint=COALESCE(NULLIF(%s,''), fingerprint) "
                         "WHERE session_id=%s AND device_id=%s",
-                        (now, label, session_id, device_id))
+                        (now, label, fingerprint, session_id, device_id))
                 else:
                     cur.execute(
-                        "UPDATE cloud_devices SET last_seen=%s "
+                        "UPDATE cloud_devices SET last_seen=%s, fingerprint=COALESCE(NULLIF(%s,''), fingerprint) "
                         "WHERE session_id=%s AND device_id=%s",
-                        (now, session_id, device_id))
+                        (now, fingerprint, session_id, device_id))
                 conn.commit()
-                return True
+                return True, device_id
+
+            # Unknown device_id -- before registering it as a new phone,
+            # see if an already-known, non-kicked device on this roster
+            # has the same fingerprint. If so, this is the same physical
+            # phone showing up from a different storage context.
+            if fingerprint:
+                cur.execute(
+                    "SELECT device_id FROM cloud_devices "
+                    "WHERE session_id=%s AND fingerprint=%s AND kicked=false "
+                    "ORDER BY last_seen DESC LIMIT 1",
+                    (session_id, fingerprint))
+                match = cur.fetchone()
+                if match:
+                    canonical_id = match["device_id"]
+                    label = _label_for_user_agent(user_agent, screen_hint)
+                    if label and label != "Device":
+                        cur.execute(
+                            "UPDATE cloud_devices SET last_seen=%s, label=%s "
+                            "WHERE session_id=%s AND device_id=%s",
+                            (now, label, session_id, canonical_id))
+                    else:
+                        cur.execute(
+                            "UPDATE cloud_devices SET last_seen=%s "
+                            "WHERE session_id=%s AND device_id=%s",
+                            (now, session_id, canonical_id))
+                    conn.commit()
+                    return True, canonical_id
+
             cur.execute(
                 "SELECT COUNT(*) AS n FROM cloud_devices WHERE session_id=%s AND kicked=false",
                 (session_id,))
             if cur.fetchone()["n"] >= MAX_DEVICES:
-                return False
+                return False, device_id
             cur.execute("""
-                INSERT INTO cloud_devices (session_id, device_id, label, first_seen, last_seen, kicked)
-                VALUES (%s, %s, %s, %s, %s, false)
+                INSERT INTO cloud_devices (session_id, device_id, label, first_seen, last_seen, kicked, fingerprint)
+                VALUES (%s, %s, %s, %s, %s, false, %s)
                 ON CONFLICT (session_id, device_id) DO NOTHING
-            """, (session_id, device_id, _label_for_user_agent(user_agent, screen_hint), now, now))
+            """, (session_id, device_id, _label_for_user_agent(user_agent, screen_hint), now, now, fingerprint))
             conn.commit()
-            return True
+            return True, device_id
 
     def _cloud_device_kicked(session_id, device_id):
         if not device_id:
@@ -583,11 +632,16 @@ def _cloud_gate():
     if device_id:
         if _cloud_device_kicked(session_id, device_id):
             return jsonify({"ok": False, "error": "kicked"}), 403
-        if not _cloud_touch_device(session_id, device_id,
-                                    request.headers.get("User-Agent"),
-                                    request.headers.get("X-Device-Screen", "")):
+        admitted, canonical_id = _cloud_touch_device(
+            session_id, device_id,
+            request.headers.get("User-Agent"),
+            request.headers.get("X-Device-Screen", ""),
+            request.headers.get("X-Device-Fingerprint", ""))
+        if not admitted:
             return jsonify({"ok": False, "error": "device_limit_reached",
                              "max_devices": MAX_DEVICES}), 403
+        if canonical_id != device_id:
+            g.canonical_device_id = canonical_id
     return None
 
 
@@ -607,8 +661,16 @@ def _cors_headers(resp):
     if CLOUD_MODE:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id")
+            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id, X-Device-Fingerprint")
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        canonical_id = getattr(g, "canonical_device_id", None)
+        if canonical_id:
+            # Tells the client its current X-Device-Id wasn't recognized as
+            # new, but matched an already-known device's fingerprint (see
+            # _cloud_touch_device) -- the client adopts this id from here
+            # on instead of staying registered as a separate device.
+            resp.headers["X-Canonical-Device-Id"] = canonical_id
+            resp.headers["Access-Control-Expose-Headers"] = "X-Canonical-Device-Id"
     return resp
 
 
@@ -1961,23 +2023,29 @@ def _label_for_user_agent(ua, screen_hint=""):
     return "Device"
 
 
-def _touch_device(device_id, user_agent=None, screen_hint=""):
+def _touch_device(device_id, user_agent=None, screen_hint="", fingerprint=""):
     """Refresh an already-known device's last-seen time, or register a
     brand-new one -- immediately admitted, no separate approval step --
-    if there's room under MAX_DEVICES. Returns True if this device_id is
-    now tracked (and therefore admitted), False only if it was turned
-    away because the cap is already full or it was explicitly
-    disconnected from the desktop app's device list. Existing devices
-    (online or not) are never evicted to make room for a newcomer -- a
-    slot only frees up when the desktop app disconnects one."""
+    if there's room under MAX_DEVICES. Returns (admitted, canonical_id):
+    admitted is False only if it was turned away because the cap is
+    already full or it was explicitly disconnected from the desktop
+    app's device list. Existing devices (online or not) are never
+    evicted to make room for a newcomer -- a slot only frees up when the
+    desktop app disconnects one.
+
+    Same fingerprint-based reconciliation as the cloud counterpart (see
+    _cloud_touch_device): an unrecognized device_id whose fingerprint
+    matches an already-known device reuses that device's slot instead of
+    registering a new one, and canonical_id tells the caller which id
+    that was."""
     if not device_id:
-        return True
+        return True, device_id
     import time
     with _devices_lock:
         devices = _devices_dict()
         rec = devices.get(device_id)
         if rec is not None and rec.get("kicked"):
-            return False
+            return False, device_id
         now = time.time()
         if rec is not None:
             rec["last_seen"] = now
@@ -1990,18 +2058,34 @@ def _touch_device(device_id, user_agent=None, screen_hint=""):
             fresh_label = _label_for_user_agent(user_agent, screen_hint)
             if fresh_label and fresh_label not in ("Device",):
                 rec["label"] = fresh_label
+            if fingerprint:
+                rec["fingerprint"] = fingerprint
             _save_devices_locked()
-            return True
+            return True, device_id
+        if fingerprint:
+            match_id = next(
+                (d for d, r in devices.items()
+                 if not r.get("kicked") and r.get("fingerprint") == fingerprint),
+                None)
+            if match_id:
+                match_rec = devices[match_id]
+                match_rec["last_seen"] = now
+                fresh_label = _label_for_user_agent(user_agent, screen_hint)
+                if fresh_label and fresh_label not in ("Device",):
+                    match_rec["label"] = fresh_label
+                _save_devices_locked()
+                return True, match_id
         if sum(1 for r in devices.values() if not r.get("kicked")) >= MAX_DEVICES:
-            return False
+            return False, device_id
         devices[device_id] = {
             "first_seen": now,
             "last_seen": now,
             "label": _label_for_user_agent(user_agent, screen_hint),
             "kicked": False,
+            "fingerprint": fingerprint,
         }
         _save_devices_locked()
-        return True
+        return True, device_id
 
 
 def _device_admitted(device_id):
@@ -2421,13 +2505,15 @@ def lock_status():
     device_id = request.headers.get("X-Device-Id", "")
     kicked = _device_was_kicked(device_id)
     admitted = True
+    canonical_device_id = None
     if not _disconnect_state["announced"] and not kicked:
-        admitted = _touch_device(
+        admitted, canonical_device_id = _touch_device(
             device_id,
             request.headers.get("User-Agent"),
             request.headers.get("X-Device-Screen", ""),
+            request.headers.get("X-Device-Fingerprint", ""),
         )
-    return jsonify({
+    resp = {
         "pin_set": _pin_required(data),
         "unlocked": _authed(),
         "app_name": APP_NAME,
@@ -2436,7 +2522,10 @@ def lock_status():
         "device_count": _active_device_count(),
         "max_devices": MAX_DEVICES,
         "device_limit_reached": (not admitted) and not kicked,
-    })
+    }
+    if canonical_device_id and canonical_device_id != device_id:
+        resp["canonical_device_id"] = canonical_device_id
+    return jsonify(resp)
 
 
 @app.route("/api/device-count")
@@ -3610,7 +3699,20 @@ function getDeviceId() {
   }
   return id;
 }
-const DEVICE_ID = getDeviceId();
+let DEVICE_ID = getDeviceId();
+function adoptCanonicalDeviceId(canonical) {
+  // The server recognizes phones primarily by this localStorage-held id,
+  // but that storage isn't always the same across contexts on the SAME
+  // physical phone: iOS treats a web app "Added to Home Screen" as a
+  // separate storage silo from Safari itself, and some in-app/QR-scanner
+  // browsers do too. When the server's fingerprint match (see
+  // DEVICE_FINGERPRINT below) says this context is really an
+  // already-known device, it hands back that device's real id -- adopt
+  // it here so this context IS that device from now on, not a new one.
+  if (!canonical || canonical === DEVICE_ID) return;
+  DEVICE_ID = canonical;
+  try { localStorage.setItem(DEVICE_ID_KEY, canonical); } catch(e) {}
+}
 // Safari deliberately omits the specific iPhone/iPad model from its
 // User-Agent string (unlike Android, which usually names the exact
 // model), so there's no reliable way to ask the browser "which iPhone is
@@ -3618,6 +3720,33 @@ const DEVICE_ID = getDeviceId();
 // perfect (several generations share the same screen size) but enough
 // for the server to make a reasonable guess instead of just "iPhone".
 const DEVICE_SCREEN_HINT = `${screen.width}x${screen.height}@${window.devicePixelRatio || 1}`;
+// A small, stable hash of signals that stay the same for this physical
+// device/browser combination regardless of which storage silo a given
+// page load happens to be in (Safari tab vs. home-screen install vs. an
+// in-app browser) -- used server-side to recognize "this is the same
+// phone as an already-known device" even when localStorage itself
+// isn't shared between those contexts. Not meant to be unique across
+// ALL devices (two identical phone models could coincide) -- just
+// stable for THIS one across contexts, which is what actually matters
+// here: the fallback only ever kicks in for an otherwise-unrecognized
+// device_id, so a coincidental match just means one fewer duplicate
+// entry on the household's device list, never a security boundary.
+function _fnv1aHash(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
+const DEVICE_FINGERPRINT = _fnv1aHash([
+  navigator.userAgent,
+  screen.width + 'x' + screen.height,
+  navigator.platform || '',
+  navigator.hardwareConcurrency || '',
+  navigator.maxTouchPoints || '',
+  navigator.language || '',
+].join('|'));
 let isOnline = true;
 let syncing = false;
 let tempIdCounter = 0;
@@ -3800,15 +3929,18 @@ async function fetchTimeout(path, opts={}, ms=4000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
   // Every call site already sends X-Device-Id; adding the screen hint
-  // here once means every request tags along the model-guessing hint
+  // and fingerprint here once means every request tags along the
+  // model-guessing hint and the cross-context device-recognition signal
   // without having to touch every fetchTimeout(...) call individually.
-  const headers = { ...(opts.headers || {}), 'X-Device-Screen': DEVICE_SCREEN_HINT };
+  const headers = { ...(opts.headers || {}), 'X-Device-Screen': DEVICE_SCREEN_HINT, 'X-Device-Fingerprint': DEVICE_FINGERPRINT };
   if (CLOUD_DIRECT && path.charAt(0) === '/' && path.indexOf('/api/') === 0) {
     headers['X-Session-Id'] = CLOUD_DIRECT.sessionId;
     headers['X-Secret-Key'] = CLOUD_DIRECT.secretKey;
   }
   try {
-    return await fetch(path, {...opts, headers, signal: ctrl.signal});
+    const res = await fetch(path, {...opts, headers, signal: ctrl.signal});
+    adoptCanonicalDeviceId(res.headers.get('X-Canonical-Device-Id'));
+    return res;
   } finally {
     clearTimeout(timer);
   }
@@ -3820,6 +3952,7 @@ async function pingServer() {
       {cache:'no-store', headers: {'X-Device-Id': DEVICE_ID}}, 3500);
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
+      adoptCanonicalDeviceId(data && data.canonical_device_id);
       if (data && (data.kicked || data.disconnecting || data.pending_approval || data.device_limit_reached)) {
         enterBlockedState(data);
         return false;
@@ -5134,6 +5267,7 @@ async function init() {
   try {
     const res = await fetchTimeout('/api/lock-status', {headers: {'X-Device-Id': DEVICE_ID}}, 3500);
     ls = await res.json();
+    adoptCanonicalDeviceId(ls && ls.canonical_device_id);
     if (ls && (ls.kicked || ls.disconnecting || ls.pending_approval || ls.device_limit_reached)) {
       enterBlockedState(ls);
       return;
