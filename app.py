@@ -664,9 +664,17 @@ def _cloud_gate():
     if not session_id or not secret_key:
         return jsonify({"ok": False, "error": "session_required"}), 401
 
-    if path == "/api/_sync" and request.method == "PUT":
-        # First-ever push for a brand-new session is allowed to establish
-        # the secret key; every other request must match what's stored.
+    if path == "/api/_sync" and request.method in ("PUT", "GET"):
+        # A session with no row yet isn't a bad secret -- it just hasn't
+        # been created by a first push yet (fresh cloud database, or a
+        # phone/browser reaching this service before the PC's first
+        # push has landed). PUT already treated this as "fine, this
+        # push establishes it"; GET used to fall through to the generic
+        # check below and get a hard bad_secret 403 instead of reaching
+        # cloud_sync()'s own, already-correct {"exists": false} response
+        # -- which is exactly what looked like "cloud unreachable" on
+        # both the phone (blank page) and the PC (device list stuck on
+        # "retrying...") even though the service was up the whole time.
         row = _cloud_get_row(session_id)
         if row and row["secret_key"] != secret_key:
             return jsonify({"ok": False, "error": "bad_secret"}), 403
