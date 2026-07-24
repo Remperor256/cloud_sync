@@ -301,17 +301,11 @@ if CLOUD_MODE:
             cur.execute("""
                 ALTER TABLE cloud_devices ADD COLUMN IF NOT EXISTS fingerprint TEXT
             """)
-            # alias is the user-chosen device name from onboarding (e.g.
-            # "Mary's phone"), kept deliberately separate from `label`
-            # (the auto-detected model, e.g. "Tecno KI5k"). `label` keeps
-            # getting silently re-derived on every poll in
-            # _cloud_touch_device so it can upgrade from a generic guess
-            # to a specific model as soon as a usable hint shows up --
-            # `alias`, once set, is only ever touched by the explicit
-            # /api/devices/<id>/alias call, never overwritten by presence
-            # polling. Display logic prefers alias, falls back to label.
+            # custom_label_locked: once a person names their own device (see
+            # _cloud_set_device_label), the auto-detected user-agent label
+            # must stop overwriting it on every subsequent poll.
             cur.execute("""
-                ALTER TABLE cloud_devices ADD COLUMN IF NOT EXISTS alias TEXT
+                ALTER TABLE cloud_devices ADD COLUMN IF NOT EXISTS custom_label_locked BOOLEAN NOT NULL DEFAULT false
             """)
             # The one-time pairing token that gates "/" -- see
             # _cloud_pairing_ok() below. A NULL token means nothing is
@@ -393,7 +387,7 @@ if CLOUD_MODE:
             conn.commit()
             return row[0].isoformat() if row else None
 
-    def _cloud_touch_device(session_id, device_id, user_agent=None, screen_hint="", fingerprint="", model_hint=""):
+    def _cloud_touch_device(session_id, device_id, user_agent=None, screen_hint="", fingerprint=""):
         """Cloud-mode counterpart to the LAN model's _touch_device(): same
         semantics (immediate admit, no separate approval step, label
         re-derived on every poll so it can upgrade from a generic
@@ -401,12 +395,6 @@ if CLOUD_MODE:
         session) but backed by Postgres so the roster is shared by every
         phone hitting this session_id directly -- no PC involved -- and
         survives Render worker restarts.
-
-        model_hint (from navigator.userAgentData, when the browser
-        supports it) is passed straight through to _label_for_user_agent,
-        which prefers it over the UA-string regex -- see that function's
-        docstring. Never touches `alias`: that column is only ever
-        written by the explicit /api/devices/<id>/alias endpoint.
 
         Returns (admitted, canonical_device_id). admitted is False only if
         the cap is full or it's kicked. canonical_device_id is normally
@@ -429,13 +417,22 @@ if CLOUD_MODE:
         now = time.time()
         with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT kicked FROM cloud_devices WHERE session_id=%s AND device_id=%s",
+                "SELECT kicked, custom_label_locked FROM cloud_devices WHERE session_id=%s AND device_id=%s",
                 (session_id, device_id))
             rec = cur.fetchone()
             if rec is not None:
                 if rec["kicked"]:
                     return False, device_id  # not admitted -- caller also checks this directly
-                label = _label_for_user_agent(user_agent, screen_hint, model_hint)
+                if rec["custom_label_locked"]:
+                    # Person named this device themselves -- never let the
+                    # auto-detected user-agent label clobber it again.
+                    cur.execute(
+                        "UPDATE cloud_devices SET last_seen=%s, fingerprint=COALESCE(NULLIF(%s,''), fingerprint) "
+                        "WHERE session_id=%s AND device_id=%s",
+                        (now, fingerprint, session_id, device_id))
+                    conn.commit()
+                    return True, device_id
+                label = _label_for_user_agent(user_agent, screen_hint)
                 if label and label != "Device":
                     cur.execute(
                         "UPDATE cloud_devices SET last_seen=%s, label=%s, fingerprint=COALESCE(NULLIF(%s,''), fingerprint) "
@@ -455,14 +452,21 @@ if CLOUD_MODE:
             # phone showing up from a different storage context.
             if fingerprint:
                 cur.execute(
-                    "SELECT device_id FROM cloud_devices "
+                    "SELECT device_id, custom_label_locked FROM cloud_devices "
                     "WHERE session_id=%s AND fingerprint=%s AND kicked=false "
                     "ORDER BY last_seen DESC LIMIT 1",
                     (session_id, fingerprint))
                 match = cur.fetchone()
                 if match:
                     canonical_id = match["device_id"]
-                    label = _label_for_user_agent(user_agent, screen_hint, model_hint)
+                    if match["custom_label_locked"]:
+                        cur.execute(
+                            "UPDATE cloud_devices SET last_seen=%s "
+                            "WHERE session_id=%s AND device_id=%s",
+                            (now, session_id, canonical_id))
+                        conn.commit()
+                        return True, canonical_id
+                    label = _label_for_user_agent(user_agent, screen_hint)
                     if label and label != "Device":
                         cur.execute(
                             "UPDATE cloud_devices SET last_seen=%s, label=%s "
@@ -485,7 +489,7 @@ if CLOUD_MODE:
                 INSERT INTO cloud_devices (session_id, device_id, label, first_seen, last_seen, kicked, fingerprint)
                 VALUES (%s, %s, %s, %s, %s, false, %s)
                 ON CONFLICT (session_id, device_id) DO NOTHING
-            """, (session_id, device_id, _label_for_user_agent(user_agent, screen_hint, model_hint), now, now, fingerprint))
+            """, (session_id, device_id, _label_for_user_agent(user_agent, screen_hint), now, now, fingerprint))
             conn.commit()
             return True, device_id
 
@@ -503,16 +507,11 @@ if CLOUD_MODE:
         """Snapshot for the desktop app's admin list -- same shape as the
         LAN model's _list_devices() so _render_connected_devices_list()
         on the desktop side needs no changes: device_id, short_id, label,
-        last_seen (epoch), online. `label` here is alias-if-set else the
-        auto-detected model, so the desktop side doesn't need to know
-        alias exists at all -- it just keeps showing whatever's in
-        `label` like before. auto_label is included too, for any caller
-        (e.g. the onboarding modal's suggested name) that wants the
-        underlying detected model even once an alias is set."""
+        last_seen (epoch), online."""
         now = time.time()
         with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT device_id, label, alias, last_seen FROM cloud_devices
+                SELECT device_id, label, last_seen FROM cloud_devices
                 WHERE session_id=%s AND kicked=false
                 ORDER BY last_seen DESC
             """, (session_id,))
@@ -521,28 +520,12 @@ if CLOUD_MODE:
             {
                 "device_id": r["device_id"],
                 "short_id": r["device_id"][:8],
-                "label": r["alias"] or r["label"] or "Unknown device",
-                "auto_label": r["label"] or "Unknown device",
-                "alias": r["alias"],
+                "label": r["label"] or "Unknown device",
                 "last_seen": r["last_seen"],
                 "online": (now - r["last_seen"]) <= ONLINE_TIMEOUT,
             }
             for r in rows
         ]
-
-    def _cloud_set_device_alias(session_id, device_id, alias):
-        """Explicit, user-driven rename -- the only code path allowed to
-        write `alias`. Never called from presence-polling (_cloud_touch_device),
-        so it can't be silently overwritten by the next poll's auto-label
-        re-derivation. Returns False if the device isn't on this
-        session's roster (nothing to rename)."""
-        with _cloud_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE cloud_devices SET alias=%s WHERE session_id=%s AND device_id=%s AND kicked=false",
-                (alias, session_id, device_id))
-            updated = cur.rowcount > 0
-            conn.commit()
-            return updated
 
     def _cloud_kick_device(session_id, device_id):
         with _cloud_conn() as conn, conn.cursor() as cur:
@@ -551,6 +534,20 @@ if CLOUD_MODE:
                 VALUES (%s, %s, 'Unknown device', %s, %s, true)
                 ON CONFLICT (session_id, device_id) DO UPDATE SET kicked=true
             """, (session_id, device_id, time.time(), time.time()))
+            conn.commit()
+
+    def _cloud_set_device_label(session_id, device_id, label):
+        """Lets a phone give itself a custom name (e.g. 'Mary's iPhone')
+        instead of the generic auto-detected model name -- and locks it so
+        _cloud_touch_device never overwrites it again on a later poll."""
+        now = time.time()
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO cloud_devices (session_id, device_id, label, first_seen, last_seen, kicked, custom_label_locked)
+                VALUES (%s, %s, %s, %s, %s, false, true)
+                ON CONFLICT (session_id, device_id)
+                DO UPDATE SET label=%s, custom_label_locked=true, last_seen=%s
+            """, (session_id, device_id, label, now, now, label, now))
             conn.commit()
 
     def _cloud_active_device_count(session_id):
@@ -693,8 +690,7 @@ def _cloud_gate():
             session_id, device_id,
             request.headers.get("User-Agent"),
             request.headers.get("X-Device-Screen", ""),
-            request.headers.get("X-Device-Fingerprint", ""),
-            request.headers.get("X-Device-Model-Hint", ""))
+            request.headers.get("X-Device-Fingerprint", ""))
         if not admitted:
             return jsonify({"ok": False, "error": "device_limit_reached",
                              "max_devices": MAX_DEVICES}), 403
@@ -719,7 +715,7 @@ def _cors_headers(resp):
     if CLOUD_MODE:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id, X-Device-Fingerprint, X-Device-Model-Hint")
+            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id, X-Device-Fingerprint")
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         canonical_id = getattr(g, "canonical_device_id", None)
         if canonical_id:
@@ -879,6 +875,63 @@ def _stamp_changed_records(new_data, old_data):
             uv["_updated_at"] = old_u["_updated_at"]
 
     return new_data
+
+
+def _merge_cloud_data(a, b):
+    """Record-level, order-independent merge of two full snapshots (`a`
+    and `b` can be passed in either order -- the result is the same
+    either way). Ported 1:1 from the desktop app's identically-named
+    helper so the server can do the same safe merge the PC already does
+    client-side, instead of the PUT /api/_sync handler picking an
+    entire snapshot as "the winner" by comparing the pushing side's own
+    wall-clock timestamp against the row's stored (server-clock)
+    timestamp -- that comparison is what silently dropped every PC push
+    once its clock drifted even a few seconds behind the database's,
+    since accepted writes are always stamped with the DB's own now().
+
+    For each tenant/unit key:
+      - present in only one side -> keep it.
+      - present in both -> keep whichever copy has the newer
+        `_updated_at` stamp (see _stamp_changed_records).
+      - a record missing `_updated_at` entirely is treated as maximally
+        stale; if neither side has a stamp, `a`'s copy wins (arbitrary
+        but stable).
+    `settings` is merged shallowly, key by key, with `a` taking
+    precedence."""
+    def _tenants_by_key(d):
+        return {(t.get("name"), t.get("unit"), t.get("entry_date")): t
+                for t in (d.get("tenants") or [])}
+
+    a_tenants, b_tenants = _tenants_by_key(a), _tenants_by_key(b)
+    merged_tenants = []
+    for key, ta in a_tenants.items():
+        tb = b_tenants.get(key)
+        merged_tenants.append(
+            ta if tb is None or _iso_ge(ta.get("_updated_at", ""), tb.get("_updated_at", "")) else tb)
+    for key, tb in b_tenants.items():
+        if key not in a_tenants:
+            merged_tenants.append(tb)
+
+    a_units, b_units = (a.get("units") or {}), (b.get("units") or {})
+    merged_units = {}
+    for uk, ua in a_units.items():
+        ub = b_units.get(uk)
+        if not isinstance(ua, dict):
+            merged_units[uk] = ub if ub is not None else ua
+        elif not isinstance(ub, dict):
+            merged_units[uk] = ua
+        else:
+            merged_units[uk] = (
+                ua if _iso_ge(ua.get("_updated_at", ""), ub.get("_updated_at", "")) else ub)
+    for uk, ub in b_units.items():
+        if uk not in a_units:
+            merged_units[uk] = ub
+
+    return {
+        "tenants": merged_tenants,
+        "units": merged_units,
+        "settings": {**(b.get("settings") or {}), **(a.get("settings") or {})},
+    }
 
 
 def save_raw(data, updated_by=None):
@@ -2048,23 +2101,12 @@ def _guess_ios_model(is_ipad, screen_hint):
         return "iPhone"
 
 
-def _label_for_user_agent(ua, screen_hint="", model_hint=""):
+def _label_for_user_agent(ua, screen_hint=""):
     """Turns a raw User-Agent (plus an optional screen-resolution hint)
     into a short, phone-model-only label for the admin device list --
     e.g. 'iPhone 12', 'Tecno KI5k', 'itel A662L'. Browser name is
     intentionally never included (admin request: only the device/phone
-    type should be shown, not which browser it's using).
-
-    model_hint, when present, comes from the client's User-Agent Client
-    Hints (navigator.userAgentData.getHighEntropyValues(['model'])) --
-    the real reported model name straight from the OS, not a regex
-    guess against the UA string. Chrome is progressively freezing/
-    reducing navigator.userAgent (the "UA reduction" rollout), so the
-    regex below is a fallback for browsers that don't support UA-CH
-    (all of iOS Safari, some older Android browsers) rather than the
-    primary signal going forward."""
-    if model_hint:
-        return model_hint
+    type should be shown, not which browser it's using)."""
     ua = ua or ""
     if "iPhone" in ua or "iPad" in ua:
         return _guess_ios_model("iPad" in ua, screen_hint)
@@ -2119,10 +2161,13 @@ def _touch_device(device_id, user_agent=None, screen_hint="", fingerprint=""):
             # arrive before its screen-hint header is populated in some
             # edge cases, so this lets the label upgrade from a generic
             # "iPhone"/"Android" to a specific model as soon as a usable
-            # hint shows up.
-            fresh_label = _label_for_user_agent(user_agent, screen_hint)
-            if fresh_label and fresh_label not in ("Device",):
-                rec["label"] = fresh_label
+            # hint shows up. Skipped entirely once the person has given
+            # this device a custom name (see _set_local_device_label) --
+            # that name should never be silently overwritten again.
+            if not rec.get("custom_label_locked"):
+                fresh_label = _label_for_user_agent(user_agent, screen_hint)
+                if fresh_label and fresh_label not in ("Device",):
+                    rec["label"] = fresh_label
             if fingerprint:
                 rec["fingerprint"] = fingerprint
             _save_devices_locked()
@@ -2135,9 +2180,10 @@ def _touch_device(device_id, user_agent=None, screen_hint="", fingerprint=""):
             if match_id:
                 match_rec = devices[match_id]
                 match_rec["last_seen"] = now
-                fresh_label = _label_for_user_agent(user_agent, screen_hint)
-                if fresh_label and fresh_label not in ("Device",):
-                    match_rec["label"] = fresh_label
+                if not match_rec.get("custom_label_locked"):
+                    fresh_label = _label_for_user_agent(user_agent, screen_hint)
+                    if fresh_label and fresh_label not in ("Device",):
+                        match_rec["label"] = fresh_label
                 _save_devices_locked()
                 return True, match_id
         if sum(1 for r in devices.values() if not r.get("kicked")) >= MAX_DEVICES:
@@ -2215,6 +2261,24 @@ def _kick_device(device_id):
                 "first_seen": 0, "last_seen": 0,
                 "label": "Unknown device", "kicked": True,
             }
+        _save_devices_locked()
+
+
+def _set_local_device_label(device_id, label):
+    """Lets a phone give itself a custom name (e.g. 'Mary's iPhone')
+    instead of the generic auto-detected model name -- and locks it so
+    _touch_device never overwrites it again on a later poll."""
+    import time
+    with _devices_lock:
+        devices = _devices_dict()
+        rec = devices.get(device_id)
+        now = time.time()
+        if rec is None:
+            rec = {"first_seen": now, "last_seen": now, "kicked": False, "fingerprint": ""}
+            devices[device_id] = rec
+        rec["label"] = label
+        rec["custom_label_locked"] = True
+        rec["last_seen"] = now
         _save_devices_locked()
 
 
@@ -2507,8 +2571,9 @@ def cloud_sync():
     """Cloud-mode only (see _cloud_gate). GET returns the stored snapshot
     for reconciliation; PUT accepts a full snapshot push -- from either
     the PC (after a local save) or, in principle, anywhere else -- and
-    keeps whichever one is more recent (last-edit-wins on the whole
-    snapshot, resolved here on the server so both sides agree)."""
+    merges it record-by-record against whatever's already stored (see
+    _merge_cloud_data) rather than treating either side's whole snapshot
+    as "the winner"."""
     if not CLOUD_MODE:
         return Response("", status=404, mimetype="text/plain")
 
@@ -2525,25 +2590,32 @@ def cloud_sync():
 
     body = request.get_json(silent=True) or {}
     incoming_data = body.get("data")
-    incoming_updated_at = body.get("updated_at")  # ISO string, caller's clock
     updated_by = body.get("updated_by", "unknown")
-    if not isinstance(incoming_data, dict) or not incoming_updated_at:
+    if not isinstance(incoming_data, dict):
         return jsonify({"ok": False, "error": "bad_request"}), 400
 
+    # Merged record-by-record against the currently stored snapshot,
+    # rather than being accepted or rejected wholesale based on comparing
+    # the PUSHING side's own wall-clock timestamp (body.get("updated_at"))
+    # against the row's stored timestamp. That comparison used to be the
+    # gate here, but every ACCEPTED write is stamped with the database's
+    # own now() (see _cloud_save) -- an authoritative, ever-advancing
+    # clock -- while the pushing side (e.g. the PC, syncing every ~20s)
+    # sends its own local clock's reading. Even a few seconds of
+    # client/server clock drift meant that, after the first successful
+    # push, every later push from that same side looked "not new enough"
+    # and was silently discarded forever -- while writes landing directly
+    # on this server (from the phone/web app) always kept advancing the
+    # row's timestamp, so pulls from that side (reconcile) kept working.
+    # That's what made syncing look one-directional: phone → PC worked,
+    # PC → phone silently stopped. Merging here removes the clock
+    # comparison from the equation entirely; per-record `_updated_at`
+    # stamps (see _stamp_changed_records) already make the merge safe
+    # regardless of which side's clock is ahead.
     row = _cloud_get_row(g.session_id)
-    if row and _iso_ge(row["updated_at"].isoformat(), incoming_updated_at):
-        # Server already has something at least as new (e.g. the phone
-        # wrote directly to the cloud after this snapshot was taken) --
-        # last-edit-wins means the incoming (older) push loses; hand back
-        # what's actually current so the caller can pull instead of
-        # silently overwriting a newer change.
-        return jsonify({
-            "ok": True, "stored": False,
-            "current": {"data": row["data"], "updated_at": row["updated_at"].isoformat()},
-        })
-
-    server_updated_at = save_raw(incoming_data, updated_by=updated_by)
-    return jsonify({"ok": True, "stored": True, "updated_at": server_updated_at})
+    merged = _merge_cloud_data(incoming_data, row["data"]) if row else incoming_data
+    server_updated_at = save_raw(merged, updated_by=updated_by)
+    return jsonify({"ok": True, "stored": True, "updated_at": server_updated_at, "data": merged})
 
 
 
@@ -2632,30 +2704,27 @@ def devices_kick(device_id):
     return jsonify({"ok": True})
 
 
-@app.route("/api/devices/<device_id>/alias", methods=["POST"])
-def devices_set_alias(device_id):
-    """Called once by a phone itself, right after its first successful
-    registration -- the onboarding step where the person names their
-    device ("Mary's phone") instead of it staying labeled with the
-    auto-detected model forever. Cloud-mode only for now: the LAN
-    companion's devices.json path doesn't have this endpoint yet, so a
-    phone on that path silently has nothing to call (fine -- the JS only
-    fires the onboarding modal when cloudCfg is configured). Session-
-    authenticated the same way every other /api/ route is in CLOUD_MODE
-    (see _cloud_gate), so any device on this household's roster may
-    rename itself or, in principle, another device_id it knows -- no
-    finer-grained trust boundary than "has the household's secret_key",
-    same as kick already has."""
-    if not CLOUD_MODE:
-        return jsonify({"ok": False, "error": "not_supported"}), 404
+@app.route("/api/devices/label", methods=["POST"])
+def set_device_label():
+    """Lets the calling device (identified by its own X-Device-Id header)
+    give itself a custom name -- e.g. 'Mary's iPhone' instead of the
+    auto-detected 'iPhone 12' -- so it's recognizable in the Connected
+    Devices list. Persisted server-side (and locked against being
+    overwritten by auto-detection again), so it only needs to be typed
+    once, ever, from any device that's already paired -- not re-entered
+    each time the web app is opened."""
+    device_id = request.headers.get("X-Device-Id", "")
     body = request.get_json(force=True) or {}
-    alias = (body.get("alias") or "").strip()[:40]
-    if not alias:
-        return jsonify({"ok": False, "error": "alias_required"}), 400
-    updated = _cloud_set_device_alias(g.session_id, device_id, alias)
-    if not updated:
-        return jsonify({"ok": False, "error": "unknown_device"}), 404
-    return jsonify({"ok": True, "alias": alias})
+    label = (body.get("label") or "").strip()[:40]
+    if not device_id:
+        return jsonify({"ok": False, "error": "Missing device id."}), 400
+    if not label:
+        return jsonify({"ok": False, "error": "Please enter a name."}), 400
+    if CLOUD_MODE:
+        _cloud_set_device_label(g.session_id, device_id, label)
+    else:
+        _set_local_device_label(device_id, label)
+    return jsonify({"ok": True, "label": label})
 
 
 @app.route("/api/pairing-token", methods=["POST"])
@@ -2862,11 +2931,6 @@ def get_tenant(idx):
     if idx < 0 or idx >= len(tenants):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
-    t["_idx"] = idx  # _tenant_summary() below reads this into "index" --
-                      # without it, "index" comes back null, and any
-                      # client code that builds a URL from it (e.g. the
-                      # Cancel button's /api/tenants/<idx>/cancel call)
-                      # 404s against the literal string "null".
     today = date.today()
     detail = _tenant_summary(t, today) | {
         "email": t.get("email", ""),
@@ -3786,110 +3850,29 @@ let state = { tab:'dashboard', tenants:[], selectedIdx:null, filter:'all', q:'' 
 // made, and the screen refreshes with the authoritative server data.
 const CACHE_KEY = 'rm_offline_cache_v1';
 const QUEUE_KEY = 'rm_offline_queue_v1';
-
-// ── Device identity (IndexedDB) ─────────────────────────────────────
-// One structured record per browser/install, replacing the old single
-// 'rm_device_id_v1' localStorage string. IndexedDB is used because this
-// record now holds more than an id (alias, onboarding state) and
-// because reads/writes here are naturally async, which matches the
-// User-Agent Client Hints API below (also Promise-based) better than
-// synchronous localStorage ever did.
-const IDENTITY_DB_NAME = 'rm_device_store', IDENTITY_DB_VERSION = 1, IDENTITY_STORE = 'identity';
-const LEGACY_DEVICE_ID_KEY = 'rm_device_id_v1'; // old localStorage key, migrated below
-
-function _openIdentityDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDENTITY_DB_NAME, IDENTITY_DB_VERSION);
-    req.onupgradeneeded = () => req.result.createObjectStore(IDENTITY_STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-function _idbGet(key) {
-  return _openIdentityDB().then(db => new Promise((res, rej) => {
-    const tx = db.transaction(IDENTITY_STORE, 'readonly').objectStore(IDENTITY_STORE).get(key);
-    tx.onsuccess = () => res(tx.result);
-    tx.onerror = () => rej(tx.error);
-  }));
-}
-function _idbSet(key, value) {
-  return _openIdentityDB().then(db => new Promise((res, rej) => {
-    const tx = db.transaction(IDENTITY_STORE, 'readwrite').objectStore(IDENTITY_STORE).put(value, key);
-    tx.onsuccess = () => res();
-    tx.onerror = () => rej(tx.error);
-  }));
-}
-
-let DEVICE_ID = null;      // resolved by ensureDeviceIdentity(), before init() does anything else
-let DEVICE_ALIAS = null;   // user-chosen name, once onboarding has run
-let _deviceIdentity = null; // the full IndexedDB record, kept around so we can update .onboarded
-
-async function ensureDeviceIdentity() {
-  try {
-    let rec = await _idbGet('device');
-    if (!rec) {
-      // Migration: a phone paired under the old scheme has its uuid
-      // sitting in localStorage. Reuse it instead of minting a new one,
-      // or it registers as a second, duplicate device on the household's
-      // roster the next time this page loads.
-      let legacyId = null;
-      try { legacyId = localStorage.getItem(LEGACY_DEVICE_ID_KEY); } catch (e) {}
-      rec = {
-        uuid: legacyId || crypto.randomUUID(),
-        alias: null,
-        created_at: Date.now(),
-        onboarded: false,
-      };
-      await _idbSet('device', rec);
-    }
-    _deviceIdentity = rec;
-    DEVICE_ID = rec.uuid;
-    DEVICE_ALIAS = rec.alias;
-  } catch (e) {
-    // Private browsing / IndexedDB disabled: fall back to an in-memory
-    // id for this session. Every reload re-pairs as "new" -- same
-    // failure mode the old localStorage-blocked case already had, so no
-    // regression, just no persistence.
-    _deviceIdentity = { uuid: crypto.randomUUID(), alias: null, created_at: Date.now(), onboarded: false };
-    DEVICE_ID = _deviceIdentity.uuid;
+const DEVICE_ID_KEY = 'rm_device_id_v1';
+function getDeviceId() {
+  let id = localStorage.getItem(DEVICE_ID_KEY);
+  if (!id) {
+    id = (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(16).slice(2)));
+    try { localStorage.setItem(DEVICE_ID_KEY, id); } catch(e) {}
   }
+  return id;
 }
-
+let DEVICE_ID = getDeviceId();
 function adoptCanonicalDeviceId(canonical) {
-  // The server recognizes phones primarily by this stored id, but that
-  // storage isn't always the same across contexts on the SAME physical
-  // phone: iOS treats a web app "Added to Home Screen" as a separate
-  // storage silo from Safari itself, and some in-app/QR-scanner
+  // The server recognizes phones primarily by this localStorage-held id,
+  // but that storage isn't always the same across contexts on the SAME
+  // physical phone: iOS treats a web app "Added to Home Screen" as a
+  // separate storage silo from Safari itself, and some in-app/QR-scanner
   // browsers do too. When the server's fingerprint match (see
   // DEVICE_FINGERPRINT below) says this context is really an
   // already-known device, it hands back that device's real id -- adopt
   // it here so this context IS that device from now on, not a new one.
   if (!canonical || canonical === DEVICE_ID) return;
   DEVICE_ID = canonical;
-  if (_deviceIdentity) {
-    _deviceIdentity.uuid = canonical;
-    _idbSet('device', _deviceIdentity).catch(() => {});
-  }
+  try { localStorage.setItem(DEVICE_ID_KEY, canonical); } catch(e) {}
 }
-
-// ── User-Agent Client Hints ─────────────────────────────────────────
-// navigator.userAgentData exists only on Chromium browsers (all of iOS
-// Safari, and some older Android browsers, have no equivalent). Where
-// it exists, it reports the real phone model straight from the OS --
-// no regex-guessing against navigator.userAgent needed, and it keeps
-// working even as Chrome's ongoing "UA reduction" rollout progressively
-// strips detail out of that string. Cached after the first successful
-// read since getHighEntropyValues() can prompt/take a moment and the
-// answer never changes for the life of this page.
-let DEVICE_MODEL_HINT = '';
-async function ensureClientHints() {
-  if (!navigator.userAgentData) return; // Safari, older browsers: leave '' → server falls back to UA regex
-  try {
-    const hints = await navigator.userAgentData.getHighEntropyValues(['model']);
-    DEVICE_MODEL_HINT = hints.model || '';
-  } catch (e) { /* denied or unsupported -- server falls back to UA regex */ }
-}
-
 // Safari deliberately omits the specific iPhone/iPad model from its
 // User-Agent string (unlike Android, which usually names the exact
 // model), so there's no reliable way to ask the browser "which iPhone is
@@ -4425,7 +4408,6 @@ async function cloudFetch(path, opts = {}) {
     'X-Secret-Key': cloudCfg.secret_key,
     'X-Device-Id': DEVICE_ID,
     'X-Device-Screen': DEVICE_SCREEN_HINT,
-    'X-Device-Model-Hint': DEVICE_MODEL_HINT,
     ...(opts.headers || {}),
   };
   const res = await fetchTimeout(cloudCfg.cloud_base_url + path, { ...opts, headers }, 6000);
@@ -4942,8 +4924,8 @@ async function renderTenantDetail(idx) {
       </div>
     </div>` : '';
 
-  const payHist = t.payment_history.map((r,i)=>txnRow(idx, r, 'payment_history', origIdx(t.payment_history,i))).join('');
-  const depHist = t.deposit_history.map((r,i)=>txnRow(idx, r, 'deposit_history', origIdx(t.deposit_history,i))).join('');
+  const payHist = t.payment_history.map((r,i)=>txnRow(t, r, 'payment_history', origIdx(t.payment_history,i))).join('');
+  const depHist = t.deposit_history.map((r,i)=>txnRow(t, r, 'deposit_history', origIdx(t.deposit_history,i))).join('');
 
   $('#main').innerHTML = `
     <button class="btn btn-ghost" style="margin-bottom:12px;" onclick="state.tab='tenants'; render();">← Back</button>
@@ -4964,7 +4946,10 @@ async function renderTenantDetail(idx) {
         <div>🏁 Move-in: ${escapeHtml(t.entry_date||'—')}</div>
         <div>📅 Due date: ${escapeHtml(t.due_date||'Not yet set')}</div>
       </div>
-      <button class="btn btn-ghost" style="margin-top:10px;" onclick="openEditTenant(${idx})">✎ Edit Info</button>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn btn-ghost" onclick="openEditTenant(${idx})">✎ Edit Tenant</button>
+        <button class="btn btn-danger" onclick="deleteTenant(${idx})">🗑 Delete Tenant</button>
+      </div>
     </div>
 
     ${leaseProgressBlock(t)}
@@ -4994,7 +4979,7 @@ async function renderTenantDetail(idx) {
 // history arrays are returned reversed (most-recent-first); recover original index for cancel calls
 function origIdx(arr, displayI) { return arr.length - 1 - displayI; }
 
-function txnRow(idx, r, key, origI) {
+function txnRow(t, r, key, origI) {
   const cancelled = r._cancelled;
   const label = key==='payment_history' ? 'Full Payment' : 'Deposit';
   return `<div class="txn-item">
@@ -5004,7 +4989,7 @@ function txnRow(idx, r, key, origI) {
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
       <span class="amt ${cancelled?'cancelled':''}">${fmt(r.amount)}</span>
-      ${!cancelled ? `<button class="icon-btn" style="width:30px;height:30px;background:var(--teal-soft);color:var(--teal-deep);font-size:13px;" onclick="cancelTxn(${idx}, '${key}', ${origI})">↺</button>`:''}
+      ${!cancelled ? `<button class="icon-btn" style="width:30px;height:30px;background:var(--teal-soft);color:var(--teal-deep);font-size:13px;" onclick="cancelTxn(${t.index}, '${key}', ${origI})">↺</button>`:''}
     </div>
   </div>`;
 }
@@ -5343,12 +5328,150 @@ async function renderSettings() {
       <a class="linklike" href="api/export/excel">⬇ Download Excel (.xlsx)</a><br><br>
       <a class="linklike" href="api/export/pdf">⬇ Download PDF Report</a>
     </div>
+    <div class="section-title">Security</div>
+    <div class="card" id="pinCard">
+      <div class="sub" style="color:var(--muted);font-size:12.5px;">Loading…</div>
+    </div>
+    <div class="section-title">Connected Devices</div>
+    <div class="card" id="devicesCard">
+      <div class="sub" style="color:var(--muted);font-size:12.5px;">Loading…</div>
+    </div>
+    <div class="section-title">Danger Zone</div>
+    <div class="card">
+      <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
+        Permanently erases every tenant, unit, and transaction shared with the desktop app. A backup of the current data is kept automatically before wiping.
+      </div>
+      <button class="btn btn-danger btn-full" onclick="openResetData()">🗑 Reset All Data</button>
+    </div>
     <div class="section-title">About</div>
     <div class="card sub" style="color:var(--muted);font-size:12.5px;">
       Tenant Monitoring &amp; Management — Web Edition.<br>Shares data with the desktop app on this PC.
     </div>
   `;
   updateInstallUI();
+  renderPinCard();
+  renderDevicesCard();
+}
+
+// ── SECURITY: PIN lock ─────────────────────────────────────────────────
+async function renderPinCard() {
+  const ls = await api('/api/lock-status');
+  const card = $('#pinCard');
+  if (!card) return;
+  if (ls && ls.pin_set) {
+    card.innerHTML = `
+      <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
+        A PIN is currently required to open this app.
+      </div>
+      <button class="btn btn-primary btn-full" onclick="openSetPin(true)">Change PIN</button>
+      <button class="btn btn-danger btn-full" style="margin-top:10px;" onclick="openRemovePin()">Remove PIN</button>
+    `;
+  } else {
+    card.innerHTML = `
+      <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
+        No PIN set — anyone with the link can open this app.
+      </div>
+      <button class="btn btn-primary btn-full" onclick="openSetPin(false)">Set a PIN</button>
+    `;
+  }
+}
+function openSetPin(hasExisting) {
+  openModal(`
+    <h2>${hasExisting ? 'Change PIN' : 'Set a PIN'}</h2>
+    ${hasExisting ? `<label class="field">Current PIN</label><input id="pin_current" type="password" inputmode="numeric">` : ''}
+    <label class="field">New PIN (min 4 digits)</label><input id="pin_new" type="password" inputmode="numeric">
+    <label class="field">Confirm New PIN</label><input id="pin_confirm" type="password" inputmode="numeric">
+    <div class="err" id="pinErr"></div>
+    <button class="btn btn-primary btn-full" style="margin-top:8px;" onclick="submitSetPin(${hasExisting})">Save PIN</button>
+  `);
+}
+async function submitSetPin(hasExisting) {
+  const newPin = $('#pin_new').value.trim();
+  const confirmPin = $('#pin_confirm').value.trim();
+  if (newPin !== confirmPin) { $('#pinErr').textContent = 'PINs do not match.'; return; }
+  const body = { new_pin: newPin, current_pin: hasExisting ? $('#pin_current').value.trim() : '' };
+  const d = await api('/api/settings/pin', {method:'POST', body: JSON.stringify(body)});
+  if (d.ok) { closeModal(); toast('PIN saved.'); renderPinCard(); }
+  else $('#pinErr').textContent = d.error || 'Could not save PIN.';
+}
+function openRemovePin() {
+  openModal(`
+    <h2>Remove PIN</h2>
+    <div class="desc">Enter your current PIN to remove the lock.</div>
+    <label class="field">Current PIN</label><input id="pin_rm_current" type="password" inputmode="numeric">
+    <div class="err" id="pinRmErr"></div>
+    <button class="btn btn-danger btn-full" style="margin-top:8px;" onclick="submitRemovePin()">Remove PIN</button>
+  `);
+}
+async function submitRemovePin() {
+  const body = { current_pin: $('#pin_rm_current').value.trim() };
+  const d = await api('/api/settings/pin', {method:'DELETE', body: JSON.stringify(body)});
+  if (d.ok) { closeModal(); toast('PIN removed.'); renderPinCard(); }
+  else $('#pinRmErr').textContent = d.error || 'Could not remove PIN.';
+}
+
+// ── CONNECTED DEVICES ────────────────────────────────────────────────
+async function renderDevicesCard() {
+  const card = $('#devicesCard');
+  if (!card) return;
+  let d;
+  try { d = await api('/api/devices'); } catch (e) { d = null; }
+  const devices = (d && d.devices) || [];
+  const mine = devices.find(dev => dev.device_id === DEVICE_ID);
+  const others = devices.filter(dev => dev.device_id !== DEVICE_ID);
+
+  // Saved once, tied to this device's own (already-persistent) DEVICE_ID --
+  // the server locks it against being overwritten, so it never needs to be
+  // typed again on this device, even after closing and reopening the app.
+  const nameRow = `
+    <div style="margin-bottom:${others.length?'14px':'0'};">
+      <label class="field" style="margin-top:0;">This Device's Name</label>
+      <div class="row">
+        <input id="dev_my_label" value="${escapeHtml((mine && mine.label) || '')}" placeholder="e.g. Mary's iPhone">
+      </div>
+      <button class="btn btn-primary btn-full" style="margin-top:8px;" onclick="submitDeviceLabel()">Save Name</button>
+      <div class="err" id="devLabelErr"></div>
+    </div>${others.length ? '<hr class="sep">' : ''}`;
+
+  const otherRows = others.map(dev => `
+    <div class="tenant-row" style="cursor:default;">
+      <div class="avatar">${dev.online ? '🟢' : '⚪'}</div>
+      <div class="meta">
+        <div class="name">${escapeHtml(dev.label || 'Unknown device')}</div>
+        <div class="sub">${dev.online ? 'Online now' : 'Last seen ' + new Date(dev.last_seen*1000).toLocaleString()}</div>
+      </div>
+      <button class="btn btn-danger" style="padding:6px 12px;font-size:12.5px;" onclick="kickDevice('${dev.device_id}')">Disconnect</button>
+    </div>`).join('') || (mine ? '' : `<div class="sub" style="color:var(--muted);font-size:12.5px;">No other devices connected right now.</div>`);
+
+  card.innerHTML = nameRow + otherRows;
+}
+async function submitDeviceLabel() {
+  const label = $('#dev_my_label').value.trim();
+  if (!label) { $('#devLabelErr').textContent = 'Please enter a name.'; return; }
+  const d = await api('/api/devices/label', {method:'POST', body: JSON.stringify({label})});
+  if (d.ok) { toast('Device name saved.'); renderDevicesCard(); }
+  else $('#devLabelErr').textContent = d.error || 'Could not save name.';
+}
+async function kickDevice(deviceId) {
+  if (!confirm('Disconnect this device? It will need to reconnect to use the app again.')) return;
+  const d = await api('/api/devices/'+encodeURIComponent(deviceId)+'/kick', {method:'POST'});
+  if (d.ok) { toast('Device disconnected.'); renderDevicesCard(); }
+}
+
+// ── DANGER ZONE: reset data ──────────────────────────────────────────
+function openResetData() {
+  openModal(`
+    <h2>Reset All Data</h2>
+    <div class="desc">This permanently deletes every tenant, unit, and transaction on both this app and the desktop app. A backup of the current data file is saved automatically first. This cannot be undone from here.</div>
+    <div class="err" id="resetErr"></div>
+    <button class="btn btn-danger btn-full" style="margin-top:8px;" onclick="submitResetData()">Yes, Reset Everything</button>
+  `);
+}
+async function submitResetData() {
+  if (!confirm('Are you absolutely sure? All tenants and units will be erased.')) return;
+  const d = await api('/api/settings/reset', {method:'POST'});
+  if (d.ok) { closeModal(); toast('All data reset.'); cacheDeletePrefix('/api/'); switchTab('dashboard'); }
+  else $('#resetErr').textContent = d.error || 'Could not reset data.';
 }
 
 const MONTH_NAMES = ['January','February','March','April','May','June','July',
@@ -5454,78 +5577,13 @@ async function generateMonthlyReport() {
   });
 })();
 
-// ── device onboarding (cloud-direct only) ──────────────────────────
-// Fires once per device, the first time it's ever seen this app AND is
-// on a household's cloud roster -- lets the person replace the
-// auto-detected model name ("Tecno KI5k") with something meaningful
-// ("Mary's phone") in the admin device list. Never re-fires: gated by
-// the persisted `onboarded` flag on the IndexedDB identity record, not
-// by anything server-side, so it survives even if this device is later
-// renamed again manually. Skipping just means the auto-detected label
-// keeps being used -- there's no "must name your device" requirement.
-function _clientGuessLabel() {
-  if (DEVICE_MODEL_HINT) return DEVICE_MODEL_HINT;
-  const ua = navigator.userAgent || '';
-  if (/iPad/.test(ua)) return 'iPad';
-  if (/iPhone/.test(ua)) return 'iPhone';
-  if (/Android/.test(ua)) return 'Android phone';
-  return 'This device';
-}
-function maybeRunOnboarding() {
-  if (!_deviceIdentity || _deviceIdentity.onboarded) return;
-  if (!CLOUD_DIRECT) return; // only meaningful once this device is on a household's cloud roster
-  const suggested = _clientGuessLabel();
-  openModal(`
-    <div class="card" style="margin:0;border:none;padding:0;">
-      <h2 style="margin-top:0;">Name this device</h2>
-      <p style="font-size:13px;color:var(--muted);margin:0 0 14px;">
-        Detected as <b>${suggested}</b>. Give it a name so it's easy to tell apart from other phones connected to this account.
-      </p>
-      <label class="field">Device name</label>
-      <input id="aliasInput" maxlength="40" value="${suggested}">
-      <div class="err" id="aliasErr"></div>
-      <div style="display:flex;gap:8px;margin-top:14px;">
-        <button class="btn btn-ghost" style="flex:1;" onclick="skipOnboarding()">Skip</button>
-        <button class="btn btn-primary" style="flex:1;" onclick="submitOnboardingAlias()">Save</button>
-      </div>
-    </div>
-  `);
-}
-async function submitOnboardingAlias() {
-  const input = $('#aliasInput');
-  const alias = input ? input.value.trim() : '';
-  if (!alias) { $('#aliasErr').textContent = 'Enter a name, or tap Skip.'; return; }
-  try {
-    const res = await cloudFetch(`/api/devices/${encodeURIComponent(DEVICE_ID)}/alias`, {
-      method: 'POST', body: JSON.stringify({ alias }),
-    });
-    if (res.ok) DEVICE_ALIAS = alias;
-    // A failure here (offline right now, device not yet registered on
-    // the roster) just means the auto-label keeps showing server-side --
-    // this was a one-time convenience prompt, not something to retry or
-    // block onboarding-completion on.
-  } catch (e) {}
-  _finishOnboarding();
-}
-function skipOnboarding() { _finishOnboarding(); }
-function _finishOnboarding() {
-  if (_deviceIdentity) {
-    _deviceIdentity.onboarded = true;
-    _idbSet('device', _deviceIdentity).catch(() => {});
-  }
-  closeModal();
-}
-
 // ── boot ─────────────────────────────────────────────────────────────
 async function boot() {
   booted = true;
   loadCloudConfig();
   switchTab('dashboard');
-  maybeRunOnboarding();
 }
 async function init() {
-  await ensureDeviceIdentity();
-  ensureClientHints(); // best-effort, not awaited -- absent on iOS/older browsers, and the server falls back to its UA regex either way
   let ls;
   try {
     const res = await fetchTimeout('/api/lock-status', {headers: {'X-Device-Id': DEVICE_ID}}, 3500);
