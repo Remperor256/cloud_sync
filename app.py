@@ -1492,6 +1492,8 @@ def cancel_transaction(t, h_key, idx):
     if idx < 0 or idx >= len(history):
         return None
     rec = history[idx]
+    if rec.get("_cancelled"):
+        return "already_cancelled"
     txn_id = rec.get("txn_id")
 
     linked = []
@@ -3056,6 +3058,7 @@ def get_tenant(idx):
     t = tenants[idx]
     today = date.today()
     detail = _tenant_summary(t, today) | {
+        "index": idx,
         "email": t.get("email", ""),
         "occupation": t.get("occupation", ""),
         "emergency_contact": t.get("emergency_contact", ""),
@@ -3233,6 +3236,13 @@ def do_record_payment(idx):
     months = body.get("months", 1)
     if period not in ("current", "next", "multiple"):
         return jsonify({"ok": False, "error": "Invalid period."}), 400
+    if period == "current" and is_current_period_paid(t):
+        return jsonify({"ok": False, "error": "Current month is already paid."}), 400
+    if period == "next":
+        if not is_current_period_paid(t):
+            return jsonify({"ok": False, "error": "Pay Current Month before Pay Next Month."}), 400
+        if is_next_period_locked(t):
+            return jsonify({"ok": False, "error": "Next month is already paid."}), 400
     if period == "multiple":
         try:
             months = int(months)
@@ -3256,6 +3266,10 @@ def do_record_deposit(idx):
     body = request.get_json(force=True) or {}
     period = body.get("period", "current")
     months = body.get("months", 1)
+    if period not in ("current", "next", "multiple"):
+        return jsonify({"ok": False, "error": "Invalid period."}), 400
+    if period == "next" and not is_current_period_paid(t):
+        return jsonify({"ok": False, "error": "Pay Current Month before Pay Next Month."}), 400
     try:
         instalment = float(str(body.get("amount", "")).strip().replace(",", ""))
         if instalment <= 0:
@@ -3291,6 +3305,8 @@ def do_cancel(idx):
     result = cancel_transaction(t, h_key, int(rec_idx))
     if result is None:
         return jsonify({"ok": False, "error": "Record not found."}), 404
+    if result == "already_cancelled":
+        return jsonify({"ok": False, "error": "That transaction has already been reversed."}), 400
     save_state(data)
     return jsonify({"ok": True, "result": result})
 
@@ -4882,11 +4898,15 @@ function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s??
 
 const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function abbrevPeriod(fromIso, toIso) {
+  // Must always agree with the record's actual from/to fields (as shown
+  // in the desktop app's Records export), so this renders the exact
+  // dates rather than collapsing them to a month/year label -- rounding
+  // to whole months previously hid the real (often mid-month) cycle
+  // boundaries and could visibly disagree with the underlying dates.
   const f = _parseIsoDate(fromIso), t = _parseIsoDate(toIso);
   if (!f || !t) return `${fromIso || '—'} → ${toIso || '—'}`;
-  const sameYear = f.getFullYear() === t.getFullYear();
-  const fLabel = MONTH_ABBR[f.getMonth()] + (sameYear ? '' : ` '${String(f.getFullYear()).slice(-2)}`);
-  const tLabel = MONTH_ABBR[t.getMonth()] + ` '${String(t.getFullYear()).slice(-2)}`;
+  const fLabel = `${MONTH_ABBR[f.getMonth()]} ${f.getDate()}, ${f.getFullYear()}`;
+  const tLabel = `${MONTH_ABBR[t.getMonth()]} ${t.getDate()}, ${t.getFullYear()}`;
   return `${fLabel} → ${tLabel}`;
 }
 function _parseIsoDate(s) {
@@ -5049,13 +5069,13 @@ async function renderTenantDetail(idx) {
     <div class="card">
       <div class="row">
         <button class="btn btn-primary" ${t.current_period_locked?'disabled':''} onclick="openPaymentModal(${idx}, 'current', ${t.current_period_locked})">Pay Current</button>
-        <button class="btn btn-primary" ${t.next_period_locked?'disabled':''} onclick="openPaymentModal(${idx}, 'next', ${t.next_period_locked})">Pay Next</button>
+        <button class="btn btn-primary" ${(!t.current_period_locked || t.next_period_locked)?'disabled':''} onclick="openPaymentModal(${idx}, 'next', ${!t.current_period_locked || t.next_period_locked})">Pay Next</button>
       </div>
       <div class="row" style="margin-top:10px;">
         <button class="btn btn-ghost" onclick="openPaymentModal(${idx}, 'multiple', false)">Pay Multiple Months</button>
       </div>
       <div class="row" style="margin-top:10px;">
-        <button class="btn btn-ghost" onclick="openDepositModal(${idx})">＋ Record Instalment</button>
+        <button class="btn btn-ghost" onclick="openDepositModal(${idx}, ${t.current_period_locked})">＋ Record Instalment</button>
       </div>
     </div>
 
@@ -5147,12 +5167,12 @@ async function submitPayment(idx, period) {
   else $('#payErr').textContent = d.error || 'Could not record payment.';
 }
 
-function openDepositModal(idx) {
+function openDepositModal(idx, currentLocked) {
   openModal(`
     <h2>Record Instalment / Deposit</h2>
     <div class="desc">Partial payments accumulate toward the chosen period's rent.</div>
     <label class="field">Period</label>
-    <select id="d_period"><option value="current">Current Month</option><option value="next">Next Month</option><option value="multiple">Multiple Months</option></select>
+    <select id="d_period"><option value="current">Current Month</option><option value="next" ${currentLocked?'':'disabled'}>Next Month${currentLocked?'':' (pay current first)'}</option><option value="multiple">Multiple Months</option></select>
     <div id="d_months_wrap" style="display:none;"><label class="field">Number of Months</label><input id="d_months" type="number" min="1" value="1"></div>
     <label class="field">Amount (UGX)</label><input id="d_amount" inputmode="numeric">
     <div class="err" id="depErr"></div>
