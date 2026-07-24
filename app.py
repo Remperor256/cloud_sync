@@ -2,16 +2,16 @@
 Tenant Monitoring & Management — Web Edition (single-file build)
 ==================================================================
 A phone-friendly web app that shares data with the original Tkinter desktop
-app via the same ~/.rental_manager/data.json file.
+app, synced entirely through the cloud service (see CLOUD_MODE below) --
+there is no LAN/local-network pairing path in this build.
 
 Run:
     pip install flask openpyxl reportlab qrcode[pil]
     python app.py
 
-Then either:
-  - let it auto-open the "Connect Your Phone" page on THIS PC and scan the
-    QR code with your phone's camera, or
-  - type the printed LAN address into your phone's browser manually.
+Deploy this file with CLOUD_MODE=1 and a DATABASE_URL, then pair phones to
+it from the desktop app's Settings -> Connect Phone (which shows the QR
+code for this deployed service directly).
 
 Everything -- backend logic, the REST API, and the mobile frontend -- lives
 in this one file on purpose, so it's a single thing to copy/share.
@@ -23,7 +23,6 @@ import copy
 import json
 import time
 import shutil
-import socket
 import hashlib
 import secrets
 import calendar
@@ -68,12 +67,6 @@ def _api_error_handler(err):
     if request.path.startswith("/api/"):
         return jsonify({"ok": False, "error": f"{type(err).__name__}: {err}"}), 500
     raise err
-
-try:
-    import qrcode
-    QRCODE_OK = True
-except ImportError:
-    QRCODE_OK = False
 
 APP_ICON_256_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAXpElEQVR4nO3dbXCc13Uf8P+599nFvgEg9JKOUhaw6iqJ"
@@ -864,6 +857,34 @@ def _tenant_key(t):
     return (t.get("name"), t.get("unit"), t.get("entry_date"))
 
 
+def _tenant_key_str(key):
+    """String form of a _tenant_key() tuple, safe to use as a JSON object
+    key (tombstone dicts are stored inside data.json, which requires
+    string keys). Uses a separator that can't appear in a name/unit/date
+    field entered through the UI."""
+    return "\x1f".join("" if p is None else str(p) for p in key)
+
+
+def stamp_tenant_deleted(data, t):
+    """Record a tombstone for a tenant that's about to be permanently
+    removed from data["tenants"], so a later cloud merge (_merge_cloud_data)
+    knows this record was deliberately deleted here rather than treating
+    the OTHER side's still-existing copy of it as something new that must
+    be kept -- which is exactly what silently resurrected deleted tenants
+    before this existed. Call this BEFORE removing the record from the
+    list, and before save_raw()/save_state()."""
+    tomb = data.setdefault("deleted_tenants", {})
+    tomb[_tenant_key_str(_tenant_key(t))] = datetime.now(timezone.utc).isoformat()
+
+
+def stamp_unit_deleted(data, name):
+    """Record a tombstone for a unit that's about to be permanently
+    removed from data["units"]. See stamp_tenant_deleted() above -- same
+    reasoning, just keyed by unit name (already a plain string)."""
+    tomb = data.setdefault("deleted_units", {})
+    tomb[name] = datetime.now(timezone.utc).isoformat()
+
+
 def _stamp_changed_records(new_data, old_data):
     """Stamps `_updated_at` (ISO now) onto every tenant/unit record in
     new_data that's brand new or whose content actually changed versus
@@ -931,19 +952,55 @@ def _merge_cloud_data(a, b):
     `settings` is treated as a single block and resolved by its own
     `_updated_at` stamp -- whichever side's settings were actually
     edited more recently wins outright, rather than `a` always winning
-    regardless of recency."""
+    regardless of recency.
+
+    `deleted_tenants` / `deleted_units` are tombstones: {key: deleted_at
+    iso timestamp}, written by stamp_tenant_deleted()/stamp_unit_deleted()
+    at the moment a record is permanently removed on either side (see
+    those functions). Without this, a record present on only one side
+    was always just "kept" -- indistinguishable from a genuinely NEW
+    record the other side hadn't seen yet -- which is what silently
+    resurrected a tenant/unit deleted on one device the next time it
+    merged against the other device's still-intact copy. The fix: merge
+    the tombstones themselves (newest timestamp per key wins, union of
+    both sides), then drop any record whose key has a tombstone dated at
+    or after that record's own `_updated_at` (a record with no stamp at
+    all is treated as older than any tombstone, same "maximally stale"
+    rule used elsewhere in this function) -- so a genuine edit made
+    AFTER the deletion (e.g. the record was deleted, then re-added fresh
+    with the same name/unit) still wins, but a stale copy that predates
+    the deletion does not come back from the dead."""
     def _tenants_by_key(d):
         return {(t.get("name"), t.get("unit"), t.get("entry_date")): t
                 for t in (d.get("tenants") or [])}
+
+    a_del_t, b_del_t = (a.get("deleted_tenants") or {}), (b.get("deleted_tenants") or {})
+    merged_del_t = dict(a_del_t)
+    for k, ts in b_del_t.items():
+        if k not in merged_del_t or _iso_ge(ts, merged_del_t[k]):
+            merged_del_t[k] = ts
+
+    a_del_u, b_del_u = (a.get("deleted_units") or {}), (b.get("deleted_units") or {})
+    merged_del_u = dict(a_del_u)
+    for k, ts in b_del_u.items():
+        if k not in merged_del_u or _iso_ge(ts, merged_del_u[k]):
+            merged_del_u[k] = ts
+
+    def _tombstoned(record, tomb_ts):
+        return tomb_ts is not None and _iso_ge(tomb_ts, record.get("_updated_at", ""))
 
     a_tenants, b_tenants = _tenants_by_key(a), _tenants_by_key(b)
     merged_tenants = []
     for key, ta in a_tenants.items():
         tb = b_tenants.get(key)
-        merged_tenants.append(
-            ta if tb is None or _iso_ge(ta.get("_updated_at", ""), tb.get("_updated_at", "")) else tb)
+        winner = (ta if tb is None or _iso_ge(ta.get("_updated_at", ""), tb.get("_updated_at", "")) else tb)
+        if _tombstoned(winner, merged_del_t.get(_tenant_key_str(key))):
+            continue
+        merged_tenants.append(winner)
     for key, tb in b_tenants.items():
         if key not in a_tenants:
+            if _tombstoned(tb, merged_del_t.get(_tenant_key_str(key))):
+                continue
             merged_tenants.append(tb)
 
     a_units, b_units = (a.get("units") or {}), (b.get("units") or {})
@@ -951,14 +1008,18 @@ def _merge_cloud_data(a, b):
     for uk, ua in a_units.items():
         ub = b_units.get(uk)
         if not isinstance(ua, dict):
-            merged_units[uk] = ub if ub is not None else ua
+            winner = ub if ub is not None else ua
         elif not isinstance(ub, dict):
-            merged_units[uk] = ua
+            winner = ua
         else:
-            merged_units[uk] = (
-                ua if _iso_ge(ua.get("_updated_at", ""), ub.get("_updated_at", "")) else ub)
+            winner = (ua if _iso_ge(ua.get("_updated_at", ""), ub.get("_updated_at", "")) else ub)
+        if isinstance(winner, dict) and _tombstoned(winner, merged_del_u.get(uk)):
+            continue
+        merged_units[uk] = winner
     for uk, ub in b_units.items():
         if uk not in a_units:
+            if isinstance(ub, dict) and _tombstoned(ub, merged_del_u.get(uk)):
+                continue
             merged_units[uk] = ub
 
     a_settings, b_settings = (a.get("settings") or {}), (b.get("settings") or {})
@@ -971,6 +1032,8 @@ def _merge_cloud_data(a, b):
         "tenants": merged_tenants,
         "units": merged_units,
         "settings": merged_settings,
+        "deleted_tenants": merged_del_t,
+        "deleted_units": merged_del_u,
     }
 
 
@@ -3151,6 +3214,7 @@ def delete_tenant(idx):
     tenants = data["tenants"]
     if idx < 0 or idx >= len(tenants):
         return jsonify({"error": "not found"}), 404
+    stamp_tenant_deleted(data, tenants[idx])
     del tenants[idx]
     save_state(data)
     return jsonify({"ok": True})
@@ -3323,6 +3387,7 @@ def delete_unit(name):
     data = load_state()
     if name not in data["units"]:
         return jsonify({"ok": False, "error": "Unit not found."}), 404
+    stamp_unit_deleted(data, name)
     del data["units"][name]
     save_state(data)
     return jsonify({"ok": True})
@@ -3432,88 +3497,26 @@ def shutdown_server():
 
 @app.route("/api/settings/reset", methods=["POST"])
 def reset_data():
+    """Wipes all tenant/unit data. Requires the admin PIN that was
+    originally set on the PC (settings.pin_hash -- the same one used to
+    lock/unlock this app) to be re-entered, so a device that merely has
+    an open, unlocked session can't nuke everything on its own; a backup
+    of the current data is always taken first regardless."""
+    data = load_state()
+    pin_hash = data.get("settings", {}).get("pin_hash", "")
+    if not pin_hash:
+        return jsonify({"ok": False,
+                         "error": "No admin PIN is set on the PC yet. Set one from "
+                                  "the desktop app's Settings before resetting data "
+                                  "from here."}), 400
+    body = request.get_json(force=True) or {}
+    entered_pin = (body.get("admin_pin") or "").strip()
+    if not entered_pin or hash_secret(entered_pin) != pin_hash:
+        return jsonify({"ok": False, "error": "Incorrect admin PIN."}), 400
     backup_current_data_file()
     save_state({"units": {}, "tenants": [], "settings": {}})
     session["unlocked"] = True
     return jsonify({"ok": True})
-
-# =========================================================================
-#  SECTION 3 -- LAN discovery + QR code ("Connect Phone")
-# =========================================================================
-def get_lan_ip():
-    """Best-effort guess at this PC's LAN IP (the address your phone would
-    use). Doesn't actually send any traffic -- just asks the OS which local
-    interface it would route through to reach the public internet."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
-
-CONNECT_PAGE = """<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Connect Your Phone -- {app_name}</title>
-<style>
-  body{{margin:0;font-family:system-ui,sans-serif;background:#0E4F4F;color:#fff;
-       min-height:100vh;display:flex;flex-direction:column;align-items:center;
-       justify-content:center;padding:32px 20px;text-align:center;}}
-  h1{{font-size:20px;margin:0 0 6px;}}
-  p{{color:#BFE0DC;font-size:14px;margin:0 0 24px;max-width:320px;line-height:1.5;}}
-  .qr-box{{background:#fff;padding:16px;border-radius:20px;box-shadow:0 12px 32px rgba(0,0,0,.25);}}
-  .qr-box img{{display:block;width:220px;height:220px;}}
-  .url{{margin-top:22px;font-size:14px;background:rgba(255,255,255,.12);padding:10px 16px;
-       border-radius:10px;letter-spacing:.3px;}}
-  a.open{{margin-top:26px;display:inline-block;background:#1FAD9F;color:#fff;text-decoration:none;
-        font-weight:600;padding:12px 28px;border-radius:12px;font-size:14px;}}
-  .hint{{margin-top:14px;font-size:12px;color:#9CC9C3;}}
-</style></head>
-<body>
-  <h1>Scan to open on your phone</h1>
-  <p>Make sure your phone is on the <b>same Wi-Fi</b> as this PC, then scan this code with your camera app.</p>
-  <div class="qr-box"><img src="/qr.png" alt="QR code"></div>
-  <div class="url">{lan_url}</div>
-  <a class="open" href="/">Continue on this device -&gt;</a>
-  <div class="hint">Keep this terminal / PC running -- it's what your phone connects to.</div>
-</body></html>"""
-
-
-@app.route("/connect")
-def connect_page():
-    # Leftover from an older LAN-only pairing flow, superseded by the
-    # desktop app's own direct-cloud QR code (see get_direct_cloud_pairing_url
-    # / _make_phone_qr_image) -- kept only so nothing breaks if this script
-    # is ever run standalone outside the desktop app. Gated the same as
-    # "/" so it can't be used to route around the pairing token: without
-    # that, it would reveal this app exists (and its LAN address) to
-    # anyone on the same Wi-Fi with no token at all.
-    if not _pairing_ok():
-        return Response("", status=404, mimetype="text/plain")
-    port = request.host.split(":")[1] if ":" in request.host else "80"
-    lan_url = f"http://{get_lan_ip()}:{port}"
-    return Response(CONNECT_PAGE.format(app_name=APP_NAME, lan_url=lan_url), mimetype="text/html")
-
-
-@app.route("/qr.png")
-def qr_png():
-    if not _pairing_ok():
-        return Response("", status=404, mimetype="text/plain")
-    if not QRCODE_OK:
-        return Response("qrcode library not installed on the server (pip install qrcode[pil]).",
-                         status=501)
-    port = request.host.split(":")[1] if ":" in request.host else "80"
-    lan_url = f"http://{get_lan_ip()}:{port}"
-    img = qrcode.make(lan_url, box_size=8, border=2)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return send_file(buf, mimetype="image/png")
-
-
 
 # =========================================================================
 #  SECTION 4 -- Mobile frontend (single-page app, embedded as one string)
@@ -4712,11 +4715,12 @@ function lockNow() {
 }
 
 // ── modal helper ─────────────────────────────────────────────────────
-function openModal(html) {
+function openModal(html, opts) {
+  const dismissible = !opts || opts.dismissible !== false;
   const root = $('#modalRoot');
-  root.innerHTML = `<div class="modal-backdrop" onclick="if(event.target===this) closeModal()">
+  root.innerHTML = `<div class="modal-backdrop" ${dismissible ? `onclick="if(event.target===this) closeModal()"` : ''}>
     <div class="modal" style="position:relative;">
-      <button class="icon-btn close-x" style="background:var(--teal-soft);color:var(--teal-deep);" onclick="closeModal()">✕</button>
+      ${dismissible ? `<button class="icon-btn close-x" style="background:var(--teal-soft);color:var(--teal-deep);" onclick="closeModal()">✕</button>` : ''}
       ${html}
     </div>
   </div>`;
@@ -5414,134 +5418,53 @@ async function renderSettings() {
       <a class="linklike" href="api/export/excel">⬇ Download Excel (.xlsx)</a><br><br>
       <a class="linklike" href="api/export/pdf">⬇ Download PDF Report</a>
     </div>
-    <div class="section-title">Security</div>
-    <div class="card" id="pinCard">
-      <div class="sub" style="color:var(--muted);font-size:12.5px;">Loading…</div>
-    </div>
-    <div class="section-title">Connected Devices</div>
-    <div class="card" id="devicesCard">
-      <div class="sub" style="color:var(--muted);font-size:12.5px;">Loading…</div>
-    </div>
     <div class="section-title">Danger Zone</div>
     <div class="card">
       <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
-        Permanently erases every tenant, unit, and transaction shared with the desktop app. A backup of the current data is kept automatically before wiping.
+        Permanently erases every tenant, unit, and transaction shared with the desktop app. A backup of the current data is kept automatically before wiping, and the PC's admin PIN is required.
       </div>
       <button class="btn btn-danger btn-full" onclick="openResetData()">🗑 Reset All Data</button>
     </div>
     <div class="section-title">About</div>
     <div class="card sub" style="color:var(--muted);font-size:12.5px;">
-      Tenant Monitoring &amp; Management — Web Edition.<br>Shares data with the desktop app on this PC.
+      Tenant Monitoring &amp; Management — Web Edition.<br>Shares data with the desktop app on this PC.<br><br>
+      Device naming, connected-device management, and the app lock/PIN are all controlled from the desktop app now, not from here.
     </div>
   `;
   updateInstallUI();
-  renderPinCard();
-  renderDevicesCard();
 }
 
-// ── SECURITY: PIN lock ─────────────────────────────────────────────────
-async function renderPinCard() {
-  const ls = await api('/api/lock-status');
-  const card = $('#pinCard');
-  if (!card) return;
-  if (ls && ls.pin_set) {
-    card.innerHTML = `
-      <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
-        A PIN is currently required to open this app.
-      </div>
-      <button class="btn btn-primary btn-full" onclick="openSetPin(true)">Change PIN</button>
-      <button class="btn btn-danger btn-full" style="margin-top:10px;" onclick="openRemovePin()">Remove PIN</button>
-    `;
-  } else {
-    card.innerHTML = `
-      <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
-        No PIN set — anyone with the link can open this app.
-      </div>
-      <button class="btn btn-primary btn-full" onclick="openSetPin(false)">Set a PIN</button>
-    `;
-  }
-}
-function openSetPin(hasExisting) {
+// ── DEVICE NAMING (prompted once, right after a QR pairing scan) ──────
+// PIN/lock and the connected-devices roster are admin-only now and are
+// managed from the desktop app's Settings -> Connect Phone panel instead
+// of from here -- a phone can still name ITSELF (device_id is already
+// tied to it, so this is just a courtesy so the admin can tell devices
+// apart in that PC-side panel), but nothing else about security or the
+// device list is editable from the web app.
+async function maybePromptDeviceName() {
+  const justPaired = new URLSearchParams(location.search).has('pt');
+  if (!justPaired) return;
+  try {
+    const d = await api('/api/devices');
+    const devices = (d && d.devices) || [];
+    const mine = devices.find(dev => dev.device_id === DEVICE_ID);
+    if (mine && mine.label) return;  // already named (e.g. re-scanned an old QR)
+  } catch (e) { return; }
   openModal(`
-    <h2>${hasExisting ? 'Change PIN' : 'Set a PIN'}</h2>
-    ${hasExisting ? `<label class="field">Current PIN</label><input id="pin_current" type="password" inputmode="numeric">` : ''}
-    <label class="field">New PIN (min 4 digits)</label><input id="pin_new" type="password" inputmode="numeric">
-    <label class="field">Confirm New PIN</label><input id="pin_confirm" type="password" inputmode="numeric">
-    <div class="err" id="pinErr"></div>
-    <button class="btn btn-primary btn-full" style="margin-top:8px;" onclick="submitSetPin(${hasExisting})">Save PIN</button>
-  `);
-}
-async function submitSetPin(hasExisting) {
-  const newPin = $('#pin_new').value.trim();
-  const confirmPin = $('#pin_confirm').value.trim();
-  if (newPin !== confirmPin) { $('#pinErr').textContent = 'PINs do not match.'; return; }
-  const body = { new_pin: newPin, current_pin: hasExisting ? $('#pin_current').value.trim() : '' };
-  const d = await api('/api/settings/pin', {method:'POST', body: JSON.stringify(body)});
-  if (d.ok) { closeModal(); toast('PIN saved.'); renderPinCard(); }
-  else $('#pinErr').textContent = d.error || 'Could not save PIN.';
-}
-function openRemovePin() {
-  openModal(`
-    <h2>Remove PIN</h2>
-    <div class="desc">Enter your current PIN to remove the lock.</div>
-    <label class="field">Current PIN</label><input id="pin_rm_current" type="password" inputmode="numeric">
-    <div class="err" id="pinRmErr"></div>
-    <button class="btn btn-danger btn-full" style="margin-top:8px;" onclick="submitRemovePin()">Remove PIN</button>
-  `);
-}
-async function submitRemovePin() {
-  const body = { current_pin: $('#pin_rm_current').value.trim() };
-  const d = await api('/api/settings/pin', {method:'DELETE', body: JSON.stringify(body)});
-  if (d.ok) { closeModal(); toast('PIN removed.'); renderPinCard(); }
-  else $('#pinRmErr').textContent = d.error || 'Could not remove PIN.';
-}
-
-// ── CONNECTED DEVICES ────────────────────────────────────────────────
-async function renderDevicesCard() {
-  const card = $('#devicesCard');
-  if (!card) return;
-  let d;
-  try { d = await api('/api/devices'); } catch (e) { d = null; }
-  const devices = (d && d.devices) || [];
-  const mine = devices.find(dev => dev.device_id === DEVICE_ID);
-  const others = devices.filter(dev => dev.device_id !== DEVICE_ID);
-
-  // Saved once, tied to this device's own (already-persistent) DEVICE_ID --
-  // the server locks it against being overwritten, so it never needs to be
-  // typed again on this device, even after closing and reopening the app.
-  const nameRow = `
-    <div style="margin-bottom:${others.length?'14px':'0'};">
-      <label class="field" style="margin-top:0;">This Device's Name</label>
-      <div class="row">
-        <input id="dev_my_label" value="${escapeHtml((mine && mine.label) || '')}" placeholder="e.g. Mary's iPhone">
-      </div>
-      <button class="btn btn-primary btn-full" style="margin-top:8px;" onclick="submitDeviceLabel()">Save Name</button>
-      <div class="err" id="devLabelErr"></div>
-    </div>${others.length ? '<hr class="sep">' : ''}`;
-
-  const otherRows = others.map(dev => `
-    <div class="tenant-row" style="cursor:default;">
-      <div class="avatar">${dev.online ? '🟢' : '⚪'}</div>
-      <div class="meta">
-        <div class="name">${escapeHtml(dev.label || 'Unknown device')}</div>
-        <div class="sub">${dev.online ? 'Online now' : 'Last seen ' + new Date(dev.last_seen*1000).toLocaleString()}</div>
-      </div>
-      <button class="btn btn-danger" style="padding:6px 12px;font-size:12.5px;" onclick="kickDevice('${dev.device_id}')">Disconnect</button>
-    </div>`).join('') || (mine ? '' : `<div class="sub" style="color:var(--muted);font-size:12.5px;">No other devices connected right now.</div>`);
-
-  card.innerHTML = nameRow + otherRows;
+    <h2>Name This Device</h2>
+    <div class="desc">Give this phone/browser a name so the admin can recognize it in the connected-devices list on the PC.</div>
+    <label class="field">Device Name</label>
+    <input id="dev_my_label" placeholder="e.g. Mary's iPhone">
+    <div class="err" id="devLabelErr"></div>
+    <button class="btn btn-primary btn-full" style="margin-top:8px;" onclick="submitDeviceLabel()">Save Name</button>
+  `, {dismissible: false});
 }
 async function submitDeviceLabel() {
   const label = $('#dev_my_label').value.trim();
   if (!label) { $('#devLabelErr').textContent = 'Please enter a name.'; return; }
   const d = await api('/api/devices/label', {method:'POST', body: JSON.stringify({label})});
-  if (d.ok) { toast('Device name saved.'); renderDevicesCard(); }
+  if (d.ok) { closeModal(); toast('Device name saved.'); }
   else $('#devLabelErr').textContent = d.error || 'Could not save name.';
-}
-async function kickDevice(deviceId) {
-  if (!confirm('Disconnect this device? It will need to reconnect to use the app again.')) return;
-  const d = await api('/api/devices/'+encodeURIComponent(deviceId)+'/kick', {method:'POST'});
-  if (d.ok) { toast('Device disconnected.'); renderDevicesCard(); }
 }
 
 // ── DANGER ZONE: reset data ──────────────────────────────────────────
@@ -5549,13 +5472,16 @@ function openResetData() {
   openModal(`
     <h2>Reset All Data</h2>
     <div class="desc">This permanently deletes every tenant, unit, and transaction on both this app and the desktop app. A backup of the current data file is saved automatically first. This cannot be undone from here.</div>
+    <label class="field">Admin PIN (set on the PC)</label><input id="reset_admin_pin" type="password" inputmode="numeric">
     <div class="err" id="resetErr"></div>
     <button class="btn btn-danger btn-full" style="margin-top:8px;" onclick="submitResetData()">Yes, Reset Everything</button>
   `);
 }
 async function submitResetData() {
+  const adminPin = $('#reset_admin_pin').value.trim();
+  if (!adminPin) { $('#resetErr').textContent = 'Enter the admin PIN set on the PC.'; return; }
   if (!confirm('Are you absolutely sure? All tenants and units will be erased.')) return;
-  const d = await api('/api/settings/reset', {method:'POST'});
+  const d = await api('/api/settings/reset', {method:'POST', body: JSON.stringify({admin_pin: adminPin})});
   if (d.ok) { closeModal(); toast('All data reset.'); cacheDeletePrefix('/api/'); switchTab('dashboard'); }
   else $('#resetErr').textContent = d.error || 'Could not reset data.';
 }
@@ -5668,6 +5594,7 @@ async function boot() {
   booted = true;
   loadCloudConfig();
   switchTab('dashboard');
+  maybePromptDeviceName();
 }
 async function init() {
   let ls;
@@ -5699,22 +5626,27 @@ init();
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     no_browser = os.environ.get("RM_NO_BROWSER") == "1"
-    lan_ip = get_lan_ip()
     print(f"\n  {APP_NAME} -- web edition (single file)")
     print(f"  Data file: {DATA_FILE}")
-    print(f"  On this PC:      http://127.0.0.1:{port}")
-    print(f"  On your phone:   http://{lan_ip}:{port}   (same Wi-Fi)")
-    print(f"  Or just scan the QR code at: http://127.0.0.1:{port}/connect\n")
+    print(f"  Local:  http://127.0.0.1:{port}")
+    if CLOUD_MODE:
+        print("  Running in CLOUD_MODE -- reachable at this service's public URL; "
+              "phones pair to it directly via the QR code the desktop app shows "
+              "under Settings -> Connect Phone.\n")
+    else:
+        print("  Not running in CLOUD_MODE (no DATABASE_URL) -- this is a local "
+              "test run only. Deploy with CLOUD_MODE=1 and a DATABASE_URL for "
+              "phones to be able to reach it.\n")
 
     if not no_browser:
         # Standalone run (person double-clicked/ran this file themselves) —
-        # open the "Connect Your Phone" page on this PC as a convenience.
-        def _open_connect_page():
+        # open the app on this PC as a convenience.
+        def _open_local_page():
             try:
-                webbrowser.open(f"http://127.0.0.1:{port}/connect")
+                webbrowser.open(f"http://127.0.0.1:{port}")
             except Exception:
                 pass
-        threading.Timer(1.0, _open_connect_page).start()
+        threading.Timer(1.0, _open_local_page).start()
     # else: launched from the desktop app's Settings → Connect Phone, which
     # already shows its own QR code in-window — nothing should open on the PC.
 
