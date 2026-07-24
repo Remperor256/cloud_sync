@@ -882,6 +882,16 @@ def _stamp_changed_records(new_data, old_data):
         elif "_updated_at" not in uv and isinstance(old_u, dict) and old_u.get("_updated_at"):
             uv["_updated_at"] = old_u["_updated_at"]
 
+    # Mirrors the desktop app's settings stamping -- see the identically
+    # named function in updates.py for why this exists.
+    new_settings = new_data.get("settings")
+    if isinstance(new_settings, dict):
+        old_settings = old_data.get("settings") if isinstance(old_data.get("settings"), dict) else {}
+        if not _record_content_equal(new_settings, old_settings):
+            new_settings["_updated_at"] = now_iso
+        elif "_updated_at" not in new_settings and old_settings.get("_updated_at"):
+            new_settings["_updated_at"] = old_settings["_updated_at"]
+
     return new_data
 
 
@@ -904,8 +914,10 @@ def _merge_cloud_data(a, b):
       - a record missing `_updated_at` entirely is treated as maximally
         stale; if neither side has a stamp, `a`'s copy wins (arbitrary
         but stable).
-    `settings` is merged shallowly, key by key, with `a` taking
-    precedence."""
+    `settings` is treated as a single block and resolved by its own
+    `_updated_at` stamp -- whichever side's settings were actually
+    edited more recently wins outright, rather than `a` always winning
+    regardless of recency."""
     def _tenants_by_key(d):
         return {(t.get("name"), t.get("unit"), t.get("entry_date")): t
                 for t in (d.get("tenants") or [])}
@@ -935,10 +947,16 @@ def _merge_cloud_data(a, b):
         if uk not in a_units:
             merged_units[uk] = ub
 
+    a_settings, b_settings = (a.get("settings") or {}), (b.get("settings") or {})
+    merged_settings = (
+        a_settings if not b_settings or
+        _iso_ge(a_settings.get("_updated_at", ""), b_settings.get("_updated_at", ""))
+        else b_settings)
+
     return {
         "tenants": merged_tenants,
         "units": merged_units,
-        "settings": {**(b.get("settings") or {}), **(a.get("settings") or {})},
+        "settings": merged_settings,
     }
 
 
@@ -4161,7 +4179,10 @@ setInterval(pingServer, 6000);
 // re-render via the same render() used everywhere else, so it goes
 // through the normal cloud-first api() path above. Skipped whenever it
 // could disrupt someone actively typing/editing, or when there's nothing
-// to refresh anyway.
+// to refresh anyway. Was 90000ms (90s) -- far slower than the PC side's
+// own pull interval, so a change made on the PC (or another phone) could
+// sit unseen here for a minute and a half. Matched to 5000ms to line up
+// with the PC's CLOUD_PULL_POLL_MS.
 setInterval(function () {
   if (document.hidden) return;
   const lockEl = $('#lockscreen');
@@ -4170,7 +4191,7 @@ setInterval(function () {
   if (modalEl && modalEl.innerHTML.trim() !== '') return;
   if (state.tab === 'add-tenant') return;
   render();
-}, 90000);
+}, 5000);
 window.addEventListener('online', pingServer);
 window.addEventListener('offline', () => setOnline(false));
 
