@@ -19,6 +19,7 @@ in this one file on purpose, so it's a single thing to copy/share.
 import os
 import re
 import io
+import copy
 import json
 import time
 import shutil
@@ -365,6 +366,19 @@ if CLOUD_MODE:
         if not row:
             return {"units": {}, "tenants": [], "settings": {}}
         return row["data"]
+
+    def _cloud_get_updated_at(session_id):
+        """Cheap timestamp-only read (no `data` column, unlike
+        _cloud_get_row) so lock_status can hand it to every device on
+        every 6s ping -- see the JS pingServer() -- without paying to
+        pull the full snapshot back down each time. Lets the web app
+        notice a change (PC save, another phone, etc.) and apply it
+        right away instead of waiting for its own slower full-refresh
+        timer."""
+        with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT updated_at FROM cloud_sessions WHERE session_id = %s", (session_id,))
+            row = cur.fetchone()
+            return row[0].isoformat() if row and row[0] else ""
 
     def _cloud_save(session_id, data, updated_by=None):
         """Always stamps updated_at with the DATABASE's own now() -- never
@@ -970,14 +984,28 @@ def save_raw(data, updated_by=None):
         return _cloud_save(g.session_id, data, updated_by=updated_by or "cloud")
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    try:
-        export_excel(data)
-    except Exception:
-        pass
-    try:
-        export_pdf(data)
-    except Exception:
-        pass
+    # Same fix as the desktop app's save_data(): export_excel/export_pdf
+    # rebuild the whole workbook/document from scratch, which is real
+    # work -- doing it synchronously here would hold the HTTP response
+    # (and so the phone's UI) hostage until both finished, on every
+    # single save. The JSON write above is what everything else actually
+    # depends on, so the response can go back now; exports finish a
+    # moment later in the background. Deepcopy for the same reason as
+    # the desktop side: `data` may still be referenced/mutated by the
+    # caller after this function returns.
+    export_snapshot = copy.deepcopy(data)
+
+    def _export_worker():
+        try:
+            export_excel(export_snapshot)
+        except Exception:
+            pass
+        try:
+            export_pdf(export_snapshot)
+        except Exception:
+            pass
+
+    threading.Thread(target=_export_worker, daemon=True).start()
     return None
 
 
@@ -2663,6 +2691,7 @@ def lock_status():
             "device_count": _cloud_active_device_count(g.session_id),
             "max_devices": MAX_DEVICES,
             "device_limit_reached": False,
+            "data_updated_at": _cloud_get_updated_at(g.session_id),
         })
     data = load_state()
     device_id = request.headers.get("X-Device-Id", "")
@@ -2676,6 +2705,10 @@ def lock_status():
             request.headers.get("X-Device-Screen", ""),
             request.headers.get("X-Device-Fingerprint", ""),
         )
+    try:
+        data_updated_at = str(os.path.getmtime(DATA_FILE))
+    except OSError:
+        data_updated_at = ""
     resp = {
         "pin_set": _pin_required(data),
         "unlocked": _authed(),
@@ -2685,6 +2718,7 @@ def lock_status():
         "device_count": _active_device_count(),
         "max_devices": MAX_DEVICES,
         "device_limit_reached": (not admitted) and not kicked,
+        "data_updated_at": data_updated_at,
     }
     if canonical_device_id and canonical_device_id != device_id:
         resp["canonical_device_id"] = canonical_device_id
@@ -4132,7 +4166,27 @@ async function fetchTimeout(path, opts={}, ms=4000) {
   }
 }
 
+// Skipped whenever a refresh could disrupt someone actively typing/
+// editing, or when there's nothing to refresh anyway. Shared by both the
+// slow 90s baseline timer below and the fast change-detection in
+// pingServer(), so "don't interrupt what the person is doing" is defined
+// in exactly one place.
+function refreshIfSafe() {
+  if (document.hidden) return;
+  const lockEl = $('#lockscreen');
+  if (lockEl && lockEl.style.display !== 'none') return;
+  const modalEl = $('#modalRoot');
+  if (modalEl && modalEl.innerHTML.trim() !== '') return;
+  if (state.tab === 'add-tenant') return;
+  render();
+}
+
 let pingMisses = 0;
+// Last data_updated_at we've seen from the server (via /api/lock-status).
+// null until the first successful ping, so that first ping only primes
+// this value instead of firing a refresh (there's nothing "new" about
+// data the app hasn't loaded yet).
+let lastKnownDataUpdatedAt = null;
 async function pingServer() {
   try {
     // Same 6000ms budget every other network call in this app gets
@@ -4153,6 +4207,19 @@ async function pingServer() {
       }
       pingMisses = 0;
       setOnline(true);
+      // /api/lock-status is cheap and already polled every 6s for the
+      // online badge -- data_updated_at rides along on that same request
+      // instead of needing its own poll. The moment it moves past what
+      // we last saw (a save on the PC, another phone, etc.), apply the
+      // change right away rather than waiting for the slow 90s baseline
+      // refresh below.
+      const stamp = data && data.data_updated_at;
+      if (stamp) {
+        if (lastKnownDataUpdatedAt !== null && stamp !== lastKnownDataUpdatedAt) {
+          refreshIfSafe();
+        }
+        lastKnownDataUpdatedAt = stamp;
+      }
       return true;
     }
   } catch(e) {}
@@ -4174,24 +4241,14 @@ async function pingServer() {
 }
 setInterval(pingServer, 6000);
 
-// Keeps the visible screen in sync with changes made elsewhere (the PC,
-// or another phone) without needing a manual reload/tab-switch. Read-only
-// re-render via the same render() used everywhere else, so it goes
-// through the normal cloud-first api() path above. Skipped whenever it
-// could disrupt someone actively typing/editing, or when there's nothing
-// to refresh anyway. Was 90000ms (90s) -- far slower than the PC side's
-// own pull interval, so a change made on the PC (or another phone) could
-// sit unseen here for a minute and a half. Matched to 5000ms to line up
-// with the PC's CLOUD_PULL_POLL_MS.
+// Baseline safety-net refresh -- catches anything data_updated_at-based
+// detection in pingServer() might miss (e.g. this device was hidden/
+// backgrounded when the change stamp ticked over) without needing its
+// own tight polling interval, since real-time pickup is already handled
+// above. 90s, as originally designed.
 setInterval(function () {
-  if (document.hidden) return;
-  const lockEl = $('#lockscreen');
-  if (lockEl && lockEl.style.display !== 'none') return;
-  const modalEl = $('#modalRoot');
-  if (modalEl && modalEl.innerHTML.trim() !== '') return;
-  if (state.tab === 'add-tenant') return;
-  render();
-}, 5000);
+  refreshIfSafe();
+}, 90000);
 window.addEventListener('online', pingServer);
 window.addEventListener('offline', () => setOnline(false));
 
