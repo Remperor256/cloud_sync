@@ -3726,6 +3726,16 @@ INDEX_HTML = """<!DOCTYPE html>
     justify-content:space-between;cursor:pointer;
   }
   .month-picker-control .mp-caret{color:var(--muted);font-size:12px;}
+  .select-native-wrap{position:relative;flex:1;}
+  .select-native-wrap select{
+    width:100%;appearance:none;-webkit-appearance:none;-moz-appearance:none;
+    border:1.5px solid var(--line);border-radius:12px;padding:11px 30px 11px 12px;
+    font-size:14px;background:#fff;color:var(--ink);
+  }
+  .select-native-wrap::after{
+    content:'▾';position:absolute;right:12px;top:50%;transform:translateY(-50%);
+    color:var(--muted);font-size:12px;pointer-events:none;
+  }
   .month-picker-panel{
     border:1.5px solid var(--line);border-radius:12px;margin-top:6px;overflow:hidden;background:#fff;
   }
@@ -4788,6 +4798,31 @@ function openModal(html, opts) {
 }
 function closeModal() { $('#modalRoot').innerHTML = ''; }
 
+// ── double-submit guard ──────────────────────────────────────────────
+// Fixes the "tapped Save/Confirm twice because it felt slow" bug: a
+// second tap before the first request finished used to re-run the same
+// handler and duplicate the change (double payment, double edit, etc).
+// This intercepts every click on a .btn that still has its inline
+// onclick, disables the button the instant the tap lands (before the
+// handler even starts, so there's no window for a second tap to slip
+// through), runs the handler, then re-enables the button only once that
+// handler -- including any awaited network call -- has actually
+// settled. Buttons without an inline onclick (e.g. ones wired up with
+// addEventListener) are untouched.
+document.addEventListener('click', function (e) {
+  const btn = e.target.closest('button.btn[onclick]');
+  if (!btn || btn.disabled) return;
+  const code = btn.getAttribute('onclick');
+  if (!code) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  btn.disabled = true;
+  Promise.resolve()
+    .then(() => new Function(code).call(btn))
+    .catch(err => console.error(err))
+    .finally(() => { if (document.body.contains(btn)) btn.disabled = false; });
+}, true);
+
 // ── tabs ─────────────────────────────────────────────────────────────
 $$('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 function switchTab(tab) {
@@ -4943,7 +4978,7 @@ function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s??
 
 const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function fmtPeriodDate(d) {
-  return `${d.getDate()} ${MONTH_ABBR[d.getMonth()].toLowerCase()},${String(d.getFullYear()).slice(-2)}`;
+  return `${d.getDate()} ${MONTH_ABBR[d.getMonth()]}, ${String(d.getFullYear()).slice(-2)}`;
 }
 function abbrevPeriod(fromIso, toIso) {
   // Must always agree with the record's actual from/to fields (as shown
@@ -5492,8 +5527,8 @@ async function renderHistory() {
       Generate a summary of payments and deposits for one specific month.
     </div>
     <div style="display:flex;gap:8px;">
-      <select id="mrMonth" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);"></select>
-      <select id="mrYear" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);"></select>
+      <div class="select-native-wrap"><select id="mrMonth"></select></div>
+      <div class="select-native-wrap"><select id="mrYear"></select></div>
     </div>
     <button class="btn btn-primary btn-full" style="margin-top:10px;" onclick="generateMonthlyReport()">Generate</button>
     <div id="mrResults" style="margin-top:12px;"></div>
