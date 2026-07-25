@@ -3620,6 +3620,7 @@ INDEX_HTML = """<!DOCTYPE html>
     border:none;color:#fff;display:flex;align-items:center;justify-content:center;
     font-size:16px;cursor:pointer;
   }
+  .icon-btn:disabled{opacity:.5;cursor:default;}
   main{padding:16px;}
   .card{
     background:var(--card);border-radius:var(--radius);
@@ -4801,16 +4802,19 @@ function closeModal() { $('#modalRoot').innerHTML = ''; }
 // ── double-submit guard ──────────────────────────────────────────────
 // Fixes the "tapped Save/Confirm twice because it felt slow" bug: a
 // second tap before the first request finished used to re-run the same
-// handler and duplicate the change (double payment, double edit, etc).
-// This intercepts every click on a .btn that still has its inline
-// onclick, disables the button the instant the tap lands (before the
-// handler even starts, so there's no window for a second tap to slip
-// through), runs the handler, then re-enables the button only once that
-// handler -- including any awaited network call -- has actually
-// settled. Buttons without an inline onclick (e.g. ones wired up with
-// addEventListener) are untouched.
+// handler and duplicate the change (double payment, double edit,
+// double cancellation, etc). This intercepts every click on any
+// <button> that still has its inline onclick -- covers .btn (Save,
+// Confirm, Record Payment...) as well as icon-buttons like the ↺
+// cancel-transaction control and the lock button -- disables the
+// button the instant the tap lands (before the handler even starts, so
+// there's no window for a second tap to slip through), runs the
+// handler, then re-enables the button only once that handler --
+// including any awaited network call -- has actually settled. Buttons
+// wired up purely with addEventListener (tabs, filter pills) have no
+// inline onclick attribute and so are untouched.
 document.addEventListener('click', function (e) {
-  const btn = e.target.closest('button.btn[onclick]');
+  const btn = e.target.closest('button[onclick]');
   if (!btn || btn.disabled) return;
   const code = btn.getAttribute('onclick');
   if (!code) return;
