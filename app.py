@@ -185,8 +185,7 @@ TENANT_FIELD_DEFAULTS = {
     "rent_increase_due":   0.0,
 }
 
-PERIOD_LABELS = {"current": "Current Month", "next": "Next Month",
-                  "multiple": "Multiple Months"}
+MONTH_PICKER_HORIZON = 24  # how many future open months to offer in the month picker
 
 # ── cloud mode ───────────────────────────────────────────────────────────
 # This exact same file can run two ways:
@@ -805,6 +804,64 @@ def _compute_txn_period(rec):
     return from_d.strftime("%Y-%m-%d"), to_d.strftime("%Y-%m-%d")
 
 
+def fmt_period_date(d):
+    """'24 jul,26' -- day, lowercase abbreviated month, comma, 2-digit year."""
+    return f"{d.day} {d.strftime('%b').lower()},{d.strftime('%y')}"
+
+
+def fmt_period(from_str, to_str):
+    """'24 jul,26 to 24 aug,26' from two YYYY-MM-DD strings."""
+    f, t = _parse_date(from_str), _parse_date(to_str)
+    if not f or not t:
+        return "—"
+    return f"{fmt_period_date(f)} to {fmt_period_date(t)}"
+
+
+def open_months_list(t, horizon=MONTH_PICKER_HORIZON):
+    """The still-payable months for tenant t, starting at the first unpaid
+    month (the tenant's current due date, or their move-in date if they've
+    never paid), running forward `horizon` months. Each entry's `months`
+    is how many consecutive months would be paid if the picker were
+    confirmed with that entry as the last one ticked."""
+    anchor = _parse_date(t.get("due_date", "")) or _parse_date(t.get("entry_date", "")) or date.today()
+    out = []
+    d = anchor
+    for i in range(horizon):
+        nxt = add_months(d, 1)
+        out.append({
+            "months": i + 1,
+            "from": d.strftime("%Y-%m-%d"),
+            "to": nxt.strftime("%Y-%m-%d"),
+            "label": fmt_period(d.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")),
+        })
+        d = nxt
+    return out
+
+
+def cleared_months_list(t):
+    """The already-paid months, from the tenant's move-in month up to (not
+    including) their current due date -- shown in the month picker as
+    locked/checked-off history, since a cleared month can't be selected
+    again."""
+    entry = _parse_date(t.get("entry_date", ""))
+    due = _parse_date(t.get("due_date", ""))
+    out = []
+    if not entry or not due or due <= entry:
+        return out
+    d = entry
+    while d < due:
+        nxt = add_months(d, 1)
+        if nxt > due:
+            nxt = due
+        out.append({
+            "from": d.strftime("%Y-%m-%d"),
+            "to": nxt.strftime("%Y-%m-%d"),
+            "label": fmt_period(d.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")),
+        })
+        d = nxt
+    return out
+
+
 # ── data load / save ────────────────────────────────────────────────────
 def _unique_backup_path(prefix, ext):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1183,16 +1240,18 @@ def current_deposit_cycle(t):
     return paid_so_far, remaining, cleared, in_progress
 
 
-def deposit_paid_for_period(t, period):
+def deposit_paid_so_far(t):
+    """Sum of active (non-cancelled) deposits since the last time the
+    deposit cycle cleared. All deposits in this window are toward the same
+    open month-window by construction (there's a single running window
+    now, not separate current/next/multiple buckets), so this no longer
+    needs to filter by a period label."""
     full_history = t.get("deposit_history", [])
     cycle_start = t.get("deposit_cycle_start", 0)
     if not isinstance(cycle_start, int) or cycle_start < 0 or cycle_start > len(full_history):
         cycle_start = 0
     cycle_window = full_history[cycle_start:]
-    return sum(
-        float(r.get("amount", 0)) for r in cycle_window
-        if not r.get("_cancelled") and r.get("period", "current") == period
-    )
+    return sum(float(r.get("amount", 0)) for r in cycle_window if not r.get("_cancelled"))
 
 
 def is_current_period_paid(t):
@@ -1202,13 +1261,6 @@ def is_current_period_paid(t):
     if due is None:
         return False
     return due >= date.today()
-
-
-def is_next_period_locked(t):
-    if not is_current_period_paid(t):
-        return False
-    locked = t.get("locked_periods", ["current"])
-    return "next" in locked
 
 
 def snapshot_tenant_state(t):
@@ -1237,12 +1289,6 @@ def restore_tenant_state(t, snap):
     t["rent_increase_due"] = snap.get("rent_increase_due", 0)
 
 
-def locked_periods_after(current_locked_before, next_locked_before, total_shift):
-    prior_periods_ahead = 2 if next_locked_before else (1 if current_locked_before else 0)
-    periods_ahead = prior_periods_ahead + total_shift
-    return ["current"] if periods_ahead <= 1 else ["current", "next"]
-
-
 def has_prior_payment_history(t):
     return bool(t.get("payment_history")) or bool(t.get("deposit_history"))
 
@@ -1256,14 +1302,6 @@ def due_date_shift_base(t, has_prior_history=None):
 
 def pending_reference_date_str(t):
     return t.get("due_date", "") or t.get("entry_date", "")
-
-
-def due_date_shift_for_period(period, months, has_prior_history=False, current_locked=False):
-    if period == "multiple":
-        return max(1, int(months))
-    if period == "next":
-        return 1 if current_locked else 2
-    return 1
 
 
 def status_level(t, today):
@@ -1339,7 +1377,7 @@ def apply_excess_cascade(t, excess, rent_target, base_due_str, pay_date, txn_id=
 
         if allow_full:
             t.setdefault("payment_history", []).append({
-                "date": pay_date, "period": "current", "months": 1,
+                "date": pay_date, "months": 1,
                 "amount": chunk,
                 "from_date": cur_due.strftime("%Y-%m-%d"),
                 "to_date": next_due.strftime("%Y-%m-%d"),
@@ -1354,8 +1392,10 @@ def apply_excess_cascade(t, excess, rent_target, base_due_str, pay_date, txn_id=
             t["deposit_cycle_start"] = len(t.get("deposit_history", []))
         else:
             t.setdefault("deposit_history", []).append({
-                "date": pay_date, "period": "current", "months": 1,
+                "date": pay_date, "months": 1,
                 "amount": chunk, "txn_id": txn_id,
+                "from_date": cur_due.strftime("%Y-%m-%d"),
+                "to_date": next_due.strftime("%Y-%m-%d"),
                 "target_month": next_due.strftime("%Y-%m-%d"),
             })
             t["deposit_cycle_start"] = len(t["deposit_history"]) - 1
@@ -1367,30 +1407,25 @@ def apply_excess_cascade(t, excess, rent_target, base_due_str, pay_date, txn_id=
 
 
 # ── payments / deposits ─────────────────────────────────────────────────
-def record_payment(t, period, months):
-    """Mutates tenant dict t in place. Returns dict describing the result."""
-    if period == "multiple":
-        months = max(1, int(months))
-    else:
-        months = 1
+def record_payment(t, months):
+    """Mutates tenant dict t in place. `months` is the number of
+    consecutive open months ticked in the month picker (1 = just the next
+    due month, n = that month plus the n-1 months after it). Returns dict
+    describing the result."""
+    months = max(1, int(months))
 
     rent = parse_amount(t.get("rent", 0))
     total = rent * months
 
-    current_locked_before = is_current_period_paid(t)
-    next_locked_before = is_next_period_locked(t)
     pre_txn_state = snapshot_tenant_state(t)
     txn_id = secrets.token_hex(4)
 
-    shift_months = due_date_shift_for_period(period, months, has_prior_payment_history(t),
-                                              current_locked=current_locked_before)
     old_due_str = t.get("due_date", "")
     shift_base_str = due_date_shift_base(t)
     new_due_str = old_due_str
-    if shift_months:
-        old_due = _parse_date(shift_base_str)
-        if old_due:
-            new_due_str = add_months(old_due, shift_months).strftime("%Y-%m-%d")
+    old_due = _parse_date(shift_base_str)
+    if old_due:
+        new_due_str = add_months(old_due, months).strftime("%Y-%m-%d")
 
     pay_date = date.today().strftime("%Y-%m-%d")
     t["pay_date"] = pay_date
@@ -1399,41 +1434,32 @@ def record_payment(t, period, months):
         t["due_date"] = new_due_str
 
     record_to_date = new_due_str
-    record_from_date = ""
-    if record_to_date:
-        to_d = _parse_date(record_to_date)
-        if to_d:
-            record_from_date = add_months(to_d, -1).strftime("%Y-%m-%d")
+    record_from_date = shift_base_str if record_to_date else ""
 
     t.setdefault("payment_history", []).append({
-        "date": pay_date, "period": period, "months": months, "amount": total,
+        "date": pay_date, "months": months, "amount": total,
         "from_date": record_from_date, "to_date": record_to_date,
         "txn_id": txn_id, "_pre_state": pre_txn_state,
     })
 
     pre_paid, _, _, _ = current_deposit_cycle(t)
-    cascade_shift = 0
     if pre_paid > 0:
         t["deposit_cycle_start"] = len(t.get("deposit_history", []))
-        cascade_shift = apply_excess_cascade(t, pre_paid, rent, t["due_date"], pay_date,
-                                              txn_id=txn_id) or 0
+        apply_excess_cascade(t, pre_paid, rent, t["due_date"], pay_date, txn_id=txn_id)
 
-    total_shift = shift_months + cascade_shift
-    t["locked_periods"] = locked_periods_after(current_locked_before, next_locked_before, total_shift)
-
-    return {"amount": total, "period": period, "months": months,
-            "due_date": t["due_date"], "old_due_date": old_due_str}
+    return {"amount": total, "months": months,
+            "due_date": t["due_date"], "old_due_date": old_due_str,
+            "period_label": fmt_period(record_from_date, record_to_date)}
 
 
-def record_deposit(t, period, months, instalment):
-    if period == "multiple":
-        months = max(1, int(months))
-    else:
-        months = 1
+def record_deposit(t, months, instalment):
+    """`months` is the number of consecutive open months ticked in the
+    month picker; the instalment accumulates toward rent x months."""
+    months = max(1, int(months))
 
     rent_target = parse_amount(t.get("rent", 0))
-    dep_paid_so_far = deposit_paid_for_period(t, period)
-    effective_target = rent_target * months if period == "multiple" else rent_target
+    dep_paid_so_far = deposit_paid_so_far(t)
+    effective_target = rent_target * months
     balance_before = max(0.0, effective_target - dep_paid_so_far)
     excess = max(0.0, instalment - balance_before)
     applied_amount = instalment - excess
@@ -1441,47 +1467,37 @@ def record_deposit(t, period, months, instalment):
     pay_date = date.today().strftime("%Y-%m-%d")
 
     had_prior_history = has_prior_payment_history(t)
-    current_locked_before = is_current_period_paid(t)
-    next_locked_before = is_next_period_locked(t)
     pre_txn_state = snapshot_tenant_state(t)
     txn_id = secrets.token_hex(4)
 
+    shift_base_str = due_date_shift_base(t, had_prior_history)
+    target_to_str = ""
+    shift_base_d = _parse_date(shift_base_str)
+    if shift_base_d:
+        target_to_str = add_months(shift_base_d, months).strftime("%Y-%m-%d")
+
     t.setdefault("deposit_history", []).append({
-        "date": pay_date, "period": period, "months": months,
-        "amount": applied_amount, "txn_id": txn_id, "_pre_state": pre_txn_state,
+        "date": pay_date, "months": months, "amount": applied_amount,
+        "from_date": shift_base_str, "to_date": target_to_str,
+        "txn_id": txn_id, "_pre_state": pre_txn_state,
     })
 
-    shift_months = 0
     if new_balance <= 0:
         prev_start = t.get("deposit_cycle_start", 0)
         t["deposit_history"][-1]["_cycle_start_before_clear"] = prev_start
         t["deposit_cycle_start"] = len(t["deposit_history"])
 
-        shift_months = due_date_shift_for_period(period, months, had_prior_history,
-                                                  current_locked=current_locked_before)
-        old_due_str = t.get("due_date", "")
-        shift_base_str = due_date_shift_base(t, had_prior_history)
-        new_due_str = old_due_str
-        if shift_months:
-            old_due = _parse_date(shift_base_str)
-            if old_due:
-                new_due_str = add_months(old_due, shift_months).strftime("%Y-%m-%d")
-        t["due_date"] = new_due_str
+        t["due_date"] = target_to_str or t.get("due_date", "")
         t["status"] = "Confirmed"
         t["pay_date"] = pay_date
 
-    cascade_shift = 0
     if excess > 0.01:
-        cascade_shift = apply_excess_cascade(t, excess, rent_target, t.get("due_date") or
-                                              due_date_shift_base(t, had_prior_history),
-                                              pay_date, txn_id=txn_id) or 0
-
-    total_shift = shift_months + cascade_shift
-    if total_shift:
-        t["locked_periods"] = locked_periods_after(current_locked_before, next_locked_before, total_shift)
+        apply_excess_cascade(t, excess, rent_target, t.get("due_date") or shift_base_str,
+                              pay_date, txn_id=txn_id)
 
     return {"amount": applied_amount, "excess": excess, "new_balance": new_balance,
-            "cleared": new_balance <= 0, "due_date": t.get("due_date", "")}
+            "cleared": new_balance <= 0, "due_date": t.get("due_date", ""),
+            "period_label": fmt_period(shift_base_str, target_to_str)}
 
 
 def cancel_transaction(t, h_key, idx):
@@ -1924,7 +1940,7 @@ def export_pdf(data):
                 pay_rows = [["#", "Date Paid", "Period", "Months", "Amount (UGX)"]]
                 for n, rec in enumerate(reversed(history), 1):
                     pay_rows.append([str(n), rec.get("date", "—"),
-                                      PERIOD_LABELS.get(rec.get("period", ""), "—"),
+                                      fmt_period(rec.get("from_date", ""), rec.get("to_date", "")),
                                       str(rec.get("months", 1)), f"{int(rec.get('amount', 0)):,}"])
                 pt = TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF7F4")),
@@ -3064,13 +3080,33 @@ def get_tenant(idx):
         "emergency_contact": t.get("emergency_contact", ""),
         "emergency_phone": t.get("emergency_phone", ""),
         "notes": t.get("notes", ""),
-        "current_period_locked": is_current_period_paid(t),
-        "next_period_locked": is_next_period_locked(t),
         "payment_history": list(reversed(t.get("payment_history", []))),
         "deposit_history": list(reversed(t.get("deposit_history", []))),
         "arrears_history": list(reversed(t.get("arrears_history", []))),
     }
     return jsonify({"tenant": detail})
+
+
+@app.route("/api/tenants/<int:idx>/months")
+def get_tenant_months(idx):
+    """Feeds the month-picker dropdown: the already-paid months (from the
+    tenant's move-in month up to their current due date -- shown locked,
+    can't be re-selected) and the still-open months going forward (shown
+    as tickable checkboxes, must be ticked in order starting from the
+    first one)."""
+    data = load_state()
+    tenants = data["tenants"]
+    if idx < 0 or idx >= len(tenants):
+        return jsonify({"error": "not found"}), 404
+    t = tenants[idx]
+    try:
+        horizon = min(60, max(1, int(request.args.get("horizon", MONTH_PICKER_HORIZON))))
+    except (ValueError, TypeError):
+        horizon = MONTH_PICKER_HORIZON
+    return jsonify({
+        "cleared": cleared_months_list(t),
+        "open": open_months_list(t, horizon),
+    })
 
 
 @app.route("/api/history")
@@ -3232,26 +3268,14 @@ def do_record_payment(idx):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
     body = request.get_json(force=True) or {}
-    period = body.get("period", "current")
-    months = body.get("months", 1)
-    if period not in ("current", "next", "multiple"):
-        return jsonify({"ok": False, "error": "Invalid period."}), 400
-    if period == "current" and is_current_period_paid(t):
-        return jsonify({"ok": False, "error": "Current month is already paid."}), 400
-    if period == "next":
-        if not is_current_period_paid(t):
-            return jsonify({"ok": False, "error": "Pay Current Month before Pay Next Month."}), 400
-        if is_next_period_locked(t):
-            return jsonify({"ok": False, "error": "Next month is already paid."}), 400
-    if period == "multiple":
-        try:
-            months = int(months)
-            if months < 1:
-                raise ValueError
-        except (ValueError, TypeError):
-            return jsonify({"ok": False, "error": "Enter a whole number of months (1 or more)."}), 400
+    try:
+        months = int(body.get("months", 1))
+        if months < 1:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "Select at least one month."}), 400
 
-    result = record_payment(t, period, months)
+    result = record_payment(t, months)
     save_state(data)
     return jsonify({"ok": True, "result": result})
 
@@ -3264,27 +3288,20 @@ def do_record_deposit(idx):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
     body = request.get_json(force=True) or {}
-    period = body.get("period", "current")
-    months = body.get("months", 1)
-    if period not in ("current", "next", "multiple"):
-        return jsonify({"ok": False, "error": "Invalid period."}), 400
-    if period == "next" and not is_current_period_paid(t):
-        return jsonify({"ok": False, "error": "Pay Current Month before Pay Next Month."}), 400
+    try:
+        months = int(body.get("months", 1))
+        if months < 1:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "Select at least one month."}), 400
     try:
         instalment = float(str(body.get("amount", "")).strip().replace(",", ""))
         if instalment <= 0:
             raise ValueError
     except (ValueError, TypeError):
         return jsonify({"ok": False, "error": "Enter a valid deposit amount greater than zero."}), 400
-    if period == "multiple":
-        try:
-            months = int(months)
-            if months < 1:
-                raise ValueError
-        except (ValueError, TypeError):
-            return jsonify({"ok": False, "error": "Enter a whole number of months (1 or more)."}), 400
 
-    result = record_deposit(t, period, months, instalment)
+    result = record_deposit(t, months, instalment)
     save_state(data)
     return jsonify({"ok": True, "result": result})
 
@@ -3703,6 +3720,34 @@ INDEX_HTML = """<!DOCTYPE html>
   .hist-row.hist-cancelled{background:#FFF0F0;color:var(--danger);}
   .hist-period{color:var(--muted);font-size:11px;}
   .hist-row.hist-cancelled .hist-period{color:var(--danger);opacity:.8;}
+  .month-picker-control{
+    width:100%;border:1.5px solid var(--line);border-radius:12px;padding:11px 12px;
+    font-size:14px;background:#fff;color:var(--ink);display:flex;align-items:center;
+    justify-content:space-between;cursor:pointer;
+  }
+  .month-picker-control .mp-caret{color:var(--muted);font-size:12px;}
+  .month-picker-panel{
+    border:1.5px solid var(--line);border-radius:12px;margin-top:6px;overflow:hidden;background:#fff;
+  }
+  .month-picker-list{max-height:230px;overflow-y:auto;}
+  .month-row{
+    display:flex;align-items:center;gap:10px;padding:10px 12px;font-size:13.5px;
+    border-bottom:1px solid var(--line);cursor:pointer;
+  }
+  .month-row:last-child{border-bottom:none;}
+  .month-row input[type=checkbox]{width:17px;height:17px;flex-shrink:0;pointer-events:none;}
+  .month-row .month-label{flex:1;}
+  .month-row.cleared{background:var(--teal-soft2);color:var(--muted);cursor:default;}
+  .month-row.cleared .month-tag{
+    font-size:10px;font-weight:700;color:var(--teal-deep);background:var(--teal-soft);
+    padding:2px 7px;border-radius:999px;text-transform:uppercase;letter-spacing:.3px;
+  }
+  .month-row.open:active{background:var(--teal-soft2);}
+  .month-row.open.ticked{background:var(--teal-soft2);}
+  .month-picker-actions{
+    display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:var(--teal-soft2);
+  }
+  .month-picker-actions .btn{padding:9px 14px;font-size:13px;}
   .searchbar input{border:none;padding:0;font-size:14px;}
   .filters{display:flex;gap:8px;overflow-x:auto;padding-bottom:2px;margin-bottom:14px;}
   .filter-pill{
@@ -4897,6 +4942,9 @@ function tenantRowHtml(t) {
 function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s??''; return d.innerHTML; }
 
 const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function fmtPeriodDate(d) {
+  return `${d.getDate()} ${MONTH_ABBR[d.getMonth()].toLowerCase()},${String(d.getFullYear()).slice(-2)}`;
+}
 function abbrevPeriod(fromIso, toIso) {
   // Must always agree with the record's actual from/to fields (as shown
   // in the desktop app's Records export), so this renders the exact
@@ -4904,10 +4952,8 @@ function abbrevPeriod(fromIso, toIso) {
   // to whole months previously hid the real (often mid-month) cycle
   // boundaries and could visibly disagree with the underlying dates.
   const f = _parseIsoDate(fromIso), t = _parseIsoDate(toIso);
-  if (!f || !t) return `${fromIso || '—'} → ${toIso || '—'}`;
-  const fLabel = `${MONTH_ABBR[f.getMonth()]} ${f.getDate()}, ${f.getFullYear()}`;
-  const tLabel = `${MONTH_ABBR[t.getMonth()]} ${t.getDate()}, ${t.getFullYear()}`;
-  return `${fLabel} → ${tLabel}`;
+  if (!f || !t) return `${fromIso || '—'} to ${toIso || '—'}`;
+  return `${fmtPeriodDate(f)} to ${fmtPeriodDate(t)}`;
 }
 function _parseIsoDate(s) {
   if (!s || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
@@ -5068,14 +5114,10 @@ async function renderTenantDetail(idx) {
 
     <div class="card">
       <div class="row">
-        <button class="btn btn-primary" ${t.current_period_locked?'disabled':''} onclick="openPaymentModal(${idx}, 'current', ${t.current_period_locked})">Pay Current</button>
-        <button class="btn btn-primary" ${(!t.current_period_locked || t.next_period_locked)?'disabled':''} onclick="openPaymentModal(${idx}, 'next', ${!t.current_period_locked || t.next_period_locked})">Pay Next</button>
+        <button class="btn btn-primary" onclick="openPaymentModal(${idx})">💳 Pay Rent</button>
       </div>
       <div class="row" style="margin-top:10px;">
-        <button class="btn btn-ghost" onclick="openPaymentModal(${idx}, 'multiple', false)">Pay Multiple Months</button>
-      </div>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn btn-ghost" onclick="openDepositModal(${idx}, ${t.current_period_locked})">＋ Record Instalment</button>
+        <button class="btn btn-ghost" onclick="openDepositModal(${idx})">＋ Record Instalment</button>
       </div>
     </div>
 
@@ -5092,10 +5134,13 @@ function origIdx(arr, displayI) { return arr.length - 1 - displayI; }
 function txnRow(t, r, key, origI) {
   const cancelled = r._cancelled;
   const label = key==='payment_history' ? 'Full Payment' : 'Deposit';
+  const periodTxt = (r.from_date && r.to_date) ? abbrevPeriod(r.from_date, r.to_date) : '';
+  const monthsTxt = r.months ? `${r.months} month${r.months==1?'':'s'}` : '';
+  const subTxt = [escapeHtml(r.date||''), monthsTxt, periodTxt].filter(Boolean).join(' · ');
   return `<div class="txn-item">
     <div>
       <div style="font-size:13px;">${label}${cancelled?' <span style="color:var(--danger);font-weight:600;">(Cancelled)</span>':''}</div>
-      <div class="sub" style="font-size:11.5px;color:var(--muted);">${escapeHtml(r.date||'')} ${r.period?('· '+r.period):''}</div>
+      <div class="sub" style="font-size:11.5px;color:var(--muted);">${subTxt}</div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
       <span class="amt ${cancelled?'cancelled':''}">${fmt(r.amount)}</span>
@@ -5149,44 +5194,127 @@ async function deleteTenant(idx) {
   if (d.ok) { closeModal(); toast('Tenant deleted.'); state.tab='tenants'; render(); }
 }
 
-function openPaymentModal(idx, period, locked) {
-  if (locked) return;
-  const monthsField = period==='multiple' ? `<label class="field">Number of Months</label><input id="p_months" type="number" min="1" value="1">` : '';
-  openModal(`
-    <h2>Record ${period==='multiple'?'Multi-Month':period==='current'?'Current Month':'Next Month'} Payment</h2>
-    <div class="desc">Records a full rent payment for the tenant and moves the due date forward.</div>
-    ${monthsField}
-    <div class="err" id="payErr"></div>
-    <button class="btn btn-primary btn-full" style="margin-top:8px;" onclick="submitPayment(${idx}, '${period}')">✓ Record Payment</button>
-  `);
+// ── Month picker (shared by Pay Rent + Record Instalment) ──────────────
+// Months are always ticked contiguously starting from the tenant's first
+// still-open month: ticking a row ticks it and every open row before it;
+// unticking a row unticks it and every open row after it. Already-paid
+// (cleared) months are shown for context but can't be selected again.
+let _mp = { open: [], cleared: [], selected: 0, pending: 0 };
+
+async function loadMonthPicker(idx) {
+  const d = await api(`/api/tenants/${idx}/months`);
+  _mp = { open: d.open || [], cleared: d.cleared || [], selected: 0, pending: 0 };
 }
-async function submitPayment(idx, period) {
-  const months = period==='multiple' ? ($('#p_months').value || 1) : 1;
-  const d = await api(`/api/tenants/${idx}/payment`, {method:'POST', body: JSON.stringify({period, months})});
+
+function monthPickerHtml() {
+  return `
+    <label class="field">Month(s)</label>
+    <div class="month-picker-control" id="mp_control" onclick="toggleMonthPickerPanel()">
+      <span id="mp_summary" style="color:var(--muted);">Select month(s)</span>
+      <span class="mp-caret">▾</span>
+    </div>
+    <div class="month-picker-panel" id="mp_panel" style="display:none;">
+      <div class="month-picker-list" id="mp_list"></div>
+      <div class="month-picker-actions">
+        <button class="btn btn-ghost" type="button" style="flex:1;" onclick="cancelMonthPicker()">Cancel</button>
+        <button class="btn btn-primary" type="button" style="flex:1;" onclick="confirmMonthPicker()">OK</button>
+      </div>
+    </div>`;
+}
+
+function renderMonthPickerList() {
+  const list = $('#mp_list');
+  if (!list) return;
+  const clearedHtml = _mp.cleared.map(m => `
+    <div class="month-row cleared">
+      <input type="checkbox" checked disabled>
+      <span class="month-label">${escapeHtml(m.label)}</span>
+      <span class="month-tag">Paid</span>
+    </div>`).join('');
+  const openHtml = _mp.open.map((m, i) => `
+    <div class="month-row open ${i < _mp.pending ? 'ticked' : ''}" onclick="toggleMonthRow(${i})">
+      <input type="checkbox" ${i < _mp.pending ? 'checked' : ''}>
+      <span class="month-label">${escapeHtml(m.label)}</span>
+    </div>`).join('');
+  list.innerHTML = clearedHtml + openHtml;
+}
+
+function toggleMonthRow(i) {
+  // Ticking row i ticks it and every open month before it (keeps the
+  // selection contiguous from the first open month); unticking it drops
+  // it and every open month after it, for the same reason.
+  _mp.pending = (i < _mp.pending) ? i : i + 1;
+  renderMonthPickerList();
+}
+
+function toggleMonthPickerPanel() {
+  const panel = $('#mp_panel');
+  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+  _mp.pending = _mp.selected;
+  renderMonthPickerList();
+  panel.style.display = 'block';
+}
+
+function cancelMonthPicker() {
+  _mp.pending = _mp.selected;
+  $('#mp_panel').style.display = 'none';
+}
+
+function confirmMonthPicker() {
+  _mp.selected = _mp.pending;
+  $('#mp_panel').style.display = 'none';
+  updateMonthPickerSummary();
+}
+
+function updateMonthPickerSummary() {
+  const el = $('#mp_summary');
+  if (!el) return;
+  if (_mp.selected <= 0) {
+    el.textContent = 'Select month(s)';
+    el.style.color = 'var(--muted)';
+  } else {
+    const first = _mp.open[0], last = _mp.open[_mp.selected - 1];
+    el.textContent = abbrevPeriod(first.from, last.to);
+    el.style.color = 'var(--ink)';
+  }
+  const btn = document.getElementById('txnSubmitBtn');
+  if (btn) btn.disabled = _mp.selected <= 0;
+}
+
+async function openPaymentModal(idx) {
+  await loadMonthPicker(idx);
+  openModal(`
+    <h2>Record Payment</h2>
+    <div class="desc">Select the month(s) being paid in full — the due date moves forward by however many months you pick.</div>
+    ${monthPickerHtml()}
+    <div class="err" id="payErr"></div>
+    <button class="btn btn-primary btn-full" style="margin-top:12px;" id="txnSubmitBtn" disabled onclick="submitPayment(${idx})">✓ Record Payment</button>
+  `);
+  renderMonthPickerList();
+}
+async function submitPayment(idx) {
+  if (_mp.selected <= 0) { $('#payErr').textContent = 'Select at least one month.'; return; }
+  const d = await api(`/api/tenants/${idx}/payment`, {method:'POST', body: JSON.stringify({months: _mp.selected})});
   if (d.ok) { closeModal(); toast(`${fmt(d.result.amount)} recorded. New due date: ${d.result.due_date}`); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
   else $('#payErr').textContent = d.error || 'Could not record payment.';
 }
 
-function openDepositModal(idx, currentLocked) {
+async function openDepositModal(idx) {
+  await loadMonthPicker(idx);
   openModal(`
     <h2>Record Instalment / Deposit</h2>
-    <div class="desc">Partial payments accumulate toward the chosen period's rent.</div>
-    <label class="field">Period</label>
-    <select id="d_period"><option value="current">Current Month</option><option value="next" ${currentLocked?'':'disabled'}>Next Month${currentLocked?'':' (pay current first)'}</option><option value="multiple">Multiple Months</option></select>
-    <div id="d_months_wrap" style="display:none;"><label class="field">Number of Months</label><input id="d_months" type="number" min="1" value="1"></div>
+    <div class="desc">Partial payments accumulate toward the selected month(s)' rent.</div>
+    ${monthPickerHtml()}
     <label class="field">Amount (UGX)</label><input id="d_amount" inputmode="numeric">
     <div class="err" id="depErr"></div>
-    <button class="btn btn-primary btn-full" style="margin-top:8px;" onclick="submitDeposit(${idx})">＋ Record Instalment</button>
+    <button class="btn btn-primary btn-full" style="margin-top:12px;" id="txnSubmitBtn" disabled onclick="submitDeposit(${idx})">＋ Record Instalment</button>
   `);
-  $('#d_period').addEventListener('change', e => {
-    $('#d_months_wrap').style.display = e.target.value==='multiple' ? 'block' : 'none';
-  });
+  renderMonthPickerList();
 }
 async function submitDeposit(idx) {
-  const period = $('#d_period').value;
-  const months = period==='multiple' ? ($('#d_months').value || 1) : 1;
+  if (_mp.selected <= 0) { $('#depErr').textContent = 'Select at least one month.'; return; }
   const amount = $('#d_amount').value;
-  const d = await api(`/api/tenants/${idx}/deposit`, {method:'POST', body: JSON.stringify({period, months, amount})});
+  const d = await api(`/api/tenants/${idx}/deposit`, {method:'POST', body: JSON.stringify({months: _mp.selected, amount})});
   if (d.ok) {
     closeModal();
     toast(d.result.cleared ? `Cleared! ${fmt(d.result.amount)} recorded.` : `${fmt(d.result.amount)} recorded, ${fmt(d.result.new_balance)} left.`);
