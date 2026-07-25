@@ -1431,6 +1431,19 @@ def record_payment(t, months):
     rent = parse_amount(t.get("rent", 0))
     total = rent * months
 
+    # Net off any partial deposit/instalment already sitting on the
+    # account for the current cycle -- e.g. the tenant put down half of
+    # this month's rent earlier, then comes back to pay the month off in
+    # full. Without this, "amount" below would always be rent*months
+    # regardless of what's already been collected, double-charging for
+    # whatever the deposit covered. Only the true genuine leftover (if
+    # the deposit alone somehow exceeds what's being cleared right now)
+    # still cascades forward onto future months, same as before.
+    pre_paid, _, _, _ = current_deposit_cycle(t)
+    amount_due_now = max(0.0, total - pre_paid)
+    excess_after = max(0.0, pre_paid - total)
+    credited_from_deposit = pre_paid - excess_after
+
     pre_txn_state = snapshot_tenant_state(t)
     txn_id = secrets.token_hex(4)
 
@@ -1451,19 +1464,21 @@ def record_payment(t, months):
     record_from_date = shift_base_str if record_to_date else ""
 
     t.setdefault("payment_history", []).append({
-        "date": pay_date, "months": months, "amount": total,
+        "date": pay_date, "months": months, "amount": amount_due_now,
         "from_date": record_from_date, "to_date": record_to_date,
         "txn_id": txn_id, "_pre_state": pre_txn_state,
+        "credited_from_deposit": credited_from_deposit,
     })
 
-    pre_paid, _, _, _ = current_deposit_cycle(t)
     if pre_paid > 0:
         t["deposit_cycle_start"] = len(t.get("deposit_history", []))
-        apply_excess_cascade(t, pre_paid, rent, t["due_date"], pay_date, txn_id=txn_id)
+        if excess_after > 0:
+            apply_excess_cascade(t, excess_after, rent, t["due_date"], pay_date, txn_id=txn_id)
 
-    return {"amount": total, "months": months,
+    return {"amount": amount_due_now, "months": months,
             "due_date": t["due_date"], "old_due_date": old_due_str,
-            "period_label": fmt_period(record_from_date, record_to_date)}
+            "period_label": fmt_period(record_from_date, record_to_date),
+            "credited_from_deposit": credited_from_deposit}
 
 
 def record_deposit(t, months, instalment):
@@ -2483,6 +2498,66 @@ def _guard():
     return None
 
 
+# ── idempotency guard for mutating requests ───────────────────────────────
+# A POST/PUT/DELETE can reach this server twice for reasons that have
+# nothing to do with someone tapping a button twice: a request that times
+# out or gets a transient 502/503/504 is automatically retried over a
+# second transport by the frontend's api() (see cloudFetch fallback), and
+# a change queued for offline sync is replayed once the device reconnects.
+# In both cases the FIRST attempt may already have been applied here even
+# though the client never saw a clean response for it -- without this,
+# the retry runs the same mutation again (a payment recorded twice, a
+# tenant deleted twice, etc). The frontend tags every mutating call with
+# a client-generated X-Idempotency-Key that stays the same across retries
+# of one logical action. The first request carrying a given key runs
+# normally and its response is cached below; any later request with that
+# same key gets the exact cached response replayed back instead of
+# re-running the handler.
+_idempotency_lock = threading.Lock()
+_idempotency_cache = {}   # key -> (stored_at, status_code, body_bytes, mimetype)
+_IDEMPOTENCY_TTL = 600     # seconds a cached response stays replayable
+_IDEMPOTENCY_MAX = 1000    # hard cap so this can never grow unbounded
+
+
+def _idempotency_prune_locked():
+    if len(_idempotency_cache) <= _IDEMPOTENCY_MAX:
+        return
+    stale = sorted(_idempotency_cache.items(), key=lambda kv: kv[1][0])
+    for k, _ in stale[: len(_idempotency_cache) - _IDEMPOTENCY_MAX]:
+        _idempotency_cache.pop(k, None)
+
+
+@app.before_request
+def _idempotency_replay():
+    if request.method not in ("POST", "PUT", "DELETE"):
+        return None
+    key = request.headers.get("X-Idempotency-Key", "")
+    if not key:
+        return None
+    now = time.time()
+    with _idempotency_lock:
+        hit = _idempotency_cache.get(key)
+        if hit and (now - hit[0]) <= _IDEMPOTENCY_TTL:
+            _, status_code, body, mimetype = hit
+            return Response(body, status=status_code, mimetype=mimetype)
+    return None
+
+
+@app.after_request
+def _idempotency_store(resp):
+    if request.method in ("POST", "PUT", "DELETE"):
+        key = request.headers.get("X-Idempotency-Key", "")
+        if key:
+            try:
+                body = resp.get_data()
+                with _idempotency_lock:
+                    _idempotency_cache[key] = (time.time(), resp.status_code, body, resp.mimetype)
+                    _idempotency_prune_locked()
+            except Exception:
+                pass
+    return resp
+
+
 # ── page ─────────────────────────────────────────────────────────────────
 WAITING_HTML = """<!DOCTYPE html>
 <html lang="en"><head>
@@ -3134,9 +3209,11 @@ def get_tenant_months(idx):
         horizon = min(60, max(1, int(request.args.get("horizon", MONTH_PICKER_HORIZON))))
     except (ValueError, TypeError):
         horizon = MONTH_PICKER_HORIZON
+    pre_paid, _, _, _ = current_deposit_cycle(t)
     return jsonify({
         "cleared": cleared_months_list(t),
         "open": open_months_list(t, horizon),
+        "deposit_paid": pre_paid,
     })
 
 
@@ -4473,7 +4550,9 @@ async function flushQueue() {
     const op = current[0];
     try {
       const res = await fetchTimeout(op.path, {
-        method: op.method, headers: {'Content-Type':'application/json'}, body: op.body,
+        method: op.method,
+        headers: {'Content-Type':'application/json', 'X-Idempotency-Key': op.idemKey || _newIdemKey()},
+        body: op.body,
       }, 6000);
       const data = await res.json().catch(() => ({}));
       if (!res.ok && res.status === 401) { syncing = false; updateSyncBadge(); showLock(); return; }
@@ -4678,9 +4757,19 @@ async function api(path, opts={}) {
         const cloudData = await cloudFetch(path);
         if (cloudData && cloudData.ok !== false) {
           cacheSet(path, cloudData);
+          setOnline(true);
           return cloudData;
         }
-      } catch (e) { /* cloud unreachable right now -- fall back below */ }
+        // Cloud answered but rejected the request (e.g. bad session) --
+        // that's still a reachable cloud, not an offline device, so
+        // don't flip the badge to offline for this.
+      } catch (e) {
+        // Cloud genuinely unreachable -- this IS what "offline" means
+        // for a cloud-direct phone (there's no other server to fall
+        // back to), so the badge needs to reflect it here, not only
+        // from the separate pingServer() polling loop.
+        setOnline(false);
+      }
     }
 
     // ── Local/PC fallback ────────────────────────────────────────────
@@ -4726,9 +4815,14 @@ async function api(path, opts={}) {
     }
   }
 
-  // Mutating request (POST/PUT/DELETE)
+  // Mutating request (POST/PUT/DELETE) -- one idempotency key covers
+  // every attempt at THIS action (first try, cloud-transport retry
+  // below, and a later offline-queue replay if it comes to that), so
+  // the server can tell "this already happened, here's what I did last
+  // time" apart from "this is genuinely a new request".
+  const idemKey = (opts.headers && opts.headers['X-Idempotency-Key']) || _newIdemKey();
   try {
-    const res = await fetchTimeout(path, {headers:{'Content-Type':'application/json','X-Device-Id':DEVICE_ID}, ...opts}, 6000);
+    const res = await fetchTimeout(path, {headers:{'Content-Type':'application/json','X-Device-Id':DEVICE_ID,'X-Idempotency-Key':idemKey}, ...opts}, 6000);
     if (res.status === 401) { showLock(); throw new Error('locked'); }
     if (res.status === 403) {
       const data403 = await res.json().catch(()=>({}));
@@ -4760,7 +4854,7 @@ async function api(path, opts={}) {
     }
     if (cloudCfg && cloudCfg.configured) {
       try {
-        const cloudData = await cloudFetch(path, { method, body: opts.body });
+        const cloudData = await cloudFetch(path, { method, body: opts.body, headers: {'X-Idempotency-Key': idemKey} });
         if (cloudData && cloudData.ok !== false) {
           toast('Saved directly to the cloud — PC will sync when it reconnects.');
           return cloudData;
@@ -4771,7 +4865,7 @@ async function api(path, opts={}) {
     try { bodyObj = opts.body ? JSON.parse(opts.body) : {}; } catch(e) {}
     const tempIdx = applyOptimisticPatch(path, method, bodyObj);
     const q = loadQueue();
-    q.push({ path, method, body: opts.body || null, ts: Date.now() });
+    q.push({ path, method, body: opts.body || null, ts: Date.now(), idemKey });
     saveQueue(q);
     toast('Offline — change saved, will sync once reconnected.');
     return { ok: true, offline: true, queued: true, index: tempIdx };
@@ -4892,6 +4986,10 @@ function closeModal() { $('#modalRoot').innerHTML = ''; }
 const _inFlightActions = new Set();
 const MIN_LOCK_MS = 400;
 function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function _newIdemKey() {
+  return (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+    : (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+}
 
 // ── Double-tap guard ─────────────────────────────────────────────────
 // Wrap any action handler's body in _beginAction(key)/_endAction(key) so a
@@ -5369,12 +5467,12 @@ async function deleteTenant(idx) {
 // still-open month: ticking a row ticks it and every open row before it;
 // unticking a row unticks it and every open row after it. Already-paid
 // (cleared) months are shown for context but can't be selected again.
-let _mp = { open: [], cleared: [], selected: 0, pending: 0, rent: 0 };
+let _mp = { open: [], cleared: [], selected: 0, pending: 0, rent: 0, prepaid: 0 };
 
 async function loadMonthPicker(idx) {
   const d = await api(`/api/tenants/${idx}/months`);
   const rent = (state.tenants[idx] && state.tenants[idx].rent) || 0;
-  _mp = { open: d.open || [], cleared: d.cleared || [], selected: 0, pending: 0, rent };
+  _mp = { open: d.open || [], cleared: d.cleared || [], selected: 0, pending: 0, rent, prepaid: d.deposit_paid || 0 };
 }
 
 function monthPickerHtml() {
@@ -5396,6 +5494,7 @@ function monthPickerHtml() {
           <div class="mp-summary-value" id="mp_amount_val">${fmt(0)}</div>
         </div>
       </div>
+      <div class="sub" id="mp_credit_note" style="color:var(--muted);font-size:12px;margin-top:-6px;margin-bottom:8px;display:none;"></div>
       <div class="month-picker-actions">
         <button class="btn btn-ghost" type="button" style="flex:1;" onclick="cancelMonthPicker()">Cancel</button>
         <button class="btn btn-primary" type="button" style="flex:1;" onclick="confirmMonthPicker()">OK</button>
@@ -5425,10 +5524,28 @@ function updateMonthPickerFields() {
   // Live "Months" / "Amount" summary inside the picker panel itself, so
   // the total is visible BEFORE confirming with OK -- updates on every
   // tick/untick, not just after confirming the selection.
+  //
+  // "Amount" is the actual amount still to be cleared, not a flat
+  // rent*months -- if a deposit/instalment has already been paid toward
+  // the current open month, that credit is subtracted here so the
+  // figure shown (and the amount actually charged on submit) matches
+  // what's really left to collect.
   const monthsVal = $('#mp_months_val');
   const amountVal = $('#mp_amount_val');
+  const creditNote = $('#mp_credit_note');
+  const gross = (_mp.rent || 0) * _mp.pending;
+  const credit = Math.min(_mp.prepaid || 0, gross);
+  const net = Math.max(0, gross - credit);
   if (monthsVal) monthsVal.textContent = String(_mp.pending);
-  if (amountVal) amountVal.textContent = fmt((_mp.rent || 0) * _mp.pending);
+  if (amountVal) amountVal.textContent = fmt(net);
+  if (creditNote) {
+    if (credit > 0) {
+      creditNote.style.display = 'block';
+      creditNote.textContent = `${fmt(credit)} already paid toward this is credited here.`;
+    } else {
+      creditNote.style.display = 'none';
+    }
+  }
 }
 
 function toggleMonthRow(i) {
