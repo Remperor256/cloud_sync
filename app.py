@@ -3802,6 +3802,10 @@ INDEX_HTML = """<!DOCTYPE html>
     display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:var(--teal-soft2);
   }
   .month-picker-actions .btn{padding:9px 14px;font-size:13px;}
+  .mp-summary-row{display:flex;gap:8px;padding:10px 12px 0;}
+  .mp-summary-box{flex:1;background:var(--teal-soft2);border:1.5px solid var(--line);border-radius:10px;padding:8px 10px;}
+  .mp-summary-box .mp-summary-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.3px;font-weight:700;}
+  .mp-summary-box .mp-summary-value{font-size:14.5px;font-weight:700;color:var(--ink);margin-top:2px;}
   .searchbar input{border:none;padding:0;font-size:14px;}
   .filters{display:flex;gap:8px;overflow-x:auto;padding-bottom:2px;margin-bottom:14px;}
   .filter-pill{
@@ -5365,11 +5369,12 @@ async function deleteTenant(idx) {
 // still-open month: ticking a row ticks it and every open row before it;
 // unticking a row unticks it and every open row after it. Already-paid
 // (cleared) months are shown for context but can't be selected again.
-let _mp = { open: [], cleared: [], selected: 0, pending: 0 };
+let _mp = { open: [], cleared: [], selected: 0, pending: 0, rent: 0 };
 
 async function loadMonthPicker(idx) {
   const d = await api(`/api/tenants/${idx}/months`);
-  _mp = { open: d.open || [], cleared: d.cleared || [], selected: 0, pending: 0 };
+  const rent = (state.tenants[idx] && state.tenants[idx].rent) || 0;
+  _mp = { open: d.open || [], cleared: d.cleared || [], selected: 0, pending: 0, rent };
 }
 
 function monthPickerHtml() {
@@ -5381,6 +5386,16 @@ function monthPickerHtml() {
     </div>
     <div class="month-picker-panel" id="mp_panel" style="display:none;">
       <div class="month-picker-list" id="mp_list"></div>
+      <div class="mp-summary-row">
+        <div class="mp-summary-box">
+          <div class="mp-summary-label">Months</div>
+          <div class="mp-summary-value" id="mp_months_val">0</div>
+        </div>
+        <div class="mp-summary-box">
+          <div class="mp-summary-label">Amount</div>
+          <div class="mp-summary-value" id="mp_amount_val">${fmt(0)}</div>
+        </div>
+      </div>
       <div class="month-picker-actions">
         <button class="btn btn-ghost" type="button" style="flex:1;" onclick="cancelMonthPicker()">Cancel</button>
         <button class="btn btn-primary" type="button" style="flex:1;" onclick="confirmMonthPicker()">OK</button>
@@ -5403,6 +5418,17 @@ function renderMonthPickerList() {
       <span class="month-label">${escapeHtml(m.label)}</span>
     </div>`).join('');
   list.innerHTML = clearedHtml + openHtml;
+  updateMonthPickerFields();
+}
+
+function updateMonthPickerFields() {
+  // Live "Months" / "Amount" summary inside the picker panel itself, so
+  // the total is visible BEFORE confirming with OK -- updates on every
+  // tick/untick, not just after confirming the selection.
+  const monthsVal = $('#mp_months_val');
+  const amountVal = $('#mp_amount_val');
+  if (monthsVal) monthsVal.textContent = String(_mp.pending);
+  if (amountVal) amountVal.textContent = fmt((_mp.rent || 0) * _mp.pending);
 }
 
 function toggleMonthRow(i) {
