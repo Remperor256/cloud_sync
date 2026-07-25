@@ -3804,9 +3804,14 @@ INDEX_HTML = """<!DOCTYPE html>
   nav.tabbar .tab{
     flex:1;padding:10px 4px 8px;display:flex;flex-direction:column;align-items:center;gap:3px;
     color:var(--muted);font-size:10.5px;font-weight:600;cursor:pointer;
+    transform:scale(.88);opacity:.68;
+    transition:transform .18s ease,opacity .18s ease,color .18s ease;
   }
-  nav.tabbar .tab.active{color:var(--teal-deep);}
-  nav.tabbar .tab .ic{font-size:19px;}
+  nav.tabbar .tab.active{
+    color:var(--teal-deep);transform:scale(1.14);opacity:1;
+  }
+  nav.tabbar .tab .ic{font-size:19px;transition:font-size .18s ease;}
+  nav.tabbar .tab.active .ic{font-size:22px;}
   .empty{text-align:center;padding:36px 12px;color:var(--muted);}
   .empty .big{font-size:32px;margin-bottom:8px;}
   .section-title{font-size:13px;font-weight:700;color:var(--teal-deep);text-transform:uppercase;letter-spacing:.4px;margin:4px 0 10px;}
