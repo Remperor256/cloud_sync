@@ -517,7 +517,7 @@ if CLOUD_MODE:
         now = time.time()
         with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT device_id, label, last_seen FROM cloud_devices
+                SELECT device_id, label, last_seen, custom_label_locked FROM cloud_devices
                 WHERE session_id=%s AND kicked=false
                 ORDER BY last_seen DESC
             """, (session_id,))
@@ -527,6 +527,7 @@ if CLOUD_MODE:
                 "device_id": r["device_id"],
                 "short_id": r["device_id"][:8],
                 "label": r["label"] or "Unknown device",
+                "custom_label_locked": bool(r["custom_label_locked"]),
                 "last_seen": r["last_seen"],
                 "online": (now - r["last_seen"]) <= ONLINE_TIMEOUT,
             }
@@ -545,9 +546,21 @@ if CLOUD_MODE:
     def _cloud_set_device_label(session_id, device_id, label):
         """Lets a phone give itself a custom name (e.g. 'Mary's iPhone')
         instead of the generic auto-detected model name -- and locks it so
-        _cloud_touch_device never overwrites it again on a later poll."""
+        _cloud_touch_device never overwrites it again on a later poll.
+        Enforces that no two currently-connected (non-kicked) devices in
+        this session share the same name (case-insensitively). Returns
+        False (without writing anything) if that name is already taken;
+        True on success."""
         now = time.time()
         with _cloud_conn() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM cloud_devices
+                WHERE session_id=%s AND device_id<>%s AND kicked=false
+                  AND lower(label) = lower(%s)
+                LIMIT 1
+            """, (session_id, device_id, label))
+            if cur.fetchone():
+                return False
             cur.execute("""
                 INSERT INTO cloud_devices (session_id, device_id, label, first_seen, last_seen, kicked, custom_label_locked)
                 VALUES (%s, %s, %s, %s, %s, false, true)
@@ -555,6 +568,7 @@ if CLOUD_MODE:
                 DO UPDATE SET label=%s, custom_label_locked=true, last_seen=%s
             """, (session_id, device_id, label, now, now, label, now))
             conn.commit()
+            return True
 
     def _cloud_active_device_count(session_id):
         with _cloud_conn() as conn, conn.cursor() as cur:
@@ -2370,6 +2384,7 @@ def _list_devices():
                 "device_id": d,
                 "short_id": d[:8],
                 "label": rec.get("label") or "Unknown device",
+                "custom_label_locked": bool(rec.get("custom_label_locked")),
                 "last_seen": rec["last_seen"],
                 "online": (now - rec["last_seen"]) <= ONLINE_TIMEOUT,
             }
@@ -2402,10 +2417,20 @@ def _kick_device(device_id):
 def _set_local_device_label(device_id, label):
     """Lets a phone give itself a custom name (e.g. 'Mary's iPhone')
     instead of the generic auto-detected model name -- and locks it so
-    _touch_device never overwrites it again on a later poll."""
+    _touch_device never overwrites it again on a later poll. Enforces
+    that no two currently-connected (non-kicked) devices share the same
+    name (case-insensitively), so the admin's device list -- and the
+    phones themselves -- can always tell devices apart. Returns False
+    (without writing anything) if that name is already taken by another
+    device; True on success."""
     import time
     with _devices_lock:
         devices = _devices_dict()
+        lname = label.strip().lower()
+        if any(other_id != device_id and not other.get("kicked")
+               and (other.get("label") or "").strip().lower() == lname
+               for other_id, other in devices.items()):
+            return False
         rec = devices.get(device_id)
         now = time.time()
         if rec is None:
@@ -2415,6 +2440,7 @@ def _set_local_device_label(device_id, label):
         rec["custom_label_locked"] = True
         rec["last_seen"] = now
         _save_devices_locked()
+        return True
 
 
 # ── auth helpers ─────────────────────────────────────────────────────────
@@ -2853,7 +2879,10 @@ def set_device_label():
     Devices list. Persisted server-side (and locked against being
     overwritten by auto-detection again), so it only needs to be typed
     once, ever, from any device that's already paired -- not re-entered
-    each time the web app is opened."""
+    each time the web app is opened. Must be unique among currently
+    connected devices -- this is what the client-side compulsory naming
+    prompt relies on to actually differentiate phones from each other,
+    not just cosmetically label them."""
     device_id = request.headers.get("X-Device-Id", "")
     body = request.get_json(force=True) or {}
     label = (body.get("label") or "").strip()[:40]
@@ -2862,9 +2891,11 @@ def set_device_label():
     if not label:
         return jsonify({"ok": False, "error": "Please enter a name."}), 400
     if CLOUD_MODE:
-        _cloud_set_device_label(g.session_id, device_id, label)
+        ok = _cloud_set_device_label(g.session_id, device_id, label)
     else:
-        _set_local_device_label(device_id, label)
+        ok = _set_local_device_label(device_id, label)
+    if not ok:
+        return jsonify({"ok": False, "error": "That name is already used by another connected phone. Please choose a different, unique name."}), 409
     return jsonify({"ok": True, "label": label})
 
 
@@ -4262,17 +4293,24 @@ let pingMisses = 0;
 // this value instead of firing a refresh (there's nothing "new" about
 // data the app hasn't loaded yet).
 let lastKnownDataUpdatedAt = null;
+
+// Budget for the online/offline check itself. A literal ~20ms round trip
+// isn't achievable over a real network (even a fast one) -- anything
+// that tight would report "Offline" almost constantly even when the PC
+// is fine, since plain latency alone usually exceeds it. 2.5s is short
+// enough that a genuinely offline PC is detected quickly, while still
+// giving a normal request room to actually complete.
+const STATUS_CHECK_TIMEOUT_MS = 2500;
+// Once a check finishes (success or failure), that Online/Offline
+// status is held/displayed for this long before the next check fires --
+// the continuous loop below is: check -> show result for 10s -> check
+// again, forever.
+const STATUS_DISPLAY_MS = 10000;
+
 async function pingServer() {
   try {
-    // Same 6000ms budget every other network call in this app gets
-    // (api(), cloudFetch(), loadCloudConfig()) -- this used to be a
-    // stricter 3500ms, which meant the online/offline badge could flip
-    // to "offline" purely from its own tighter timeout even while every
-    // actual read/write was succeeding fine on the shared 6s budget.
-    // That's a real gap on higher-latency connections (e.g. reaching a
-    // cloud-hosted service from far away, or a slow mobile network).
     const res = await fetchTimeout('/api/lock-status',
-      {cache:'no-store', headers: {'X-Device-Id': DEVICE_ID}}, 6000);
+      {cache:'no-store', headers: {'X-Device-Id': DEVICE_ID}}, STATUS_CHECK_TIMEOUT_MS);
     if (res.ok) {
       const data = await res.json().catch(() => ({}));
       adoptCanonicalDeviceId(data && data.canonical_device_id);
@@ -4282,12 +4320,12 @@ async function pingServer() {
       }
       pingMisses = 0;
       setOnline(true);
-      // /api/lock-status is cheap and already polled every 6s for the
-      // online badge -- data_updated_at rides along on that same request
-      // instead of needing its own poll. The moment it moves past what
-      // we last saw (a save on the PC, another phone, etc.), apply the
-      // change right away rather than waiting for the slow 90s baseline
-      // refresh below.
+      // /api/lock-status is cheap and already polled on this loop for
+      // the online badge -- data_updated_at rides along on that same
+      // request instead of needing its own poll. The moment it moves
+      // past what we last saw (a save on the PC, another phone, etc.),
+      // apply the change right away rather than waiting for the slow
+      // 90s baseline refresh below.
       const stamp = data && data.data_updated_at;
       if (stamp) {
         if (lastKnownDataUpdatedAt !== null && stamp !== lastKnownDataUpdatedAt) {
@@ -4302,19 +4340,27 @@ async function pingServer() {
   // network/PC drop, not a disconnect: keep working from cache.
   //
   // One miss on its own isn't enough to call it "offline" -- a single
-  // dropped packet or a briefly slow response every 6s is normal, not
-  // a real outage, and flipping the badge on every isolated miss makes
-  // it flicker even on a genuinely fine connection. Only declare
-  // offline after two misses in a row (~12s of no contact), which
-  // still lands well inside the 20s window the server itself uses to
-  // decide a device has gone offline (see ONLINE_TIMEOUT).
+  // dropped packet or a briefly slow response every cycle is normal,
+  // not a real outage, and flipping the badge on every isolated miss
+  // makes it flicker even on a genuinely fine connection. Only declare
+  // offline after two misses in a row (~20s of no contact at the 10s
+  // display cadence below), which matches the 20s window the server
+  // itself uses to decide a device has gone offline (see ONLINE_TIMEOUT).
   pingMisses += 1;
   if (pingMisses >= 2) {
     setOnline(false);
   }
   return false;
 }
-setInterval(pingServer, 6000);
+
+// Continuous check/display loop: run a check, then wait STATUS_DISPLAY_MS
+// before the next one -- and repeat forever. Uses a self-scheduling
+// setTimeout (rather than setInterval) so a slow check can never overlap
+// with the next one; the wait always starts only after the previous
+// check has actually finished.
+(function statusCheckLoop() {
+  pingServer().finally(() => setTimeout(statusCheckLoop, STATUS_DISPLAY_MS));
+})();
 
 // Baseline safety-net refresh -- catches anything data_updated_at-based
 // detection in pingServer() might miss (e.g. this device was hidden/
@@ -4806,25 +4852,49 @@ function closeModal() { $('#modalRoot').innerHTML = ''; }
 // double cancellation, etc). This intercepts every click on any
 // <button> that still has its inline onclick -- covers .btn (Save,
 // Confirm, Record Payment...) as well as icon-buttons like the ↺
-// cancel-transaction control and the lock button -- disables the
-// button the instant the tap lands (before the handler even starts, so
-// there's no window for a second tap to slip through), runs the
-// handler, then re-enables the button only once that handler --
-// including any awaited network call -- has actually settled. Buttons
-// wired up purely with addEventListener (tabs, filter pills) have no
-// inline onclick attribute and so are untouched.
+// cancel-transaction control and the lock button.
+//
+// Two independent locks, not just one:
+//  1. btn.disabled -- the normal, visible "this button is busy" state.
+//  2. _inFlightActions -- keyed by the action's own onclick code (e.g.
+//     "submitPayment(7)"), not by the DOM node. This is the one that
+//     actually matters for a genuine double-tap: if anything in between
+//     the two taps causes this button to be re-rendered (a fresh
+//     re-render swaps in a brand-new, non-disabled button element),
+//     lock #1 alone would miss it because it lives on the old node.
+//     Locking on the action text itself closes that gap regardless of
+//     which physical button element the second tap lands on.
+// A short MIN_LOCK_MS floor keeps the lock held for at least that long
+// even if the action resolves instantly, so two taps landing in the
+// same handful of milliseconds can't both slip through before the lock
+// is set.
+const _inFlightActions = new Set();
+const MIN_LOCK_MS = 400;
+function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 document.addEventListener('click', function (e) {
   const btn = e.target.closest('button[onclick]');
-  if (!btn || btn.disabled) return;
+  if (!btn) return;
   const code = btn.getAttribute('onclick');
   if (!code) return;
+  if (btn.disabled || _inFlightActions.has(code)) {
+    // Already running (or just ran) -- swallow this tap entirely so it
+    // has no effect at all, rather than letting it fall through to any
+    // other handler.
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    return;
+  }
   e.preventDefault();
   e.stopImmediatePropagation();
   btn.disabled = true;
-  Promise.resolve()
-    .then(() => new Function(code).call(btn))
-    .catch(err => console.error(err))
-    .finally(() => { if (document.body.contains(btn)) btn.disabled = false; });
+  _inFlightActions.add(code);
+  Promise.all([
+    Promise.resolve().then(() => new Function(code).call(btn)).catch(err => console.error(err)),
+    _sleep(MIN_LOCK_MS),
+  ]).finally(() => {
+    _inFlightActions.delete(code);
+    if (document.body.contains(btn)) btn.disabled = false;
+  });
 }, true);
 
 // ── tabs ─────────────────────────────────────────────────────────────
@@ -5629,17 +5699,24 @@ async function renderSettings() {
 // apart in that PC-side panel), but nothing else about security or the
 // device list is editable from the web app.
 async function maybePromptDeviceName() {
-  const justPaired = new URLSearchParams(location.search).has('pt');
-  if (!justPaired) return;
   try {
     const d = await api('/api/devices');
     const devices = (d && d.devices) || [];
     const mine = devices.find(dev => dev.device_id === DEVICE_ID);
-    if (mine && mine.label) return;  // already named (e.g. re-scanned an old QR)
+    // custom_label_locked only becomes true once a person has actually
+    // typed and saved a name -- unlike `label`, which is never empty
+    // (the server always auto-fills it with a detected model name like
+    // "iPhone" or the generic "Device"), so checking `label` here used
+    // to make this prompt effectively never fire. Runs on every boot,
+    // not just right after a fresh QR-code pairing, so a phone that
+    // connected before this requirement existed -- or that dismissed/
+    // missed it somehow -- is still asked the next time it opens the
+    // app, until it actually has a unique name on file.
+    if (mine && mine.custom_label_locked) return;
   } catch (e) { return; }
   openModal(`
     <h2>Name This Device</h2>
-    <div class="desc">Give this phone/browser a name so the admin can recognize it in the connected-devices list on the PC.</div>
+    <div class="desc">Every connected phone needs its own unique name so the admin -- and this phone itself -- can always tell it apart from any other connected phone.</div>
     <label class="field">Device Name</label>
     <input id="dev_my_label" placeholder="e.g. Mary's iPhone">
     <div class="err" id="devLabelErr"></div>
@@ -5651,7 +5728,7 @@ async function submitDeviceLabel() {
   if (!label) { $('#devLabelErr').textContent = 'Please enter a name.'; return; }
   const d = await api('/api/devices/label', {method:'POST', body: JSON.stringify({label})});
   if (d.ok) { closeModal(); toast('Device name saved.'); }
-  else $('#devLabelErr').textContent = d.error || 'Could not save name.';
+  else $('#devLabelErr').textContent = d.error || 'Could not save name -- that name may already be taken by another connected phone.';
 }
 
 // ── DANGER ZONE: reset data ──────────────────────────────────────────
