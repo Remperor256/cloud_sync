@@ -4876,6 +4876,18 @@ function closeModal() { $('#modalRoot').innerHTML = ''; }
 const _inFlightActions = new Set();
 const MIN_LOCK_MS = 400;
 function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── Double-tap guard ─────────────────────────────────────────────────
+// Wrap any action handler's body in _beginAction(key)/_endAction(key) so a
+// second tap on the same action button while the first tap is still being
+// processed is ignored instead of firing the action again.
+const _actionKeys = new Set();
+function _beginAction(key) {
+  if (_actionKeys.has(key)) return false;
+  _actionKeys.add(key);
+  return true;
+}
+function _endAction(key) { _actionKeys.delete(key); }
 document.addEventListener('click', function (e) {
   const btn = e.target.closest('button[onclick]');
   if (!btn) return;
@@ -5127,19 +5139,24 @@ async function renderAddTenant() {
   });
 }
 async function submitAddTenant(replace=false) {
-  const body = {
-    name: $('#f_name').value, unit: $('#f_unit').value, phone: $('#f_phone').value,
-    email: $('#f_email').value, occupation: $('#f_occupation').value,
-    emergency_contact: $('#f_emergency_contact').value, emergency_phone: $('#f_emergency_phone').value,
-    rent: $('#f_rent').value, entry_date: $('#f_entry_date').value, notes: $('#f_notes').value, replace,
-  };
-  const d = await api('/api/tenants', {method:'POST', body: JSON.stringify(body)});
-  if (d.ok) { toast('Tenant saved.'); state.tab='tenants'; render(); return; }
-  if (d.error === 'unit_taken') {
-    if (confirm(d.message + ' Replace with this new tenant?')) return submitAddTenant(true);
-    return;
+  if (!replace && !_beginAction('submitAddTenant')) return;
+  try {
+    const body = {
+      name: $('#f_name').value, unit: $('#f_unit').value, phone: $('#f_phone').value,
+      email: $('#f_email').value, occupation: $('#f_occupation').value,
+      emergency_contact: $('#f_emergency_contact').value, emergency_phone: $('#f_emergency_phone').value,
+      rent: $('#f_rent').value, entry_date: $('#f_entry_date').value, notes: $('#f_notes').value, replace,
+    };
+    const d = await api('/api/tenants', {method:'POST', body: JSON.stringify(body)});
+    if (d.ok) { toast('Tenant saved.'); state.tab='tenants'; render(); return; }
+    if (d.error === 'unit_taken') {
+      if (confirm(d.message + ' Replace with this new tenant?')) return await submitAddTenant(true);
+      return;
+    }
+    $('#addErr').textContent = d.error || 'Could not save tenant.';
+  } finally {
+    if (!replace) _endAction('submitAddTenant');
   }
-  $('#addErr').textContent = d.error || 'Could not save tenant.';
 }
 
 // ── TENANT DETAIL ────────────────────────────────────────────────────
@@ -5264,10 +5281,16 @@ function txnRow(t, r, key, origI) {
 }
 
 async function cancelTxn(idx, key, recIdx) {
-  if (!confirm("Cancel this record and reverse its effect on the tenant's account?")) return;
-  const d = await api(`/api/tenants/${idx}/cancel`, {method:'POST', body: JSON.stringify({history_key:key, record_index:recIdx})});
-  if (d.ok) { toast(`Reversed ${fmt(d.result.total_amount)}.`); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
-  else toast(d.error || 'Could not cancel.');
+  const _k = `cancelTxn:${idx}:${key}:${recIdx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    if (!confirm("Cancel this record and reverse its effect on the tenant's account?")) return;
+    const d = await api(`/api/tenants/${idx}/cancel`, {method:'POST', body: JSON.stringify({history_key:key, record_index:recIdx})});
+    if (d.ok) { toast(`Reversed ${fmt(d.result.total_amount)}.`); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
+    else toast(d.error || 'Could not cancel.');
+  } finally {
+    _endAction(_k);
+  }
 }
 
 function openEditTenant(idx) {
@@ -5292,20 +5315,32 @@ function openEditTenant(idx) {
   });
 }
 async function submitEditTenant(idx) {
-  const body = {
-    name: $('#e_name').value, phone: $('#e_phone').value, email: $('#e_email').value,
-    occupation: $('#e_occupation').value, emergency_contact: $('#e_emergency_contact').value,
-    emergency_phone: $('#e_emergency_phone').value, entry_date: $('#e_entry_date').value,
-    due_date: $('#e_due_date').value, rent: $('#e_rent').value, notes: $('#e_notes').value,
-  };
-  const d = await api('/api/tenants/'+idx, {method:'PUT', body: JSON.stringify(body)});
-  if (d.ok) { closeModal(); toast('Tenant updated.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
-  else $('#editErr').textContent = d.error || 'Could not save.';
+  const _k = `submitEditTenant:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    const body = {
+      name: $('#e_name').value, phone: $('#e_phone').value, email: $('#e_email').value,
+      occupation: $('#e_occupation').value, emergency_contact: $('#e_emergency_contact').value,
+      emergency_phone: $('#e_emergency_phone').value, entry_date: $('#e_entry_date').value,
+      due_date: $('#e_due_date').value, rent: $('#e_rent').value, notes: $('#e_notes').value,
+    };
+    const d = await api('/api/tenants/'+idx, {method:'PUT', body: JSON.stringify(body)});
+    if (d.ok) { closeModal(); toast('Tenant updated.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
+    else $('#editErr').textContent = d.error || 'Could not save.';
+  } finally {
+    _endAction(_k);
+  }
 }
 async function deleteTenant(idx) {
-  if (!confirm('Permanently delete this tenant? This cannot be undone.')) return;
-  const d = await api('/api/tenants/'+idx, {method:'DELETE'});
-  if (d.ok) { closeModal(); toast('Tenant deleted.'); state.tab='tenants'; render(); }
+  const _k = `deleteTenant:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    if (!confirm('Permanently delete this tenant? This cannot be undone.')) return;
+    const d = await api('/api/tenants/'+idx, {method:'DELETE'});
+    if (d.ok) { closeModal(); toast('Tenant deleted.'); state.tab='tenants'; render(); }
+  } finally {
+    _endAction(_k);
+  }
 }
 
 // ── Month picker (shared by Pay Rent + Record Instalment) ──────────────
@@ -5407,10 +5442,16 @@ async function openPaymentModal(idx) {
   renderMonthPickerList();
 }
 async function submitPayment(idx) {
-  if (_mp.selected <= 0) { $('#payErr').textContent = 'Select at least one month.'; return; }
-  const d = await api(`/api/tenants/${idx}/payment`, {method:'POST', body: JSON.stringify({months: _mp.selected})});
-  if (d.ok) { closeModal(); toast(`${fmt(d.result.amount)} recorded. New due date: ${d.result.due_date}`); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
-  else $('#payErr').textContent = d.error || 'Could not record payment.';
+  const _k = `submitPayment:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    if (_mp.selected <= 0) { $('#payErr').textContent = 'Select at least one month.'; return; }
+    const d = await api(`/api/tenants/${idx}/payment`, {method:'POST', body: JSON.stringify({months: _mp.selected})});
+    if (d.ok) { closeModal(); toast(`${fmt(d.result.amount)} recorded. New due date: ${d.result.due_date}`); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
+    else $('#payErr').textContent = d.error || 'Could not record payment.';
+  } finally {
+    _endAction(_k);
+  }
 }
 
 async function openDepositModal(idx) {
@@ -5426,14 +5467,20 @@ async function openDepositModal(idx) {
   renderMonthPickerList();
 }
 async function submitDeposit(idx) {
-  if (_mp.selected <= 0) { $('#depErr').textContent = 'Select at least one month.'; return; }
-  const amount = $('#d_amount').value;
-  const d = await api(`/api/tenants/${idx}/deposit`, {method:'POST', body: JSON.stringify({months: _mp.selected, amount})});
-  if (d.ok) {
-    closeModal();
-    toast(d.result.cleared ? `Cleared! ${fmt(d.result.amount)} recorded.` : `${fmt(d.result.amount)} recorded, ${fmt(d.result.new_balance)} left.`);
-    state.selectedIdx=idx; state.tab='tenant-detail'; render();
-  } else $('#depErr').textContent = d.error || 'Could not record deposit.';
+  const _k = `submitDeposit:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    if (_mp.selected <= 0) { $('#depErr').textContent = 'Select at least one month.'; return; }
+    const amount = $('#d_amount').value;
+    const d = await api(`/api/tenants/${idx}/deposit`, {method:'POST', body: JSON.stringify({months: _mp.selected, amount})});
+    if (d.ok) {
+      closeModal();
+      toast(d.result.cleared ? `Cleared! ${fmt(d.result.amount)} recorded.` : `${fmt(d.result.amount)} recorded, ${fmt(d.result.new_balance)} left.`);
+      state.selectedIdx=idx; state.tab='tenant-detail'; render();
+    } else $('#depErr').textContent = d.error || 'Could not record deposit.';
+  } finally {
+    _endAction(_k);
+  }
 }
 
 function openClearArrears(idx, due) {
@@ -5449,10 +5496,16 @@ function openClearArrears(idx, due) {
   $('#a_method').addEventListener('change', e => { if (e.target.value==='Full') $('#a_amount').value = Math.round(due); });
 }
 async function submitArrears(idx) {
-  const method = $('#a_method').value, amount = $('#a_amount').value;
-  const d = await api(`/api/tenants/${idx}/arrears`, {method:'POST', body: JSON.stringify({method, amount})});
-  if (d.ok) { closeModal(); toast('Arrears payment recorded.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
-  else $('#arrErr').textContent = d.error || 'Could not record.';
+  const _k = `submitArrears:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    const method = $('#a_method').value, amount = $('#a_amount').value;
+    const d = await api(`/api/tenants/${idx}/arrears`, {method:'POST', body: JSON.stringify({method, amount})});
+    if (d.ok) { closeModal(); toast('Arrears payment recorded.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
+    else $('#arrErr').textContent = d.error || 'Could not record.';
+  } finally {
+    _endAction(_k);
+  }
 }
 
 // ── UNITS ────────────────────────────────────────────────────────────
@@ -5490,9 +5543,14 @@ function openAddUnit() {
   `);
 }
 async function submitAddUnit() {
-  const body = {name: $('#u_name').value, rent: $('#u_rent').value, location: $('#u_location').value};
-  const d = await api('/api/units', {method:'POST', body: JSON.stringify(body)});
-  if (d.ok) { closeModal(); toast('Unit added.'); renderUnits(); } else $('#unitErr').textContent = d.error;
+  if (!_beginAction('submitAddUnit')) return;
+  try {
+    const body = {name: $('#u_name').value, rent: $('#u_rent').value, location: $('#u_location').value};
+    const d = await api('/api/units', {method:'POST', body: JSON.stringify(body)});
+    if (d.ok) { closeModal(); toast('Unit added.'); renderUnits(); } else $('#unitErr').textContent = d.error;
+  } finally {
+    _endAction('submitAddUnit');
+  }
 }
 async function openEditUnit(nameEnc) {
   const name = decodeURIComponent(nameEnc);
@@ -5508,16 +5566,28 @@ async function openEditUnit(nameEnc) {
   `);
 }
 async function submitEditUnit(nameEnc) {
-  const name = decodeURIComponent(nameEnc);
-  const body = {rent: $('#eu_rent').value, location: $('#eu_location').value};
-  const d = await api('/api/units/'+encodeURIComponent(name), {method:'PUT', body: JSON.stringify(body)});
-  if (d.ok) { closeModal(); toast('Unit updated.'); renderUnits(); } else $('#euErr').textContent = d.error;
+  const _k = `submitEditUnit:${nameEnc}`;
+  if (!_beginAction(_k)) return;
+  try {
+    const name = decodeURIComponent(nameEnc);
+    const body = {rent: $('#eu_rent').value, location: $('#eu_location').value};
+    const d = await api('/api/units/'+encodeURIComponent(name), {method:'PUT', body: JSON.stringify(body)});
+    if (d.ok) { closeModal(); toast('Unit updated.'); renderUnits(); } else $('#euErr').textContent = d.error;
+  } finally {
+    _endAction(_k);
+  }
 }
 async function deleteUnit(nameEnc) {
-  const name = decodeURIComponent(nameEnc);
-  if (!confirm(`Permanently remove unit '${name}'?`)) return;
-  const d = await api('/api/units/'+encodeURIComponent(name), {method:'DELETE'});
-  if (d.ok) { closeModal(); toast('Unit removed.'); renderUnits(); }
+  const _k = `deleteUnit:${nameEnc}`;
+  if (!_beginAction(_k)) return;
+  try {
+    const name = decodeURIComponent(nameEnc);
+    if (!confirm(`Permanently remove unit '${name}'?`)) return;
+    const d = await api('/api/units/'+encodeURIComponent(name), {method:'DELETE'});
+    if (d.ok) { closeModal(); toast('Unit removed.'); renderUnits(); }
+  } finally {
+    _endAction(_k);
+  }
 }
 function openIncreaseRent(nameEnc, currentRent) {
   const name = decodeURIComponent(nameEnc);
@@ -5539,10 +5609,16 @@ function openIncreaseRent(nameEnc, currentRent) {
   `);
 }
 async function submitIncreaseRent(nameEnc) {
-  const name = decodeURIComponent(nameEnc);
-  const body = {new_rent: $('#ir_rent').value, effective_month: $('#ir_month').value};
-  const d = await api('/api/units/'+encodeURIComponent(name)+'/increase-rent', {method:'POST', body: JSON.stringify(body)});
-  if (d.ok) { closeModal(); toast('Rent increase scheduled.'); renderUnits(); } else $('#irErr').textContent = d.error;
+  const _k = `submitIncreaseRent:${nameEnc}`;
+  if (!_beginAction(_k)) return;
+  try {
+    const name = decodeURIComponent(nameEnc);
+    const body = {new_rent: $('#ir_rent').value, effective_month: $('#ir_month').value};
+    const d = await api('/api/units/'+encodeURIComponent(name)+'/increase-rent', {method:'POST', body: JSON.stringify(body)});
+    if (d.ok) { closeModal(); toast('Rent increase scheduled.'); renderUnits(); } else $('#irErr').textContent = d.error;
+  } finally {
+    _endAction(_k);
+  }
 }
 
 // ── ALERTS ───────────────────────────────────────────────────────────
@@ -5729,11 +5805,16 @@ async function maybePromptDeviceName() {
   `, {dismissible: false});
 }
 async function submitDeviceLabel() {
-  const label = $('#dev_my_label').value.trim();
-  if (!label) { $('#devLabelErr').textContent = 'Please enter a name.'; return; }
-  const d = await api('/api/devices/label', {method:'POST', body: JSON.stringify({label})});
-  if (d.ok) { closeModal(); toast('Device name saved.'); }
-  else $('#devLabelErr').textContent = d.error || 'Could not save name -- that name may already be taken by another connected phone.';
+  if (!_beginAction('submitDeviceLabel')) return;
+  try {
+    const label = $('#dev_my_label').value.trim();
+    if (!label) { $('#devLabelErr').textContent = 'Please enter a name.'; return; }
+    const d = await api('/api/devices/label', {method:'POST', body: JSON.stringify({label})});
+    if (d.ok) { closeModal(); toast('Device name saved.'); }
+    else $('#devLabelErr').textContent = d.error || 'Could not save name -- that name may already be taken by another connected phone.';
+  } finally {
+    _endAction('submitDeviceLabel');
+  }
 }
 
 // ── DANGER ZONE: reset data ──────────────────────────────────────────
@@ -5747,12 +5828,17 @@ function openResetData() {
   `);
 }
 async function submitResetData() {
-  const adminPin = $('#reset_admin_pin').value.trim();
-  if (!adminPin) { $('#resetErr').textContent = 'Enter the admin PIN set on the PC.'; return; }
-  if (!confirm('Are you absolutely sure? All tenants and units will be erased.')) return;
-  const d = await api('/api/settings/reset', {method:'POST', body: JSON.stringify({admin_pin: adminPin})});
-  if (d.ok) { closeModal(); toast('All data reset.'); cacheDeletePrefix('/api/'); switchTab('dashboard'); }
-  else $('#resetErr').textContent = d.error || 'Could not reset data.';
+  if (!_beginAction('submitResetData')) return;
+  try {
+    const adminPin = $('#reset_admin_pin').value.trim();
+    if (!adminPin) { $('#resetErr').textContent = 'Enter the admin PIN set on the PC.'; return; }
+    if (!confirm('Are you absolutely sure? All tenants and units will be erased.')) return;
+    const d = await api('/api/settings/reset', {method:'POST', body: JSON.stringify({admin_pin: adminPin})});
+    if (d.ok) { closeModal(); toast('All data reset.'); cacheDeletePrefix('/api/'); switchTab('dashboard'); }
+    else $('#resetErr').textContent = d.error || 'Could not reset data.';
+  } finally {
+    _endAction('submitResetData');
+  }
 }
 
 const MONTH_NAMES = ['January','February','March','April','May','June','July',
@@ -5773,6 +5859,7 @@ function populateMonthlyPickers() {
 }
 
 async function generateMonthlyReport() {
+  if (!_beginAction('generateMonthlyReport')) return;
   const month = $('#mrMonth').value, year = $('#mrYear').value;
   const box = $('#mrResults');
   box.innerHTML = `<div class="sub" style="color:var(--muted);">Generating…</div>`;
@@ -5801,6 +5888,8 @@ async function generateMonthlyReport() {
     `;
   } catch (e) {
     box.innerHTML = `<div class="sub" style="color:var(--danger);">Couldn't generate the report — check the connection and try again.</div>`;
+  } finally {
+    _endAction('generateMonthlyReport');
   }
 }
 
