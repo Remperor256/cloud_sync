@@ -3298,6 +3298,18 @@ def do_record_payment(idx):
     if idx < 0 or idx >= len(tenants):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
+
+    # Once a tenant has an instalment/deposit plan in progress, full
+    # "Pay Rent" is locked until that balance reaches zero -- enforced
+    # here (not just hidden in the UI) so it holds for every caller,
+    # including direct API calls, not just the phone-app button.
+    _, dep_remaining, dep_cleared, dep_in_progress = current_deposit_cycle(t)
+    if dep_in_progress and not dep_cleared:
+        return jsonify({"ok": False,
+            "error": f"An instalment plan is in progress (UGX {int(dep_remaining):,} "
+                     f"still remaining) — record instalments until the balance reaches "
+                     f"zero before paying rent in full."}), 400
+
     body = request.get_json(force=True) or {}
     try:
         months = int(body.get("months", 1))
@@ -5245,11 +5257,16 @@ async function renderTenantDetail(idx) {
 
     <div class="card">
       <div class="row">
-        <button class="btn btn-primary" onclick="openPaymentModal(${idx})">💳 Pay Rent</button>
+        ${t.level === 'underpaid'
+          ? `<button class="btn btn-primary" disabled style="opacity:.5;cursor:not-allowed;">🔒 Pay Rent</button>`
+          : `<button class="btn btn-primary" onclick="openPaymentModal(${idx})">💳 Pay Rent</button>`}
       </div>
       <div class="row" style="margin-top:10px;">
         <button class="btn btn-ghost" onclick="openDepositModal(${idx})">＋ Record Instalment</button>
       </div>
+      ${t.level === 'underpaid'
+        ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">🔒 Pay Rent is locked while an instalment plan is in progress. Keep recording instalments until the balance reaches zero.</div>`
+        : ''}
     </div>
 
     <div class="section-title">Payment History</div>
