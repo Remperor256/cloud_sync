@@ -2737,6 +2737,38 @@ def _guard():
     return None
 
 
+# ── state-mutation lock ─────────────────────────────────────────────────
+# record_payment/record_deposit/cancel_transaction/etc. all follow the same
+# shape: load_state() -> mutate one tenant/unit dict in place -> save_state().
+# Nothing serialized that read-modify-write cycle, so two mutating requests
+# landing close together (the PC and a phone both tapping "Pay" near the
+# same moment, or a slow request racing its own automatic retry) could both
+# read the SAME starting due_date, both compute the SAME shifted period,
+# and then whichever saved last would silently overwrite the other's
+# change -- exactly the "same period on multiple payments" symptom, since
+# due-date-shift math is only correct when each call sees the result of
+# the one before it. Every mutating /api/ request now holds this lock for
+# its entire duration, so they're applied one at a time, strictly in the
+# order they actually arrive -- registered before the idempotency guard
+# below so key-check-then-store also becomes atomic across concurrent
+# duplicate requests, not just within a single request.
+_state_mutation_lock = threading.RLock()
+
+
+@app.before_request
+def _acquire_state_lock():
+    if request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/"):
+        _state_mutation_lock.acquire()
+        g._state_lock_held = True
+
+
+@app.teardown_request
+def _release_state_lock(exc=None):
+    if getattr(g, "_state_lock_held", False):
+        g._state_lock_held = False
+        _state_mutation_lock.release()
+
+
 # ── idempotency guard for mutating requests ───────────────────────────────
 # A POST/PUT/DELETE can reach this server twice for reasons that have
 # nothing to do with someone tapping a button twice: a request that times
@@ -2812,9 +2844,9 @@ WAITING_HTML = """<!DOCTYPE html>
 <style>
   html,body{margin:0;padding:0;height:100%;background:radial-gradient(120% 100% at 50% 0%,#123F3A 0%,#0B2B27 55%,#081D1A 100%);color:#fff;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;}
   .wrap{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:32px;}
-  .mark{width:56px;height:56px;border-radius:16px;margin-bottom:18px;background:linear-gradient(155deg,#1C8F81,#0E4F45);
+  .mark{width:56px;height:56px;border-radius:16px;margin-bottom:18px;background:linear-gradient(155deg,#1C8F81,#0E4F45);overflow:hidden;
         display:flex;align-items:center;justify-content:center;box-shadow:0 12px 28px -10px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.16);}
-  .mark svg{width:28px;height:28px;}
+  .mark img{width:100%;height:100%;object-fit:cover;display:block;}
   h1{font-family:'Fraunces',serif;font-weight:600;font-size:21px;margin:0 0 8px;letter-spacing:.2px;}
   p{font-size:13.5px;line-height:1.55;opacity:.68;max-width:280px;margin:0;}
   .spin{margin-top:26px;width:20px;height:20px;border-radius:50%;border:2.5px solid rgba(255,255,255,.18);
@@ -2823,7 +2855,7 @@ WAITING_HTML = """<!DOCTYPE html>
   @keyframes sp{to{transform:rotate(360deg);}}
 </style></head>
 <body><div class="wrap">
-  <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 11.5 12 4l8 7.5" stroke="#EAFBF7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="#EAFBF7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  <div class="mark"><img src="icon-256.png?v=2" alt=""></div>
   <h1>Tenant Management</h1>
   <p>Waiting to connect. Scan the QR code shown in Connect Phone on the PC to open this device's tenant data.</p>
   <div class="spin"></div>
@@ -2962,9 +2994,10 @@ def service_worker():
     # the whole app, not just its own folder.
     js = """
 // Bumped so every existing install picks up this fix on its next
-// activate() instead of continuing to serve a stale precached "./" that
-// (pre-fix) never had sid/key on it in the first place.
-const CACHE = 'rental-app-shell-v5';
+// activate() instead of continuing to serve a stale precached shell --
+// bumped again for the header/splash icon swap and the icon-256.png
+// addition to SHELL_URLS below.
+const CACHE = 'rental-app-shell-v6';
 // sid/key travel here via this script's OWN url (see the
 // navigator.serviceWorker.register('sw.js?sid=...&key=...') call) --
 // self.location.search is that query string, readable from inside the
@@ -2973,7 +3006,7 @@ const PARAMS = self.location.search;
 const ROOT_URL = './' + PARAMS;
 const MANIFEST_URL = './manifest.json' + PARAMS;
 // Relative, not root-absolute: resolved against this script's own URL.
-const SHELL_URLS = [ROOT_URL, MANIFEST_URL, './icon-192.png?v=2'];
+const SHELL_URLS = [ROOT_URL, MANIFEST_URL, './icon-192.png?v=2', './icon-256.png?v=2'];
 
 self.addEventListener('install', (evt) => {
   self.skipWaiting();
@@ -4092,12 +4125,15 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   header.top .brand{display:flex;align-items:center;gap:11px;min-width:0;}
   header.top .brand .mark{
-    width:36px;height:36px;border-radius:11px;flex-shrink:0;
+    width:36px;height:36px;border-radius:11px;flex-shrink:0;overflow:hidden;
     background:linear-gradient(155deg,var(--teal-bright),var(--teal-deep));
     box-shadow:0 6px 16px -6px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.18);
     display:flex;align-items:center;justify-content:center;font-weight:700;
   }
-  header.top .brand .mark svg{width:19px;height:19px;display:block;}
+  /* Same bitmap the desktop app uses as its own icon (served from
+     /icon-<size>.png, see app_icon() below) rather than a hand-drawn
+     approximation of it, so the header glyph matches the PC app exactly. */
+  header.top .brand .mark img{width:100%;height:100%;object-fit:cover;display:block;}
   header.top h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.1px;}
   header.top .sub{font-size:11px;opacity:.7;margin-top:2px;font-family:var(--font-body);}
   .icon-btn{
@@ -4333,8 +4369,8 @@ INDEX_HTML = """<!DOCTYPE html>
   /* Static fallback for prefers-reduced-motion (see hideSplash()) -- a
      plain fade instead of the lunge/wipe below. */
   .splash-screen.hidden{opacity:0;pointer-events:none;transition:opacity .25s ease;}
-  .splash-house{width:60px;height:60px;animation:splash-grow 1.1s ease-in-out infinite;transform-origin:center;}
-  .splash-house svg{width:100%;height:100%;display:block;}
+  .splash-house{width:60px;height:60px;border-radius:16px;overflow:hidden;animation:splash-grow 1.1s ease-in-out infinite;transform-origin:center;}
+  .splash-house img{width:100%;height:100%;object-fit:cover;display:block;}
   @keyframes splash-grow{
     0%,100%{transform:scale(.72);opacity:.55;}
     50%{transform:scale(1.18);opacity:1;}
@@ -4438,10 +4474,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <div id="splashScreen" class="splash-screen">
   <div class="splash-house">
-    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M4 11.5 12 4l8 7.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
+    <img src="icon-256.png?v=2" alt="">
   </div>
   <div class="splash-label">Tenant Management</div>
 </div>
@@ -4471,7 +4504,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="app" id="app" style="display:none;">
   <header class="top">
     <div class="brand">
-      <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 11.5 12 4l8 7.5" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="mark"><img src="icon-256.png?v=2" alt=""></div>
       <div>
         <h1>Tenant Management</h1>
         <div class="sub" id="headerSub">—</div>
@@ -4573,7 +4606,7 @@ function leaseProgressBlock(t) {
   </div>`;
 }
 
-let state = { tab:'dashboard', tenants:[], selectedIdx:null, filter:'all', q:'' };
+let state = { tab:'dashboard', tenants:[], selectedIdx:null, filter:'all', q:'', unitsFilter:'all', alertsFilter:'all' };
 
 // ── Offline queue + cache ───────────────────────────────────────────
 // While this phone/browser can't reach the PC (PC is off, or off Wi-Fi),
@@ -5615,7 +5648,14 @@ function dcard({accent, icon, title, value, subs, actionLabel, actionTab}) {
 }
 
 async function renderDashboard() {
-  const d = await api('/api/dashboard');
+  const path = '/api/dashboard';
+  const cached = cacheGet(path);
+  if (cached && !cached.no_cache) paintDashboard(cached);
+  const d = await api(path);
+  if (state.tab !== 'dashboard') return;
+  paintDashboard(d);
+}
+function paintDashboard(d) {
   if (d.no_cache) {
     // Offline and the dashboard was never loaded on this device before --
     // showing "0 tenants · 0 units" here would look like real data instead
@@ -5700,13 +5740,27 @@ function openTenant(idx) { state.selectedIdx = idx; state.tab = 'tenant-detail';
 // ── TENANTS LIST ─────────────────────────────────────────────────────
 async function renderTenants() {
   const params = new URLSearchParams({q: state.q, filter: state.filter});
-  const d = await api('/api/tenants?' + params.toString());
+  const path = '/api/tenants?' + params.toString();
+  // Paint whatever's cached for this exact query immediately -- no need
+  // to wait on the network round trip just to show what was already on
+  // screen a moment ago. The live api() call below still runs right
+  // after and repaints with the real, current numbers as soon as they
+  // arrive (or leaves the cached view up if this tab's been left by then).
+  const cached = cacheGet(path);
+  if (cached) paintTenants(cached);
+  const d = await api(path);
+  if (state.tab !== 'tenants') return;
+  paintTenants(d);
+}
+function paintTenants(d) {
   $('#headerSub').textContent = `${d.tenants.length} shown`;
   const filters = [['all','All'],['paid','Paid'],['underpaid','Instalments'],['pending','Pending']];
   const emptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
     : `<div class="empty"><div class="big">👤</div>No tenants match.</div>`;
   const rows = d.tenants.map(tenantRowHtml).join('') || emptyMsg;
+  const hadFocus = document.activeElement && document.activeElement.id === 'searchInput';
+  const selStart = hadFocus ? document.activeElement.selectionStart : null;
   $('#main').innerHTML = `
     <div class="searchbar"><span>🔎</span><input id="searchInput" placeholder="Search name or unit" value="${escapeHtml(state.q)}"></div>
     <div class="filters">${filters.map(([k,l])=>`<div class="filter-pill ${state.filter===k?'active':''}" data-f="${k}">${l}</div>`).join('')}</div>
@@ -5715,6 +5769,7 @@ async function renderTenants() {
   `;
   $('#searchInput').addEventListener('input', debounce(e => { state.q = e.target.value; renderTenants(); }, 300));
   $$('.filter-pill').forEach(p => p.addEventListener('click', () => { state.filter = p.dataset.f; renderTenants(); }));
+  if (hadFocus) { const el = $('#searchInput'); el.focus(); el.setSelectionRange(selStart, selStart); }
 }
 function debounce(fn, ms) { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
 
@@ -6067,18 +6122,14 @@ function updateMonthPickerFields() {
   const credit = Math.min(_mp.prepaid || 0, (_mp.rent || 0) * _mp.pending);
   if (monthsVal) monthsVal.textContent = String(_mp.pending);
   if (amountVal) amountVal.textContent = fmt(net);
-  // The Deposit modal has its own editable "Deposit" field (Pay Rent
-  // doesn't -- it always charges the full computed amount). It was
-  // starting out blank/zero instead of pre-filled with the computed
-  // amount = rent * months. Keep it in sync with the month picker here,
-  // but only while the user hasn't typed their own custom deposit --
-  // once they touch the field (see the 'input' listener in
-  // openDepositModal), this stops overwriting what they entered, since
-  // a deposit is often a partial amount rather than the full total.
-  const depositEl = $('#d_deposit');
-  if (depositEl && !depositEl.dataset.userEdited) {
-    depositEl.value = net > 0 ? String(net) : '';
-  }
+  // The Deposit modal shows a read-only "Amount" field (amount due for
+  // the ticked months) directly above the editable "Deposit" field, kept
+  // in sync with the month picker here. "Deposit" itself is never
+  // auto-filled -- the admin always types the actual amount handed
+  // over, since a deposit/instalment is often a partial amount rather
+  // than the full total.
+  const amountEl = $('#d_amount');
+  if (amountEl) amountEl.textContent = fmt(net);
   updateDepositBalance();
   if (creditNote) {
     if (credit > 0) {
@@ -6180,7 +6231,11 @@ async function openDepositModal(idx) {
     <h2>Record Instalment / Deposit</h2>
     <div class="desc">${locked ? 'Continue clearing the balance for the current month below.' : "Partial payments accumulate toward the selected month(s)' rent."}</div>
     ${monthPickerHtml(locked)}
-    <label class="field">Deposit (UGX)</label><input id="d_deposit" inputmode="numeric">
+    <label class="field">Amount (UGX)</label>
+    <div class="month-picker-control" style="cursor:default;">
+      <span id="d_amount" style="font-family:var(--font-mono);color:var(--ink);">${fmt(0)}</span>
+    </div>
+    <label class="field">Deposit (UGX)</label><input id="d_deposit" inputmode="numeric" placeholder="Amount handed over">
     <label class="field">Balance (UGX)</label>
     <div class="month-picker-control" style="cursor:default;">
       <span id="d_balance" style="font-family:var(--font-mono);color:var(--ink);">${fmt(0)}</span>
@@ -6192,7 +6247,7 @@ async function openDepositModal(idx) {
   updateMonthPickerSummary();
   const depositEl = $('#d_deposit');
   if (depositEl) {
-    depositEl.addEventListener('input', () => { depositEl.dataset.userEdited = '1'; updateDepositBalance(); });
+    depositEl.addEventListener('input', updateDepositBalance);
   }
 }
 async function submitDeposit(idx) {
@@ -6253,7 +6308,14 @@ function unitRowHtml(u) {
     </div>`;
 }
 async function renderUnits() {
-  const d = await api('/api/units');
+  const path = '/api/units';
+  const cached = cacheGet(path);
+  if (cached) paintUnits(cached);
+  const d = await api(path);
+  if (state.tab !== 'units') return;
+  paintUnits(d);
+}
+function paintUnits(d) {
   $('#headerSub').textContent = `${d.units.length} units`;
   const unitsEmptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
@@ -6275,11 +6337,23 @@ async function renderUnits() {
       <span style="background:${color};color:#fff;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700;">${list.length}</span>
     </div>
     <div class="card" style="padding:4px 12px;">${list.map(unitRowHtml).join('')}</div>` : '';
+  const unitFilters = [['occupied','Occupied'],['vacant','Vacant']];
+  const filterRow = `<div class="filters">${unitFilters.map(([k,l])=>`<div class="filter-pill ${state.unitsFilter===k?'active':''}" data-uf="${k}">${l}</div>`).join('')}</div>`;
+  const noMatchMsg = `<div class="card" style="padding:4px 12px;"><div class="empty">No ${state.unitsFilter} units.</div></div>`;
+  let sections;
+  if (state.unitsFilter === 'occupied') sections = occupied.length ? section('Occupied', 'var(--teal-deep)', occupied) : noMatchMsg;
+  else if (state.unitsFilter === 'vacant') sections = vacant.length ? section('Vacant', 'var(--muted)', vacant) : noMatchMsg;
+  else sections = section('Occupied', 'var(--teal-deep)', occupied) + section('Vacant', 'var(--muted)', vacant);
   $('#main').innerHTML = `
     <button class="btn btn-primary btn-full" style="margin-bottom:14px;" onclick="openAddUnit()">＋ Add Unit</button>
-    ${section('Occupied', 'var(--teal-deep)', occupied)}
-    ${section('Vacant', 'var(--muted)', vacant)}
+    ${filterRow}
+    ${sections}
   `;
+  $$('.filter-pill[data-uf]').forEach(p => p.addEventListener('click', () => {
+    const k = p.dataset.uf;
+    state.unitsFilter = (state.unitsFilter === k) ? 'all' : k;
+    renderUnits();
+  }));
 }
 function openAddUnit() {
   openModal(`
@@ -6372,13 +6446,30 @@ async function submitIncreaseRent(nameEnc) {
 
 // ── ALERTS ───────────────────────────────────────────────────────────
 async function renderAlerts() {
-  const d = await api('/api/alerts');
+  const path = '/api/alerts';
+  const cached = cacheGet(path);
+  if (cached) paintAlerts(cached);
+  const d = await api(path);
+  if (state.tab !== 'alerts') return;
+  paintAlerts(d);
+}
+function paintAlerts(d) {
+  const alerts = state.alertsFilter === 'all' ? d.alerts
+    : d.alerts.filter(t => t.level === state.alertsFilter);
   $('#headerSub').textContent = `${d.alerts.length} tenant(s) to watch`;
   const alertsEmptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
-    : `<div class="empty"><div class="big">✅</div>No alerts. Everyone's paid up.</div>`;
-  const rows = d.alerts.map(tenantRowHtml).join('') || alertsEmptyMsg;
-  $('#main').innerHTML = `<div class="section-title">Overdue &amp; Upcoming</div><div class="card" style="padding:4px 12px;">${rows}</div>`;
+    : (d.alerts.length ? `<div class="empty">No ${state.alertsFilter === 'pending' ? 'pending' : 'instalment'} tenants.</div>`
+      : `<div class="empty"><div class="big">✅</div>No alerts. Everyone's paid up.</div>`);
+  const rows = alerts.map(tenantRowHtml).join('') || alertsEmptyMsg;
+  const alertFilters = [['pending','Pending'],['underpaid','Instalments']];
+  const filterRow = `<div class="filters">${alertFilters.map(([k,l])=>`<div class="filter-pill ${state.alertsFilter===k?'active':''}" data-af="${k}">${l}</div>`).join('')}</div>`;
+  $('#main').innerHTML = `<div class="section-title">Overdue &amp; Upcoming</div>${filterRow}<div class="card" style="padding:4px 12px;">${rows}</div>`;
+  $$('.filter-pill[data-af]').forEach(p => p.addEventListener('click', () => {
+    const k = p.dataset.af;
+    state.alertsFilter = (state.alertsFilter === k) ? 'all' : k;
+    paintAlerts(d);
+  }));
 }
 
 // ── SETTINGS ─────────────────────────────────────────────────────────
@@ -6408,11 +6499,16 @@ function renderMoreMenu() {
 
 async function renderHistory() {
   const q = state.historyQ || '';
+  const histPath = '/api/history' + (q ? ('?q=' + encodeURIComponent(q)) : '');
+  const dashPath = '/api/dashboard';
   $('#headerSub').textContent = 'Transaction History';
-  const [d, dash] = await Promise.all([
-    api('/api/history' + (q ? ('?q=' + encodeURIComponent(q)) : '')),
-    api('/api/dashboard'),
-  ]);
+  const cachedHist = cacheGet(histPath), cachedDash = cacheGet(dashPath);
+  if (cachedHist && cachedDash) paintHistory(cachedHist, cachedDash, q);
+  const [d, dash] = await Promise.all([api(histPath), api(dashPath)]);
+  if (state.tab !== 'history') return;
+  paintHistory(d, dash, q);
+}
+function paintHistory(d, dash, q) {
   const tenants = d.tenants || [];
 
   const incomeCard = `<div class="card" style="background:var(--teal-soft2);border-color:var(--teal-soft);">
@@ -6796,3 +6892,4 @@ if __name__ == "__main__":
     # already shows its own QR code in-window — nothing should open on the PC.
 
     app.run(host="0.0.0.0", port=port, debug=False)
+    
