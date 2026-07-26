@@ -885,24 +885,34 @@ def _cloud_gate():
         return None
 
     path = request.path
-    pc_only_prefixes = (
+    pc_only_paths = (
         "/api/device-count",
         "/api/announce-disconnect",
-        "/api/unlock", "/api/lock", "/api/settings/pin",
+        "/api/settings/pin",
         "/api/settings/reset", "/api/shutdown", "/connect", "/qr.png",
         "/api/cloud-config",
     )
-    # /api/lock-status, /api/devices(/…/kick), and /api/pairing-token used
-    # to be blanket-404'd here along with the rest of this list -- they
-    # made sense only for the PC-hosted LAN companion. Now that cloud-
-    # direct pairing has its own device roster (cloud_devices) and its
-    # own single-use scan token (cloud_pairing), they're real, session-
-    # authenticated endpoints instead: /api/lock-status is what a cloud-
-    # direct phone's pingServer() polls to know the cloud service itself
-    # is reachable, /api/devices is how the desktop manages that roster,
-    # and /api/pairing-token is how the desktop pushes a fresh scan token
-    # every time it (re)shows the QR code -- see _cloud_pairing_ok().
-    if path.startswith(pc_only_prefixes):
+    # /api/lock-status, /api/devices(/…/kick), /api/pairing-token,
+    # /api/unlock, and /api/lock used to be blanket-404'd here along with
+    # the rest of this list -- they made sense only for the PC-hosted LAN
+    # companion. Now that cloud-direct pairing has its own device roster
+    # (cloud_devices) and its own copy of the PIN (settings.pin_hash rides
+    # along in the synced data, see load_state()/_raw_load()'s CLOUD_MODE
+    # branch), they're real, session-authenticated endpoints instead:
+    # /api/lock-status is what a cloud-direct phone's pingServer() polls
+    # to know the cloud service itself is reachable, /api/devices is how
+    # the desktop manages that roster, /api/pairing-token is how the
+    # desktop pushes a fresh scan token every time it (re)shows the QR
+    # code, and /api/unlock/lock let a cloud-direct phone lock/unlock
+    # with its own PIN even while the PC is off, exactly like a phone
+    # still on the LAN can -- see _cloud_pairing_ok().
+    #
+    # This is checked with an exact match, not a prefix/startswith check:
+    # "/api/lock" as a *prefix* used to also swallow "/api/lock-status"
+    # (a completely different, always-meant-to-be-real endpoint) since
+    # the latter literally starts with the former's characters, which is
+    # what made lock-status silently 404 for every cloud-direct phone.
+    if path in pc_only_paths:
         return Response("", status=404, mimetype="text/plain")
     if path in ("/manifest.json", "/sw.js") or path.startswith("/icon-"):
         # These carry no tenant data, so there's nothing to gate -- let
@@ -982,7 +992,8 @@ def _cors_headers(resp):
     if CLOUD_MODE:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id, X-Device-Fingerprint")
+            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id, X-Device-Fingerprint, "
+            "X-Device-Screen, X-Idempotency-Key")
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         canonical_id = getattr(g, "canonical_device_id", None)
         if canonical_id:
@@ -1816,6 +1827,91 @@ def cancel_transaction(t, h_key, idx):
     return {"n_records": len(linked), "total_amount": total_amt}
 
 
+def add_old_data(t, records, final_state=None):
+    """Backfills a tenant's pre-existing rental history in one go -- for a
+    tenant who was already renting before this app was set up, where the
+    admin knows every past payment/instalment/due-date and is entering it
+    from paper records / memory rather than the app having computed it
+    live. Each item in `records` becomes one payment_history or
+    deposit_history entry, same shape as record_payment/record_deposit
+    produce, except with no `_pre_state` snapshot -- there's no live
+    "before" state to roll back to for a record that was never actually
+    processed through the app, so cancelling one of these later falls
+    back to cancel_transaction's legacy-record path instead.
+
+    `final_state` optionally sets the tenant's current status/due_date/
+    pay_date/notes once every historical record has been added -- the
+    admin-entered "where this tenant stands today" after their backfilled
+    history, since that isn't something to derive automatically from
+    old, out-of-band records the way a live payment would.
+
+    Returns {"added": n} on success."""
+    added = 0
+    for rec in records or []:
+        kind = "deposit_history" if rec.get("type") == "deposit" else "payment_history"
+        txn_date = (rec.get("date") or "").strip()
+        try:
+            datetime.strptime(txn_date, "%Y-%m-%d")
+        except ValueError:
+            continue  # skip malformed rows rather than fail the whole batch
+        to_date = (rec.get("to_date") or "").strip()
+        if to_date:
+            try:
+                datetime.strptime(to_date, "%Y-%m-%d")
+            except ValueError:
+                to_date = ""
+        from_date = (rec.get("from_date") or "").strip()
+        if not from_date and to_date:
+            from_date = add_months(_parse_date(to_date), -1).strftime("%Y-%m-%d")
+        amount = parse_amount(rec.get("amount", 0))
+        note = (rec.get("note") or "").strip()
+        entry = {
+            "date": txn_date, "months": max(0, int(rec.get("months", 0) or 0)),
+            "amount": amount, "from_date": from_date, "to_date": to_date,
+            "txn_id": f"old-data-{secrets.token_hex(4)}",
+            "note": note or "Old data entered by admin.",
+            "_backfilled": True,
+        }
+        if bool(rec.get("cancelled")):
+            entry["_cancelled"] = True
+            entry["cancelled_on"] = (rec.get("cancelled_on") or "").strip() or txn_date
+        t.setdefault(kind, []).append(entry)
+        added += 1
+
+    # Keep each history array in chronological order so it displays and
+    # exports the same as if these had been entered one at a time as they
+    # actually happened, instead of clumped at the end in entry order.
+    for key in ("payment_history", "deposit_history"):
+        t[key] = sorted(t.get(key, []), key=lambda r: r.get("date", ""))
+
+    if final_state:
+        due_str = (final_state.get("due_date") or "").strip()
+        if due_str:
+            try:
+                datetime.strptime(due_str, "%Y-%m-%d")
+                t["due_date"] = due_str
+            except ValueError:
+                pass
+        status = (final_state.get("status") or "").strip()
+        if status in ("Confirmed", "Pending"):
+            t["status"] = status
+        pay_date = (final_state.get("pay_date") or "").strip()
+        if pay_date:
+            try:
+                datetime.strptime(pay_date, "%Y-%m-%d")
+                t["pay_date"] = pay_date
+            except ValueError:
+                pass
+        notes = final_state.get("notes")
+        if notes is not None:
+            existing = (t.get("notes") or "").strip()
+            addition = str(notes).strip()
+            if addition:
+                t["notes"] = (existing + "\n" + addition).strip() if existing else addition
+
+    return {"added": added}
+
+
 MONTHS = ["January", "February", "March", "April", "May", "June", "July",
           "August", "September", "October", "November", "December"]
 
@@ -2037,6 +2133,7 @@ def export_excel(data):
     row_num = 2
     seq = 0
     for t in tenants:
+      try:
         all_txns = []
         for rec in t.get("payment_history", []):
             all_txns.append({"_type": "payment", **rec})
@@ -2072,6 +2169,12 @@ def export_excel(data):
                     cell.font = bold(10) if ci in (2, 6) else reg(10)
             ws.row_dimensions[row_num].height = 20
             row_num += 1
+      except Exception:
+        # One tenant with an odd/malformed record shouldn't take the
+        # entire export down for everyone else -- skip it and keep going.
+        import traceback
+        traceback.print_exc()
+        continue
 
     if row_num == 2:
         ws.cell(row=2, column=1, value="No transactions recorded yet.").font = reg(11)
@@ -3585,6 +3688,7 @@ def add_tenant():
     entry_str = (body.get("entry_date") or "").strip()
     notes = (body.get("notes") or "").strip()
     replace = bool(body.get("replace"))
+    existing_tenant = bool(body.get("existing_tenant"))
 
     if not name:
         return jsonify({"ok": False, "error": "Tenant name is required."}), 400
@@ -3599,6 +3703,31 @@ def add_tenant():
     except ValueError:
         return jsonify({"ok": False, "error": "Move-in date must be in YYYY-MM-DD format."}), 400
 
+    # Existing/older tenant: every field below is admin-entered rather
+    # than defaulted, since this tenant's rental history predates the
+    # app -- their due date, status, and last-payment date are known
+    # facts, not something to compute from a first payment that never
+    # happens here.
+    due_str = ""
+    status = "Pending"
+    pay_date = ""
+    if existing_tenant:
+        due_str = (body.get("due_date") or "").strip()
+        if due_str:
+            try:
+                datetime.strptime(due_str, "%Y-%m-%d")
+            except ValueError:
+                return jsonify({"ok": False, "error": "Due date must be in YYYY-MM-DD format."}), 400
+        status = "Confirmed" if (body.get("status") or "").strip().lower() == "confirmed" else "Pending"
+        pay_date = (body.get("pay_date") or "").strip()
+        if pay_date:
+            try:
+                datetime.strptime(pay_date, "%Y-%m-%d")
+            except ValueError:
+                return jsonify({"ok": False, "error": "Last payment date must be in YYYY-MM-DD format."}), 400
+        elif status == "Confirmed":
+            pay_date = date.today().strftime("%Y-%m-%d")
+
     rent = parse_amount(rent_str) if rent_str else 0.0
     record = {
         "name": name, "phone": phone,
@@ -3607,11 +3736,23 @@ def add_tenant():
         "emergency_contact": (body.get("emergency_contact") or "").strip(),
         "emergency_phone": (body.get("emergency_phone") or "").strip(),
         "unit": unit, "rent": rent,
-        "entry_date": entry_str, "due_date": "",
-        "status": "Pending", "pay_date": "", "notes": notes,
+        "entry_date": entry_str, "due_date": due_str,
+        "status": status, "pay_date": pay_date, "notes": notes,
         "payment_history": [], "deposit_history": [], "arrears_history": [],
         "locked_periods": [], "deposit_cycle_start": 0, "rent_increase_due": 0.0,
     }
+    if existing_tenant and due_str:
+        # Marks this tenant as having prior rental history (see
+        # has_prior_payment_history / due_date_shift_base) so their NEXT
+        # payment shifts forward from this manually-entered due_date,
+        # exactly like a tenant whose history was built up one payment
+        # at a time in the app -- not from their move-in date, which
+        # only applies to a tenant with no real due_date yet.
+        record["payment_history"] = [{
+            "date": entry_str, "months": 0, "amount": 0.0,
+            "from_date": entry_str, "to_date": due_str,
+            "txn_id": "manual-entry", "note": "Opening balance entered manually by admin.",
+        }]
 
     data = load_state()
     for i, t in enumerate(data["tenants"]):
@@ -3627,6 +3768,7 @@ def add_tenant():
     data["tenants"].append(record)
     save_state(data)
     return jsonify({"ok": True, "index": len(data["tenants"]) - 1})
+
 
 
 @app.route("/api/tenants/<int:idx>", methods=["PUT"])
@@ -3652,6 +3794,30 @@ def edit_tenant(idx):
 
     save_state(data)
     return jsonify({"ok": True})
+
+
+@app.route("/api/tenants/<int:idx>/old-data", methods=["POST"])
+def do_add_old_data(idx):
+    """Lets the admin backfill a tenant's pre-existing rental history --
+    every past payment/instalment plus the tenant's current standing --
+    in one batch, for a tenant who was renting before this app existed.
+    Already covered by the same session-unlock gate as every other /api/
+    call (see _guard()), so no extra PIN check here."""
+    data = load_state()
+    tenants = data["tenants"]
+    if idx < 0 or idx >= len(tenants):
+        return jsonify({"error": "not found"}), 404
+    t = tenants[idx]
+    body = request.get_json(force=True) or {}
+    records = body.get("records") or []
+    if not isinstance(records, list) or not records:
+        return jsonify({"ok": False, "error": "Add at least one old transaction."}), 400
+
+    result = add_old_data(t, records, final_state=body.get("final_state"))
+    if result["added"] == 0:
+        return jsonify({"ok": False, "error": "None of the rows had a valid date (YYYY-MM-DD)."}), 400
+    save_state(data)
+    return jsonify({"ok": True, "result": result})
 
 
 @app.route("/api/tenants/<int:idx>", methods=["DELETE"])
@@ -4063,6 +4229,17 @@ INDEX_HTML = """<!DOCTYPE html>
     --accent-income:#206E3A;
     --accent-alerts:#D34321;
     color-scheme:light;
+
+    /* Text-on-soft-background color -- same dark teal as --teal-deep in
+       light mode, where it reads fine against white/pale-teal
+       backgrounds. See the dark-mode override below: this is the
+       variable that should have been swapped for dark mode everywhere
+       --teal-deep was being used as *text* (as opposed to a button/pill
+       background painted solid, which stays --teal-deep in both modes),
+       and wasn't -- which is what made the back button and various
+       labels in Settings unreadable (dark text on a dark background) in
+       dark mode. */
+    --teal-ink:var(--teal-deep);
   }
 
   /* ── Dark mode: the previous default palette, now an explicit choice
@@ -4095,6 +4272,7 @@ INDEX_HTML = """<!DOCTYPE html>
     --accent-income:#3DD9C4;
     --accent-alerts:#F0955C;
     color-scheme:dark;
+    --teal-ink:var(--teal-bright);
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
   html,body{margin:0;padding:0;}
@@ -4153,7 +4331,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
   .stat{padding:14px;border-radius:var(--radius-sm);background:var(--card-2);}
-  .stat .num{font-family:var(--font-mono);font-size:21px;font-weight:600;color:var(--teal-deep);font-variant-numeric:tabular-nums;}
+  .stat .num{font-family:var(--font-mono);font-size:21px;font-weight:600;color:var(--teal-ink);font-variant-numeric:tabular-nums;}
   .stat .lbl{font-size:11.5px;color:var(--muted);margin-top:3px;}
 
   /* ── Dashboard "ledger tile" cards — the signature element: a
@@ -4192,7 +4370,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .btn:active{transform:scale(.97);}
   .btn-primary{background:linear-gradient(155deg,var(--teal-bright),var(--teal));color:#fff;box-shadow:0 8px 18px -8px rgba(23,143,130,.55);}
   .btn-primary:active{filter:brightness(.92);}
-  .btn-ghost{background:var(--teal-soft);color:var(--teal-deep);}
+  .btn-ghost{background:var(--teal-soft);color:var(--teal-ink);}
   .btn-danger{background:var(--danger-soft);color:var(--danger);}
   .btn-full{width:100%;}
   .btn:disabled{opacity:.5;}
@@ -4219,7 +4397,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .tenant-row:active{background:var(--card-2);}
   .tenant-row:last-child{border-bottom:none;}
   .avatar{
-    width:42px;height:42px;border-radius:12px;background:var(--teal-soft);color:var(--teal-deep);
+    width:42px;height:42px;border-radius:12px;background:var(--teal-soft);color:var(--teal-ink);
     display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0;
     font-family:var(--font-display);
   }
@@ -4290,7 +4468,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .month-row .month-label{flex:1;}
   .month-row.cleared{background:var(--card-2);color:var(--muted);cursor:default;}
   .month-row.cleared .month-tag{
-    font-size:10px;font-weight:700;color:var(--teal-deep);background:var(--teal-soft);
+    font-size:10px;font-weight:700;color:var(--teal-ink);background:var(--teal-soft);
     padding:2px 7px;border-radius:999px;text-transform:uppercase;letter-spacing:.3px;
   }
   .month-row.open:active{background:var(--card-2);}
@@ -4333,7 +4511,7 @@ INDEX_HTML = """<!DOCTYPE html>
   nav.tabbar .tab.active .ic{font-size:21px;}
   .empty{text-align:center;padding:36px 12px;color:var(--muted);}
   .empty .big{font-size:32px;margin-bottom:8px;}
-  .section-title{font-size:12.5px;font-weight:700;color:var(--teal-deep);text-transform:uppercase;letter-spacing:.5px;margin:4px 0 10px;font-family:var(--font-body);}
+  .section-title{font-size:12.5px;font-weight:700;color:var(--teal-ink);text-transform:uppercase;letter-spacing:.5px;margin:4px 0 10px;font-family:var(--font-body);}
   .modal-backdrop{
     position:fixed;inset:0;background:rgba(8,20,18,.55);z-index:100;
     -webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);
@@ -4362,7 +4540,7 @@ INDEX_HTML = """<!DOCTYPE html>
      the app itself. Uses the theme background so it never flashes a
      mismatched color before/after the lock screen or app appear. ── */
   .splash-screen{
-    position:fixed;inset:0;z-index:3000;background:var(--bg);color:var(--teal-deep);
+    position:fixed;inset:0;z-index:3000;background:var(--bg);color:var(--teal-ink);
     display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
   }
   html[data-theme="dark"] .splash-screen{color:var(--teal-bright);}
@@ -4444,7 +4622,7 @@ INDEX_HTML = """<!DOCTYPE html>
     position:absolute;top:-4px;right:-4px;background:var(--danger);color:#fff;font-size:10px;font-weight:700;
     min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 3px;
   }
-  a.linklike{color:var(--teal-deep);font-weight:600;text-decoration:none;font-size:13px;}
+  a.linklike{color:var(--teal-ink);font-weight:600;text-decoration:none;font-size:13px;}
   .progress-bar{height:8px;border-radius:6px;background:var(--teal-soft);overflow:hidden;margin-top:6px;}
   .progress-bar > div{height:100%;background:linear-gradient(90deg,var(--teal),var(--teal-bright));}
   hr.sep{border:none;border-top:1px solid var(--line);margin:14px 0;}
@@ -4461,7 +4639,7 @@ INDEX_HTML = """<!DOCTYPE html>
     height:0;overflow:hidden;transition:height .15s ease;
   }
   .ptr-indicator.visible{height:34px;line-height:34px;}
-  .ptr-indicator.ready{color:var(--teal-deep);}
+  .ptr-indicator.ready{color:var(--teal-ink);}
   .ptr-indicator.spinning{animation:ptr-pulse 1s ease-in-out infinite;}
   @keyframes ptr-pulse{0%,100%{opacity:.5;}50%{opacity:1;}}
   .pending-note{
@@ -4510,7 +4688,6 @@ INDEX_HTML = """<!DOCTYPE html>
         <div class="sub" id="headerSub">—</div>
       </div>
     </div>
-    <div id="syncBadge" class="sync-badge" style="display:none;"></div>
     <button class="icon-btn" onclick="lockNow()" title="Lock">🔒</button>
   </header>
   <div id="ptrIndicator" class="ptr-indicator">↓ Pull to refresh</div>
@@ -5248,6 +5425,51 @@ async function cloudFetch(path, opts = {}) {
   return data;
 }
 
+// ── file downloads (Excel / PDF exports) ────────────────────────────────
+// Plain <a href="api/export/..."> links used to be the whole
+// implementation here, which works for the PC-local test server but
+// breaks for every phone paired through CLOUD_MODE: a bare browser
+// navigation carries none of the X-Session-Id/X-Secret-Key headers
+// _cloud_gate() requires, so it 401s and the phone's browser just
+// renders the raw {"ok":false,"error":"session_required"} JSON as a
+// page -- which is exactly the "error message instead of a file"
+// people were seeing. Fetching the same way api()/cloudFetch() already
+// do (with those headers attached) and turning the response into a
+// blob download fixes it for both cloud-direct and local/LAN sessions.
+async function downloadFile(path, filename) {
+  try {
+    if (!cloudCfg || !cloudCfg.configured) await loadCloudConfig();
+    let res;
+    if (cloudCfg && cloudCfg.configured) {
+      res = await fetch(cloudCfg.cloud_base_url + path, {
+        headers: {
+          'X-Session-Id': cloudCfg.session_id,
+          'X-Secret-Key': cloudCfg.secret_key,
+          'X-Device-Id': DEVICE_ID,
+        },
+      });
+    } else {
+      res = await fetch(path, { headers: { 'X-Device-Id': DEVICE_ID } });
+    }
+    if (!res.ok) {
+      let msg = `Download failed (HTTP ${res.status}).`;
+      try { const j = await res.json(); if (j && j.error) msg = j.error; } catch (e) {}
+      toast(msg);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  } catch (e) {
+    toast('Could not download the file — check your connection and try again.');
+  }
+}
+
 // ── api helper ───────────────────────────────────────────────────────
 async function api(path, opts={}) {
   const method = (opts.method || 'GET').toUpperCase();
@@ -5480,7 +5702,7 @@ function openModal(html, opts) {
   root.innerHTML = `<div class="modal-backdrop" ${dismissible ? `onclick="if(event.target===this) closeModal()"` : ''}>
     <div class="modal" style="position:relative;">
       <div class="modal-handle"></div>
-      ${dismissible ? `<button class="icon-btn close-x" style="background:var(--teal-soft);color:var(--teal-deep);" onclick="closeModal()">✕</button>` : ''}
+      ${dismissible ? `<button class="icon-btn close-x" style="background:var(--teal-soft);color:var(--teal-ink);" onclick="closeModal()">✕</button>` : ''}
       ${html}
     </div>
   </div>`;
@@ -5681,7 +5903,7 @@ function paintDashboard(d) {
         accent: D_GREEN, icon:'💰', title:`Total Income — ${d.month_name}`,
         value: fmt(d.month_income),
         subs: [['Full', fmt(d.full_payment_total), 'var(--good)'],
-               ['Deposits', fmt(d.deposit_total), 'var(--teal-deep)'],
+               ['Deposits', fmt(d.deposit_total), 'var(--teal-ink)'],
                ['Cancelled', fmt(d.cancelled_total), 'var(--danger)']],
         actionLabel:'View Records', actionTab:'history'
       })}
@@ -5689,7 +5911,7 @@ function paintDashboard(d) {
         accent: D_ORANGE, icon:'🔔', title:'Rent Alerts', value: d.counts.pending,
         subs: [['Pending', d.counts.pending, 'var(--warn)'],
                ['Paid in Full', d.counts.paid, 'var(--good)'],
-               ['Installments', d.counts.underpaid, 'var(--teal-deep)']],
+               ['Installments', d.counts.underpaid, 'var(--teal-ink)']],
         actionLabel:'View Alerts', actionTab:'alerts'
       })}
     </div>
@@ -5782,6 +6004,11 @@ async function renderAddTenant() {
     <button class="btn btn-ghost" style="margin-bottom:12px;" onclick="state.tab='tenants'; render();">← Back</button>
     <div class="card">
       <h2 style="margin-top:0;">Add Tenant</h2>
+      <div class="row" style="margin-bottom:14px;">
+        <button type="button" class="btn filter-pill active" id="modeNewBtn" onclick="setAddTenantMode(false)">New Tenant</button>
+        <button type="button" class="btn filter-pill" id="modeExistingBtn" onclick="setAddTenantMode(true)">Existing / Older Tenant</button>
+      </div>
+      <div class="desc" id="modeHint" style="margin-bottom:12px;">A brand-new tenant with no rental history yet — their due date is set automatically once their first payment is recorded.</div>
       <label class="field">Full Name *</label><input id="f_name">
       <label class="field">Unit *</label><select id="f_unit"><option value="">Select a vacant unit…</option>${opts}</select>
       <label class="field">Phone *</label><input id="f_phone">
@@ -5791,6 +6018,12 @@ async function renderAddTenant() {
       <div><label class="field">Emergency Phone</label><input id="f_emergency_phone"></div></div>
       <label class="field">Monthly Rent (UGX)</label><input id="f_rent" inputmode="numeric">
       <label class="field">Move-in Date *</label><input id="f_entry_date" type="date" value="${todayStr()}">
+      <div id="existingFields" style="display:none;">
+        <label class="field">Current Due Date *</label><input id="f_due_date" type="date">
+        <label class="field">Current Status</label>
+        <select id="f_status"><option value="Pending">Pending (rent owed)</option><option value="Confirmed">Confirmed (paid up)</option></select>
+        <label class="field">Last Payment Date</label><input id="f_pay_date" type="date">
+      </div>
       <label class="field">Notes</label><textarea id="f_notes" rows="2"></textarea>
       <div class="err" id="addErr"></div>
       <button class="btn btn-primary btn-full" style="margin-top:12px;" onclick="submitAddTenant()">Save Tenant</button>
@@ -5801,15 +6034,32 @@ async function renderAddTenant() {
     if (opt && opt.dataset.rent) $('#f_rent').value = opt.dataset.rent;
   });
 }
+function setAddTenantMode(existing) {
+  state._addTenantExisting = existing;
+  $('#modeNewBtn').classList.toggle('active', !existing);
+  $('#modeExistingBtn').classList.toggle('active', existing);
+  $('#existingFields').style.display = existing ? 'block' : 'none';
+  $('#modeHint').textContent = existing
+    ? 'This tenant already has rental history before being added here — fill in their current due date, status, and last payment date exactly as they stand today.'
+    : 'A brand-new tenant with no rental history yet — their due date is set automatically once their first payment is recorded.';
+}
 async function submitAddTenant(replace=false) {
   if (!replace && !_beginAction('submitAddTenant')) return;
   try {
+    const existing = !!state._addTenantExisting;
     const body = {
       name: $('#f_name').value, unit: $('#f_unit').value, phone: $('#f_phone').value,
       email: $('#f_email').value, occupation: $('#f_occupation').value,
       emergency_contact: $('#f_emergency_contact').value, emergency_phone: $('#f_emergency_phone').value,
       rent: $('#f_rent').value, entry_date: $('#f_entry_date').value, notes: $('#f_notes').value, replace,
+      existing_tenant: existing,
     };
+    if (existing) {
+      body.due_date = $('#f_due_date').value;
+      body.status = $('#f_status').value;
+      body.pay_date = $('#f_pay_date').value;
+      if (!body.due_date) { $('#addErr').textContent = 'Current due date is required for an existing tenant.'; return; }
+    }
     const d = await api('/api/tenants', {method:'POST', body: JSON.stringify(body)});
     if (d.ok) { toast('Tenant saved.'); state.tab='tenants'; render(); return; }
     if (d.error === 'unit_taken') {
@@ -5900,6 +6150,9 @@ async function renderTenantDetail(idx) {
         <button class="btn btn-ghost" onclick="openEditTenant(${idx})">✎ Edit Tenant</button>
         <button class="btn btn-danger" onclick="deleteTenant(${idx})">🗑 Delete Tenant</button>
       </div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn btn-ghost" onclick="openOldDataModal(${idx})">🕘 Add Old Data</button>
+      </div>
     </div>
 
     ${leaseProgressBlock(t)}
@@ -5943,7 +6196,7 @@ function txnRow(t, r, key, origI) {
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
       <span class="amt ${cancelled?'cancelled':''}">${fmt(r.amount)}</span>
-      ${!cancelled ? `<button class="icon-btn" style="width:30px;height:30px;background:var(--teal-soft);color:var(--teal-deep);font-size:13px;" onclick="cancelTxn(${t.index}, '${key}', ${origI})">↺</button>`:''}
+      ${!cancelled ? `<button class="icon-btn" style="width:30px;height:30px;background:var(--teal-soft);color:var(--teal-ink);font-size:13px;" onclick="cancelTxn(${t.index}, '${key}', ${origI})">↺</button>`:''}
     </div>
   </div>`;
 }
@@ -6006,6 +6259,102 @@ async function deleteTenant(idx) {
     if (!confirm('Permanently delete this tenant? This cannot be undone.')) return;
     const d = await api('/api/tenants/'+idx, {method:'DELETE'});
     if (d.ok) { closeModal(); toast('Tenant deleted.'); state.tab='tenants'; render(); }
+  } finally {
+    _endAction(_k);
+  }
+}
+
+// ── Add Old Data (admin backfill of pre-existing rental history) ──────
+// Lets the admin key in every past payment/instalment for a tenant who
+// was already renting before this app existed -- each row becomes one
+// history record, plus optional fields for where the tenant stands
+// *today* (current due date / status / last-payment date), which the
+// backend sets on the tenant record itself once every row is saved.
+let _oldData = { idx: null, rows: [] };
+
+function openOldDataModal(idx) {
+  _oldData = { idx, rows: [{ type: 'payment', date: '', to_date: '', amount: '', note: '' }] };
+  renderOldDataModal();
+}
+
+function renderOldDataModal() {
+  const rowsHtml = _oldData.rows.map((r, i) => `
+    <div class="card" style="margin-top:${i===0?'0':'10px'};padding:12px;">
+      <div class="row">
+        <div>
+          <label class="field">Type</label>
+          <select id="od_type_${i}" onchange="_oldData.rows[${i}].type=this.value;">
+            <option value="payment" ${r.type==='payment'?'selected':''}>Full Payment</option>
+            <option value="deposit" ${r.type==='deposit'?'selected':''}>Instalment / Deposit</option>
+          </select>
+        </div>
+        <div><label class="field">Amount (UGX)</label><input id="od_amount_${i}" value="${escapeHtml(String(r.amount))}" oninput="_oldData.rows[${i}].amount=this.value;"></div>
+      </div>
+      <div class="row">
+        <div><label class="field">Payment Date</label><input id="od_date_${i}" type="date" value="${r.date}" onchange="_oldData.rows[${i}].date=this.value;"></div>
+        <div><label class="field">Covers Up To (due date)</label><input id="od_to_${i}" type="date" value="${r.to_date}" onchange="_oldData.rows[${i}].to_date=this.value;"></div>
+      </div>
+      <label class="field">Note</label>
+      <input id="od_note_${i}" value="${escapeHtml(r.note)}" placeholder="e.g. paid in cash before app was set up" oninput="_oldData.rows[${i}].note=this.value;">
+      ${_oldData.rows.length > 1 ? `<button class="btn btn-ghost" style="margin-top:8px;" onclick="removeOldDataRow(${i})">✕ Remove row</button>` : ''}
+    </div>`).join('');
+
+  openModal(`
+    <h2>Add Old Data</h2>
+    <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
+      Enter this tenant's pre-existing transactions -- one row per past payment or instalment, with its date, due date, and amount. Add as many rows as you need.
+    </div>
+    <div id="oldDataRows">${rowsHtml}</div>
+    <button class="btn btn-ghost btn-full" style="margin-top:10px;" onclick="addOldDataRow()">＋ Add Another Row</button>
+    <hr class="sep">
+    <div class="section-title" style="margin-top:0;">Tenant's Current Standing (optional)</div>
+    <div class="row">
+      <div><label class="field">Current Due Date</label><input id="od_final_due" type="date"></div>
+      <div><label class="field">Status</label>
+        <select id="od_final_status">
+          <option value="">Leave as-is</option>
+          <option value="Confirmed">Confirmed</option>
+          <option value="Pending">Pending</option>
+        </select>
+      </div>
+    </div>
+    <label class="field">Additional Notes</label>
+    <input id="od_final_notes" placeholder="Appended to the tenant's notes">
+    <div class="err" id="oldDataErr"></div>
+    <button class="btn btn-primary btn-full" style="margin-top:12px;" onclick="submitOldData()">Save Old Data</button>
+  `);
+}
+
+function addOldDataRow() {
+  _oldData.rows.push({ type: 'payment', date: '', to_date: '', amount: '', note: '' });
+  renderOldDataModal();
+}
+function removeOldDataRow(i) {
+  _oldData.rows.splice(i, 1);
+  renderOldDataModal();
+}
+
+async function submitOldData() {
+  const idx = _oldData.idx;
+  const _k = `submitOldData:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    const records = _oldData.rows
+      .filter(r => r.date)
+      .map(r => ({ type: r.type, date: r.date, to_date: r.to_date, amount: r.amount, note: r.note }));
+    if (!records.length) { $('#oldDataErr').textContent = 'Enter at least one row with a payment date.'; return; }
+    const final_state = {
+      due_date: $('#od_final_due').value, status: $('#od_final_status').value,
+      notes: $('#od_final_notes').value,
+    };
+    const d = await api(`/api/tenants/${idx}/old-data`, {method:'POST', body: JSON.stringify({records, final_state})});
+    if (d.ok) {
+      closeModal();
+      toast(`Added ${d.result.added} old record${d.result.added===1?'':'s'}.`);
+      state.selectedIdx = idx; state.tab = 'tenant-detail'; render();
+    } else {
+      $('#oldDataErr').textContent = d.error || 'Could not save old data.';
+    }
   } finally {
     _endAction(_k);
   }
@@ -6302,8 +6651,8 @@ function unitRowHtml(u) {
         <div class="sub">${fmt(u.rent)}/mo · ${u.occupant ? 'Occupied: '+escapeHtml(u.occupant) : 'Vacant'}${u.location?' · '+escapeHtml(u.location):''}</div>
       </div>
       <div style="display:flex;gap:6px;">
-        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openEditUnit('${encodeURIComponent(u.name)}')">✎</button>
-        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openIncreaseRent('${encodeURIComponent(u.name)}', ${u.rent})">↑</button>
+        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-ink);font-size:13px;width:32px;height:32px;" onclick="openEditUnit('${encodeURIComponent(u.name)}')">✎</button>
+        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-ink);font-size:13px;width:32px;height:32px;" onclick="openIncreaseRent('${encodeURIComponent(u.name)}', ${u.rent})">↑</button>
       </div>
     </div>`;
 }
@@ -6341,9 +6690,9 @@ function paintUnits(d) {
   const filterRow = `<div class="filters">${unitFilters.map(([k,l])=>`<div class="filter-pill ${state.unitsFilter===k?'active':''}" data-uf="${k}">${l}</div>`).join('')}</div>`;
   const noMatchMsg = `<div class="card" style="padding:4px 12px;"><div class="empty">No ${state.unitsFilter} units.</div></div>`;
   let sections;
-  if (state.unitsFilter === 'occupied') sections = occupied.length ? section('Occupied', 'var(--teal-deep)', occupied) : noMatchMsg;
+  if (state.unitsFilter === 'occupied') sections = occupied.length ? section('Occupied', 'var(--teal-ink)', occupied) : noMatchMsg;
   else if (state.unitsFilter === 'vacant') sections = vacant.length ? section('Vacant', 'var(--muted)', vacant) : noMatchMsg;
-  else sections = section('Occupied', 'var(--teal-deep)', occupied) + section('Vacant', 'var(--muted)', vacant);
+  else sections = section('Occupied', 'var(--teal-ink)', occupied) + section('Vacant', 'var(--muted)', vacant);
   $('#main').innerHTML = `
     <button class="btn btn-primary btn-full" style="margin-bottom:14px;" onclick="openAddUnit()">＋ Add Unit</button>
     ${filterRow}
@@ -6513,10 +6862,10 @@ function paintHistory(d, dash, q) {
 
   const incomeCard = `<div class="card" style="background:var(--teal-soft2);border-color:var(--teal-soft);">
     <div class="section-title" style="margin-top:0;">Monthly Income — ${escapeHtml(dash.month_name || '')}</div>
-    <div style="font-family:var(--font-mono);font-size:24px;font-weight:600;color:var(--teal-deep);">${fmt(dash.month_income || 0)}</div>
+    <div style="font-family:var(--font-mono);font-size:24px;font-weight:600;color:var(--teal-ink);">${fmt(dash.month_income || 0)}</div>
     <div style="display:flex;gap:16px;margin-top:8px;font-size:12px;">
       <div><b style="color:var(--good);">${fmt(dash.full_payment_total || 0)}</b><div style="color:var(--muted);">Full</div></div>
-      <div><b style="color:var(--teal-deep);">${fmt(dash.deposit_total || 0)}</b><div style="color:var(--muted);">Deposits</div></div>
+      <div><b style="color:var(--teal-ink);">${fmt(dash.deposit_total || 0)}</b><div style="color:var(--muted);">Deposits</div></div>
       <div><b style="color:var(--danger);">${fmt(dash.cancelled_total || 0)}</b><div style="color:var(--muted);">Cancelled</div></div>
     </div>
   </div>`;
@@ -6609,8 +6958,8 @@ async function renderSettings() {
     </div>
     <div class="section-title">Reports</div>
     <div class="card">
-      <a class="linklike" href="api/export/excel">⬇ Download Excel (.xlsx)</a><br><br>
-      <a class="linklike" href="api/export/pdf">⬇ Download PDF Report</a>
+      <a class="linklike" href="javascript:void(0)" onclick="downloadFile('/api/export/excel','tenant_records.xlsx')">⬇ Download Excel (.xlsx)</a><br><br>
+      <a class="linklike" href="javascript:void(0)" onclick="downloadFile('/api/export/pdf','tenant_data.pdf')">⬇ Download PDF Report</a>
     </div>
     <div class="section-title">Danger Zone</div>
     <div class="card">
@@ -6731,16 +7080,16 @@ async function generateMonthlyReport() {
         </div>`).join('')
       : `<div class="hist-empty">No transactions in ${escapeHtml(report.month_label)}.</div>`;
     box.innerHTML = `
-      <div style="font-family:var(--font-mono);font-size:20px;font-weight:600;color:var(--teal-deep);margin-top:6px;">
+      <div style="font-family:var(--font-mono);font-size:20px;font-weight:600;color:var(--teal-ink);margin-top:6px;">
         ${fmt(report.grand_combined)}
       </div>
       <div style="display:flex;gap:16px;margin:6px 0 12px;font-size:12px;">
         <div><b style="color:var(--good);">${fmt(report.grand_pay)}</b><div style="color:var(--muted);">Full</div></div>
-        <div><b style="color:var(--teal-deep);">${fmt(report.grand_dep)}</b><div style="color:var(--muted);">Deposits</div></div>
+        <div><b style="color:var(--teal-ink);">${fmt(report.grand_dep)}</b><div style="color:var(--muted);">Deposits</div></div>
         <div><b style="color:var(--danger);">${fmt(report.grand_cancelled)}</b><div style="color:var(--muted);">Cancelled</div></div>
       </div>
       ${rowsHtml}
-      <a class="linklike" style="display:block;margin-top:12px;" href="api/export/monthly-excel?year=${year}&month=${month}">⬇ Download Monthly Excel (.xlsx)</a>
+      <a class="linklike" style="display:block;margin-top:12px;" href="javascript:void(0)" onclick="downloadFile('/api/export/monthly-excel?year=${year}&month=${month}','monthly_report.xlsx')">⬇ Download Monthly Excel (.xlsx)</a>
     `;
   } catch (e) {
     box.innerHTML = `<div class="sub" style="color:var(--danger);">Couldn't generate the report — check the connection and try again.</div>`;
