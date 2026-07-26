@@ -2805,8 +2805,8 @@ WAITING_HTML = """<!DOCTYPE html>
 <title>Tenant Management</title>
 <meta name="theme-color" content="#0B2B27">
 <meta name="color-scheme" content="dark">
-<link rel="icon" href="icon-192.png">
-<link rel="apple-touch-icon" href="icon-256.png">
+<link rel="icon" href="icon-192.png?v=2">
+<link rel="apple-touch-icon" href="icon-256.png?v=2">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -2944,12 +2944,12 @@ def manifest():
             # some platforms pick the wrong one when both are declared on
             # the same entry. The icon itself is a fully opaque square with
             # the house glyph inside the safe zone, so it works either way.
-            {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
-            {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable"},
-            {"src": "icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any"},
-            {"src": "icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "maskable"},
-            {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-            {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            {"src": "icon-192.png?v=2", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+            {"src": "icon-192.png?v=2", "sizes": "192x192", "type": "image/png", "purpose": "maskable"},
+            {"src": "icon-256.png?v=2", "sizes": "256x256", "type": "image/png", "purpose": "any"},
+            {"src": "icon-256.png?v=2", "sizes": "256x256", "type": "image/png", "purpose": "maskable"},
+            {"src": "icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            {"src": "icon-512.png?v=2", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
         ],
     })
 
@@ -2973,7 +2973,7 @@ const PARAMS = self.location.search;
 const ROOT_URL = './' + PARAMS;
 const MANIFEST_URL = './manifest.json' + PARAMS;
 // Relative, not root-absolute: resolved against this script's own URL.
-const SHELL_URLS = [ROOT_URL, MANIFEST_URL, './icon-192.png'];
+const SHELL_URLS = [ROOT_URL, MANIFEST_URL, './icon-192.png?v=2'];
 
 self.addEventListener('install', (evt) => {
   self.skipWaiting();
@@ -3475,6 +3475,11 @@ def get_tenant_months(idx):
         "cleared": cleared_months_list(t),
         "open": open_months_list(t, horizon),
         "deposit_paid": pre_paid,
+        # Straight from the source record, not the (never-populated)
+        # client-side state.tenants cache -- see loadMonthPicker() in the
+        # front end, which used to read state.tenants[idx].rent and always
+        # got undefined/0 since nothing ever wrote to that array.
+        "rent": parse_amount(t.get("rent", 0)),
     })
 
 
@@ -3964,8 +3969,8 @@ INDEX_HTML = """<!DOCTYPE html>
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#0B2B27">
 <meta name="color-scheme" content="light dark">
-<link rel="icon" href="icon-192.png">
-<link rel="apple-touch-icon" href="icon-256.png">
+<link rel="icon" href="icon-192.png?v=2">
+<link rel="apple-touch-icon" href="icon-256.png?v=2">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -4323,17 +4328,46 @@ INDEX_HTML = """<!DOCTYPE html>
   .splash-screen{
     position:fixed;inset:0;z-index:3000;background:var(--bg);color:var(--teal-deep);
     display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
-    transition:opacity .35s ease;
   }
   html[data-theme="dark"] .splash-screen{color:var(--teal-bright);}
-  .splash-screen.hidden{opacity:0;pointer-events:none;}
-  .splash-house{width:60px;height:60px;animation:splash-grow 1.1s ease-in-out infinite;}
+  /* Static fallback for prefers-reduced-motion (see hideSplash()) -- a
+     plain fade instead of the lunge/wipe below. */
+  .splash-screen.hidden{opacity:0;pointer-events:none;transition:opacity .25s ease;}
+  .splash-house{width:60px;height:60px;animation:splash-grow 1.1s ease-in-out infinite;transform-origin:center;}
   .splash-house svg{width:100%;height:100%;display:block;}
   @keyframes splash-grow{
     0%,100%{transform:scale(.72);opacity:.55;}
     50%{transform:scale(1.18);opacity:1;}
   }
-  .splash-label{font-family:var(--font-display);font-weight:600;font-size:15px;color:var(--muted);letter-spacing:.2px;}
+  .splash-label{font-family:var(--font-display);font-weight:600;font-size:15px;color:var(--muted);letter-spacing:.2px;transition:opacity .2s ease;}
+  /* Exit sequence, triggered once the dashboard's real data is actually
+     ready (see hideSplash()): the breathing icon stops pulsing and takes
+     one last lunge toward the viewer, scaling past the edges of the
+     screen as it fades ("magnifies completely out") -- then, instead of
+     just cutting to the app underneath, a circular wipe opens from that
+     same center point so the real data is revealed through an expanding
+     porthole rather than appearing abruptly. Both are pure CSS transforms
+     (no layout thrash), so they stay smooth even on low-end phones. */
+  .splash-screen.exiting .splash-house{
+    animation: splash-lunge .55s cubic-bezier(.5,0,.85,0) forwards;
+  }
+  .splash-screen.exiting .splash-label{ opacity:0; }
+  @keyframes splash-lunge{
+    0%{transform:scale(1);opacity:1;}
+    70%{transform:scale(7);opacity:1;}
+    100%{transform:scale(13);opacity:0;}
+  }
+  .splash-screen.wiping{
+    animation: splash-wipe .5s cubic-bezier(.4,0,.2,1) forwards;
+  }
+  @keyframes splash-wipe{
+    from{clip-path:circle(150% at 50% 50%);}
+    to{clip-path:circle(0% at 50% 50%);}
+  }
+  @media (prefers-reduced-motion: reduce){
+    .splash-screen.exiting .splash-house{animation:none;opacity:0;transition:opacity .25s ease;}
+    .splash-screen.wiping{animation:none;}
+  }
   .lockscreen{
     position:fixed;inset:0;background:radial-gradient(120% 100% at 50% 0%,#164740 0%,#0B2B27 55%,#081D1A 100%);
     z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;padding:24px;
@@ -5931,7 +5965,12 @@ let _mp = { open: [], cleared: [], selected: 0, pending: 0, rent: 0, prepaid: 0 
 
 async function loadMonthPicker(idx) {
   const d = await api(`/api/tenants/${idx}/months`);
-  const rent = (state.tenants[idx] && state.tenants[idx].rent) || 0;
+  // Rent now comes straight from this same response (see get_tenant_months
+  // server-side) instead of state.tenants[idx].rent -- that array was never
+  // actually populated anywhere in this file, so rent was always 0 here,
+  // which made the Amount field always compute to 0 regardless of how many
+  // months were ticked.
+  const rent = d.rent || 0;
   _mp = { open: d.open || [], cleared: d.cleared || [], selected: 0, pending: 0, rent, prepaid: d.deposit_paid || 0 };
 }
 
@@ -6199,13 +6238,8 @@ async function submitArrears(idx) {
 }
 
 // ── UNITS ────────────────────────────────────────────────────────────
-async function renderUnits() {
-  const d = await api('/api/units');
-  $('#headerSub').textContent = `${d.units.length} units`;
-  const unitsEmptyMsg = d.no_cache
-    ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
-    : `<div class="empty"><div class="big">🏢</div>No units yet.</div>`;
-  const rows = d.units.map(u => `
+function unitRowHtml(u) {
+  return `
     <div class="tenant-row" style="cursor:default;">
       <div class="avatar">🏢</div>
       <div class="meta">
@@ -6216,10 +6250,35 @@ async function renderUnits() {
         <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openEditUnit('${encodeURIComponent(u.name)}')">✎</button>
         <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openIncreaseRent('${encodeURIComponent(u.name)}', ${u.rent})">↑</button>
       </div>
-    </div>`).join('') || unitsEmptyMsg;
+    </div>`;
+}
+async function renderUnits() {
+  const d = await api('/api/units');
+  $('#headerSub').textContent = `${d.units.length} units`;
+  const unitsEmptyMsg = d.no_cache
+    ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
+    : `<div class="empty"><div class="big">🏢</div>No units yet.</div>`;
+  if (!d.units.length) {
+    $('#main').innerHTML = `
+      <button class="btn btn-primary btn-full" style="margin-bottom:14px;" onclick="openAddUnit()">＋ Add Unit</button>
+      <div class="card" style="padding:4px 12px;">${unitsEmptyMsg}</div>
+    `;
+    return;
+  }
+  // Split into Occupied / Vacant sections rather than one flat list, so
+  // it's immediately clear at a glance how many units are free.
+  const occupied = d.units.filter(u => u.occupant);
+  const vacant = d.units.filter(u => !u.occupant);
+  const section = (title, color, list) => list.length ? `
+    <div class="section-title" style="display:flex;align-items:center;gap:8px;margin:${title==='Occupied'?'0':'18px'} 0 6px;">
+      <span>${title}</span>
+      <span style="background:${color};color:#fff;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700;">${list.length}</span>
+    </div>
+    <div class="card" style="padding:4px 12px;">${list.map(unitRowHtml).join('')}</div>` : '';
   $('#main').innerHTML = `
     <button class="btn btn-primary btn-full" style="margin-bottom:14px;" onclick="openAddUnit()">＋ Add Unit</button>
-    <div class="card" style="padding:4px 12px;">${rows}</div>
+    ${section('Occupied', 'var(--teal-deep)', occupied)}
+    ${section('Vacant', 'var(--muted)', vacant)}
   `;
 }
 function openAddUnit() {
@@ -6653,8 +6712,19 @@ function hideSplash() {
   const s = $('#splashScreen');
   if (!s || s.dataset.hidden) return;
   s.dataset.hidden = '1';
-  s.classList.add('hidden');
-  setTimeout(() => { if (s) s.style.display = 'none'; }, 400);
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    s.classList.add('hidden');
+    setTimeout(() => { if (s) s.style.display = 'none'; }, 300);
+    return;
+  }
+  // Stage 1: icon lunges toward the viewer and fades (.exiting, 550ms).
+  // Stage 2, started partway through stage 1 so the two read as one
+  // continuous motion rather than two separate steps: a circular wipe
+  // opens from the same center point, revealing the now-ready dashboard
+  // underneath (.wiping, 500ms). See the matching @keyframes above.
+  s.classList.add('exiting');
+  setTimeout(() => { if (s) s.classList.add('wiping'); }, 300);
+  setTimeout(() => { if (s) s.style.display = 'none'; }, 850);
 }
 // Safety net: never leave the splash stuck on screen if something above
 // goes wrong (e.g. an unexpected error before init() reaches a branch
