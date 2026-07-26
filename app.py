@@ -32,7 +32,7 @@ from urllib.parse import quote
 from datetime import datetime, date, timezone
 
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from reportlab.lib.pagesizes import A4
@@ -1681,7 +1681,7 @@ def record_payment(t, months):
     rent = parse_amount(t.get("rent", 0))
     total = rent * months
 
-    # Net off any partial deposit/instalment already sitting on the
+    # Net off any partial deposit/installment already sitting on the
     # account for the current cycle -- e.g. the tenant put down half of
     # this month's rent earlier, then comes back to pay the month off in
     # full. Without this, "amount" below would always be rent*months
@@ -1731,17 +1731,17 @@ def record_payment(t, months):
             "credited_from_deposit": credited_from_deposit}
 
 
-def record_deposit(t, months, instalment):
+def record_deposit(t, months, installment):
     """`months` is the number of consecutive open months ticked in the
-    month picker; the instalment accumulates toward rent x months."""
+    month picker; the installment accumulates toward rent x months."""
     months = max(1, int(months))
 
     rent_target = parse_amount(t.get("rent", 0))
     dep_paid_so_far = deposit_paid_so_far(t)
     effective_target = rent_target * months
     balance_before = max(0.0, effective_target - dep_paid_so_far)
-    excess = max(0.0, instalment - balance_before)
-    applied_amount = instalment - excess
+    excess = max(0.0, installment - balance_before)
+    applied_amount = installment - excess
     new_balance = max(0.0, effective_target - dep_paid_so_far - applied_amount)
     pay_date = date.today().strftime("%Y-%m-%d")
 
@@ -1830,7 +1830,7 @@ def cancel_transaction(t, h_key, idx):
 def add_old_data(t, records, final_state=None):
     """Backfills a tenant's pre-existing rental history in one go -- for a
     tenant who was already renting before this app was set up, where the
-    admin knows every past payment/instalment/due-date and is entering it
+    admin knows every past payment/installment/due-date and is entering it
     from paper records / memory rather than the app having computed it
     live. Each item in `records` becomes one payment_history or
     deposit_history entry, same shape as record_payment/record_deposit
@@ -1847,6 +1847,7 @@ def add_old_data(t, records, final_state=None):
 
     Returns {"added": n} on success."""
     added = 0
+    today_str = date.today().strftime("%Y-%m-%d")
     for rec in records or []:
         kind = "deposit_history" if rec.get("type") == "deposit" else "payment_history"
         txn_date = (rec.get("date") or "").strip()
@@ -1854,15 +1855,31 @@ def add_old_data(t, records, final_state=None):
             datetime.strptime(txn_date, "%Y-%m-%d")
         except ValueError:
             continue  # skip malformed rows rather than fail the whole batch
+        if txn_date >= today_str:
+            continue  # old data must predate today
+        from_date = (rec.get("from_date") or "").strip()
+        if from_date:
+            try:
+                datetime.strptime(from_date, "%Y-%m-%d")
+            except ValueError:
+                from_date = ""
         to_date = (rec.get("to_date") or "").strip()
         if to_date:
             try:
                 datetime.strptime(to_date, "%Y-%m-%d")
             except ValueError:
                 to_date = ""
-        from_date = (rec.get("from_date") or "").strip()
-        if not from_date and to_date:
+        if from_date:
+            # "To" always equals exactly one month after "From" -- ignore
+            # whatever the client sent and recompute so the two can never
+            # drift apart, whether due to a stale value or a tampered request.
+            to_date = add_months(_parse_date(from_date), 1).strftime("%Y-%m-%d")
+        elif not from_date and to_date:
             from_date = add_months(_parse_date(to_date), -1).strftime("%Y-%m-%d")
+        if from_date and from_date >= today_str:
+            continue
+        if to_date and to_date >= today_str:
+            continue
         amount = parse_amount(rec.get("amount", 0))
         note = (rec.get("note") or "").strip()
         entry = {
@@ -1998,20 +2015,15 @@ def export_monthly_excel(report):
     """Writes a single "Monthly Transactions" sheet for one month, styled to
     match the desktop app's dedicated monthly export (separate from the
     all-time Transaction History workbook produced by export_excel())."""
-    C_WHITE, C_GREY_H, C_CANCEL, C_TOTAL = "FFFFFF", "DDDDDD", "FFF0F0", "F0F7FF"
-
     def side():
         s = Side(style="thin", color="000000")
         return Border(left=s, right=s, top=s, bottom=s)
 
     def bold(sz=11):
-        return Font(name="Calibri", bold=True, size=sz, color="000000")
+        return Font(name="Calibri", bold=True, size=sz)
 
     def reg(sz=10):
-        return Font(name="Calibri", size=sz, color="000000")
-
-    def strike(sz=10):
-        return Font(name="Calibri", size=sz, color="000000", strike=True)
+        return Font(name="Calibri", size=sz)
 
     def ctr():
         return Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -2028,8 +2040,7 @@ def export_monthly_excel(report):
     title = ws["A1"]
     title.value = f"Monthly Transactions — {report['month_label']}"
     title.alignment = ctr()
-    title.fill = PatternFill("solid", fgColor="1A73E8")
-    title.font = Font(name="Calibri", bold=True, size=13, color="FFFFFF")
+    title.font = Font(name="Calibri", bold=True, size=13)
     ws.row_dimensions[1].height = 30
 
     hdrs = ["#", "TENANT", "UNIT", "DATE", "TYPE", "AMOUNT (UGX)", "FROM", "TO", "NOTE"]
@@ -2037,7 +2048,6 @@ def export_monthly_excel(report):
     for ci, (h, cw) in enumerate(zip(hdrs, widths), 1):
         cell = ws.cell(row=2, column=ci, value=h)
         cell.font = bold(10)
-        cell.fill = PatternFill("solid", fgColor=C_GREY_H)
         cell.alignment = ctr()
         cell.border = side()
         ws.column_dimensions[get_column_letter(ci)].width = cw
@@ -2046,19 +2056,18 @@ def export_monthly_excel(report):
     row_num = 3
     for seq, dr in enumerate(report["detail_rows"], 1):
         is_c = dr["is_cancelled"]
-        fgc = C_WHITE if not is_c else C_CANCEL
+        txn_type = dr["txn_type"] + (" (Cancelled)" if is_c else "")
         note = f"Cancelled on {dr['cancelled_on']}" if is_c else ""
         row_vals = [
             (seq, ctr()), (dr["name"], lft()), (dr["unit"], ctr()),
-            (dr["date"], ctr()), (dr["txn_type"], ctr()), (dr["amount"], ctr()),
+            (dr["date"], ctr()), (txn_type, ctr()), (dr["amount"], ctr()),
             (dr["from_d"], ctr()), (dr["to_d"], ctr()), (note, lft()),
         ]
         for ci, (val, aln) in enumerate(row_vals, 1):
             cell = ws.cell(row=row_num, column=ci, value=val)
-            cell.fill = PatternFill("solid", fgColor=fgc)
             cell.border = side()
             cell.alignment = aln
-            cell.font = strike(10) if is_c else (bold(10) if ci in (2, 6) else reg(10))
+            cell.font = bold(10) if ci in (2, 6) else reg(10)
         ws.row_dimensions[row_num].height = 20
         row_num += 1
 
@@ -2069,18 +2078,16 @@ def export_monthly_excel(report):
     ws.merge_cells(f"A{row_num}:E{row_num}")
     tc = ws.cell(row=row_num, column=1, value="TOTALS")
     tc.font, tc.alignment, tc.border = bold(11), ctr(), side()
-    tc.fill = PatternFill("solid", fgColor=C_TOTAL)
     for ci in range(2, 6):
         c2 = ws.cell(row=row_num, column=ci)
-        c2.fill, c2.border = PatternFill("solid", fgColor=C_TOTAL), side()
+        c2.border = side()
     pay_cell = ws.cell(row=row_num, column=6,
                         value=f"Pay: {report['grand_pay']:,}  Dep: {int(report['grand_dep']):,}  "
                               f"Cancelled: {int(report['grand_cancelled']):,}")
     pay_cell.font, pay_cell.alignment, pay_cell.border = bold(10), ctr(), side()
-    pay_cell.fill = PatternFill("solid", fgColor=C_TOTAL)
     for ci in range(7, 10):
         c3 = ws.cell(row=row_num, column=ci, value="")
-        c3.fill, c3.border = PatternFill("solid", fgColor=C_TOTAL), side()
+        c3.border = side()
     ws.row_dimensions[row_num].height = 22
 
     monthly_path = os.path.join(DATA_DIR, f"monthly_{report['prefix'].replace('-', '_')}.xlsx")
@@ -2091,21 +2098,16 @@ def export_monthly_excel(report):
 # ── exports (ported near-verbatim from desktop app) ─────────────────────
 def export_excel(data):
     wb = openpyxl.Workbook()
-    C_WHITE = "FFFFFF"
-    C_BLACK = "000000"
 
     def thin_border():
         s = Side(style="thin", color="000000")
         return Border(left=s, right=s, top=s, bottom=s)
 
     def bold(sz=11):
-        return Font(name="Calibri", bold=True, size=sz, color=C_BLACK)
+        return Font(name="Calibri", bold=True, size=sz)
 
     def reg(sz=10):
-        return Font(name="Calibri", size=sz, color=C_BLACK)
-
-    def cancelled_font(sz=10):
-        return Font(name="Calibri", size=sz, color=C_BLACK, strike=True)
+        return Font(name="Calibri", size=sz)
 
     def center():
         return Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -2124,7 +2126,6 @@ def export_excel(data):
     for ci, (h, cw) in enumerate(zip(hdrs, col_widths), 1):
         cell = ws.cell(row=1, column=ci, value=h)
         cell.font = bold(10)
-        cell.fill = PatternFill("solid", fgColor="DDDDDD")
         cell.alignment = center()
         cell.border = thin_border()
         ws.column_dimensions[get_column_letter(ci)].width = cw
@@ -2160,13 +2161,9 @@ def export_excel(data):
             ]
             for ci, (val, aln) in enumerate(row_vals, 1):
                 cell = ws.cell(row=row_num, column=ci, value=val)
-                cell.fill = PatternFill("solid", fgColor=C_WHITE)
                 cell.border = thin_border()
                 cell.alignment = aln
-                if is_cancelled:
-                    cell.font = cancelled_font(10)
-                else:
-                    cell.font = bold(10) if ci in (2, 6) else reg(10)
+                cell.font = bold(10) if ci in (2, 6) else reg(10)
             ws.row_dimensions[row_num].height = 20
             row_num += 1
       except Exception:
@@ -2190,12 +2187,9 @@ def export_pdf(data):
     )
     W = A4[0] - 36 * mm
     styles = getSampleStyleSheet()
-    H1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=18,
-                         textColor=colors.HexColor("#0E4F4F"), spaceAfter=4)
-    H2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13,
-                         textColor=colors.HexColor("#1FAD9F"), spaceAfter=2, spaceBefore=10)
-    MUTED = ParagraphStyle("MUTED", parent=styles["Normal"], fontSize=9,
-                            textColor=colors.HexColor("#6E8482"))
+    H1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=18, spaceAfter=4)
+    H2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13, spaceAfter=2, spaceBefore=10)
+    MUTED = ParagraphStyle("MUTED", parent=styles["Normal"], fontSize=9)
     BOLD = ParagraphStyle("BOLD", parent=styles["Normal"], fontSize=10, fontName="Helvetica-Bold")
 
     story = []
@@ -2203,7 +2197,7 @@ def export_pdf(data):
     story.append(Spacer(1, 10 * mm))
     story.append(Paragraph(APP_NAME, H1))
     story.append(Paragraph(f"Data Export — {today_str}", MUTED))
-    story.append(HRFlowable(width=W, thickness=1, color=colors.HexColor("#1FAD9F"), spaceAfter=8))
+    story.append(HRFlowable(width=W, thickness=1, color=colors.black, spaceAfter=8))
 
     tenants = data.get("tenants", [])
     units = data.get("units", {})
@@ -2230,17 +2224,14 @@ def export_pdf(data):
         [str(len(tenants)), str(len(units)), f"UGX {total_collected:,}", today_str],
     ]
     ts = TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0E4F4F")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTSIZE", (0, 0), (-1, 0), 10),
-        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#EAF7F4")),
         ("FONTSIZE", (0, 1), (-1, 1), 11),
         ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#1FAD9F")),
-        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0D4D0")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.black),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ])
@@ -2256,13 +2247,10 @@ def export_pdf(data):
             tenant_name = next((t.get("name", "Unnamed") for t in tenants if t.get("unit") == h), "Vacant")
             house_rows.append([h, f"{int(rent):,}", location or "—", tenant_name])
         ht = TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1FAD9F")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F0FAF8")]),
-            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#B0D4D0")),
-            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0E8E4")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.black),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ])
@@ -2295,11 +2283,8 @@ def export_pdf(data):
                 ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
                 ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#6E8482")),
-                ("TEXTCOLOR", (2, 0), (2, -1), colors.HexColor("#6E8482")),
-                ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.HexColor("#F6FBFA"), colors.white]),
-                ("BOX", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0E8E4")),
-                ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.HexColor("#E0F0EC")),
+                ("BOX", (0, 0), (-1, -1), 0.3, colors.black),
+                ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.black),
                 ("TOPPADDING", (0, 0), (-1, -1), 3),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ])
@@ -2314,21 +2299,19 @@ def export_pdf(data):
                                       fmt_period(rec.get("from_date", ""), rec.get("to_date", "")),
                                       str(rec.get("months", 1)), f"{int(rec.get('amount', 0)):,}"])
                 pt = TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF7F4")),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("FONTSIZE", (0, 0), (-1, -1), 8),
                     ("ALIGN", (0, 0), (0, -1), "CENTER"),
                     ("ALIGN", (4, 0), (4, -1), "RIGHT"),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F6FBFA")]),
-                    ("BOX", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0D4D0")),
-                    ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.HexColor("#D8EEEA")),
+                    ("BOX", (0, 0), (-1, -1), 0.3, colors.black),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.black),
                     ("TOPPADDING", (0, 0), (-1, -1), 3),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
                 ])
                 story.append(Table(pay_rows, colWidths=[W * 0.06, W * 0.18, W * 0.32, W * 0.12, W * 0.32], style=pt))
             else:
                 story.append(Paragraph("No payments recorded yet.", MUTED))
-            story.append(HRFlowable(width=W, thickness=0.5, color=colors.HexColor("#C8E0DC"),
+            story.append(HRFlowable(width=W, thickness=0.5, color=colors.black,
                                      spaceAfter=4, spaceBefore=4))
     doc.build(story)
     return PDF_FILE
@@ -3799,7 +3782,7 @@ def edit_tenant(idx):
 @app.route("/api/tenants/<int:idx>/old-data", methods=["POST"])
 def do_add_old_data(idx):
     """Lets the admin backfill a tenant's pre-existing rental history --
-    every past payment/instalment plus the tenant's current standing --
+    every past payment/installment plus the tenant's current standing --
     in one batch, for a tenant who was renting before this app existed.
     Already covered by the same session-unlock gate as every other /api/
     call (see _guard()), so no extra PIN check here."""
@@ -3841,15 +3824,15 @@ def do_record_payment(idx):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
 
-    # Once a tenant has an instalment/deposit plan in progress, full
+    # Once a tenant has an installment/deposit plan in progress, full
     # "Pay Rent" is locked until that balance reaches zero -- enforced
     # here (not just hidden in the UI) so it holds for every caller,
     # including direct API calls, not just the phone-app button.
     _, dep_remaining, dep_cleared, dep_in_progress = current_deposit_cycle(t)
     if dep_in_progress and not dep_cleared:
         return jsonify({"ok": False,
-            "error": f"An instalment plan is in progress (UGX {int(dep_remaining):,} "
-                     f"still remaining) — record instalments until the balance reaches "
+            "error": f"An installment plan is in progress (UGX {int(dep_remaining):,} "
+                     f"still remaining) — record installments until the balance reaches "
                      f"zero before paying rent in full."}), 400
 
     body = request.get_json(force=True) or {}
@@ -3880,13 +3863,13 @@ def do_record_deposit(idx):
     except (ValueError, TypeError):
         return jsonify({"ok": False, "error": "Select at least one month."}), 400
     try:
-        instalment = float(str(body.get("amount", "")).strip().replace(",", ""))
-        if instalment <= 0:
+        installment = float(str(body.get("amount", "")).strip().replace(",", ""))
+        if installment <= 0:
             raise ValueError
     except (ValueError, TypeError):
         return jsonify({"ok": False, "error": "Enter a valid deposit amount greater than zero."}), 400
 
-    result = record_deposit(t, months, instalment)
+    result = record_deposit(t, months, installment)
     save_state(data)
     return jsonify({"ok": True, "result": result})
 
@@ -4617,7 +4600,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .txn-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:13px;}
   .txn-item:last-child{border-bottom:none;}
   .txn-item .amt{font-weight:600;font-size:14px;}
-  .txn-item .amt.cancelled{text-decoration:line-through;color:var(--muted);font-weight:500;}
+  .txn-item .amt.cancelled{color:var(--danger);font-weight:500;}
   .badge-dot{
     position:absolute;top:-4px;right:-4px;background:var(--danger);color:#fff;font-size:10px;font-weight:700;
     min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 3px;
@@ -4710,6 +4693,23 @@ const $ = (sel, el=document) => el.querySelector(sel);
 const $$ = (sel, el=document) => [...el.querySelectorAll(sel)];
 const fmt = n => 'UGX ' + Math.round(n||0).toLocaleString();
 const todayStr = () => new Date().toISOString().slice(0,10);
+// Adds `n` (whole, possibly negative) months to an ISO date string,
+// clamping the day to the target month's length -- mirrors the
+// server-side add_months() so autofilled/derived dates always agree
+// with what the backend would compute for the same input.
+function addMonthsISO(dateStr, n) {
+  if (!dateStr) return '';
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (!y || !m || !d) return '';
+  const totalMonthIndex = (m - 1) + n;
+  const ny = y + Math.floor(totalMonthIndex / 12);
+  const nm = ((totalMonthIndex % 12) + 12) % 12 + 1;
+  const lastDay = new Date(ny, nm, 0).getDate();
+  const nd = Math.min(d, lastDay);
+  const pad = x => String(x).padStart(2, '0');
+  return `${ny}-${pad(nm)}-${pad(nd)}`;
+}
+const oneMonthAheadISO = dateStr => addMonthsISO(dateStr, 1);
 
 // ── theme (Light/Dark, set in Settings) ────────────────────────────────
 // The bootstrap <script> in <head> already set data-theme before this
@@ -5976,7 +5976,7 @@ async function renderTenants() {
 }
 function paintTenants(d) {
   $('#headerSub').textContent = `${d.tenants.length} shown`;
-  const filters = [['all','All'],['paid','Paid'],['underpaid','Instalments'],['pending','Pending']];
+  const filters = [['all','All'],['paid','Paid'],['underpaid','Installments'],['pending','Pending']];
   const emptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
     : `<div class="empty"><div class="big">👤</div>No tenants match.</div>`;
@@ -6111,7 +6111,7 @@ async function renderTenantDetail(idx) {
   const depPct = t.rent>0 ? Math.min(100, Math.round((t.deposit_paid/t.rent)*100)) : 0;
   const depBlock = (t.level==='underpaid') ? `
     <div class="card">
-      <div class="section-title" style="margin-top:0;">Instalment Progress</div>
+      <div class="section-title" style="margin-top:0;">Installment Progress</div>
       <div style="display:flex;justify-content:space-between;font-size:13px;"><span>${fmt(t.deposit_paid)} paid</span><span>${fmt(t.deposit_remaining)} left</span></div>
       <div class="progress-bar"><div style="width:${depPct}%"></div></div>
     </div>` : '';
@@ -6166,18 +6166,18 @@ async function renderTenantDetail(idx) {
           : `<button class="btn btn-primary" onclick="openPaymentModal(${idx})">💳 Pay Rent</button>`}
       </div>
       <div class="row" style="margin-top:10px;">
-        <button class="btn btn-ghost" onclick="openDepositModal(${idx})">＋ Record Instalment</button>
+        <button class="btn btn-ghost" onclick="openDepositModal(${idx})">＋ Record Installment</button>
       </div>
       ${t.level === 'underpaid'
-        ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">🔒 Pay Rent is locked while an instalment plan is in progress. Keep recording instalments until the balance reaches zero.</div>`
+        ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">🔒 Pay Rent is locked while an installment plan is in progress. Keep recording installments until the balance reaches zero.</div>`
         : ''}
     </div>
 
     <div class="section-title">Payment History</div>
     <div class="card" style="padding:4px 14px;">${payHist || '<div class="empty" style="padding:16px;">No full payments yet.</div>'}</div>
 
-    <div class="section-title">Instalment / Deposit History</div>
-    <div class="card" style="padding:4px 14px;">${depHist || '<div class="empty" style="padding:16px;">No instalments yet.</div>'}</div>
+    <div class="section-title">Installment / Deposit History</div>
+    <div class="card" style="padding:4px 14px;">${depHist || '<div class="empty" style="padding:16px;">No installments yet.</div>'}</div>
   `;
 }
 // history arrays are returned reversed (most-recent-first); recover original index for cancel calls
@@ -6265,19 +6265,40 @@ async function deleteTenant(idx) {
 }
 
 // ── Add Old Data (admin backfill of pre-existing rental history) ──────
-// Lets the admin key in every past payment/instalment for a tenant who
+// Lets the admin key in every past payment/installment for a tenant who
 // was already renting before this app existed -- each row becomes one
 // history record, plus optional fields for where the tenant stands
 // *today* (current due date / status / last-payment date), which the
 // backend sets on the tenant record itself once every row is saved.
 let _oldData = { idx: null, rows: [] };
 
+// Every date entered in this modal describes something that already
+// happened, so none of them may land on or after today -- this is the
+// shared upper bound (exclusive) applied to the Payment Date, Covers
+// From, and Covers To fields via the <input type="date" max="..."> attr.
+function _oldDataMaxDateExclusive() {
+  // "less than the current date" -- one day before today.
+  const t = todayStr().split('-').map(Number);
+  const d = new Date(t[0], t[1] - 1, t[2]);
+  d.setDate(d.getDate() - 1);
+  const pad = x => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+}
+
 function openOldDataModal(idx) {
-  _oldData = { idx, rows: [{ type: 'payment', date: '', to_date: '', amount: '', note: '' }] };
+  _oldData = { idx, rows: [{ type: 'payment', date: '', from_date: '', to_date: '', amount: '', note: '' }] };
   renderOldDataModal();
 }
 
+function _oldDataSetFrom(i, val) {
+  _oldData.rows[i].from_date = val;
+  _oldData.rows[i].to_date = oneMonthAheadISO(val);
+  const toEl = document.getElementById(`od_to_${i}`);
+  if (toEl) toEl.value = _oldData.rows[i].to_date;
+}
+
 function renderOldDataModal() {
+  const maxDate = _oldDataMaxDateExclusive();
   const rowsHtml = _oldData.rows.map((r, i) => `
     <div class="card" style="margin-top:${i===0?'0':'10px'};padding:12px;">
       <div class="row">
@@ -6285,16 +6306,24 @@ function renderOldDataModal() {
           <label class="field">Type</label>
           <select id="od_type_${i}" onchange="_oldData.rows[${i}].type=this.value;">
             <option value="payment" ${r.type==='payment'?'selected':''}>Full Payment</option>
-            <option value="deposit" ${r.type==='deposit'?'selected':''}>Instalment / Deposit</option>
+            <option value="deposit" ${r.type==='deposit'?'selected':''}>Installment / Deposit</option>
           </select>
         </div>
         <div><label class="field">Amount (UGX)</label><input id="od_amount_${i}" value="${escapeHtml(String(r.amount))}" oninput="_oldData.rows[${i}].amount=this.value;"></div>
       </div>
       <div class="row">
-        <div><label class="field">Payment Date</label><input id="od_date_${i}" type="date" value="${r.date}" onchange="_oldData.rows[${i}].date=this.value;"></div>
-        <div><label class="field">Covers Up To (due date)</label><input id="od_to_${i}" type="date" value="${r.to_date}" onchange="_oldData.rows[${i}].to_date=this.value;"></div>
+        <div><label class="field">Payment Date</label><input id="od_date_${i}" type="date" max="${maxDate}" value="${r.date}" onchange="_oldData.rows[${i}].date=this.value;"></div>
+        <div><label class="field">Covers From</label><input id="od_from_${i}" type="date" max="${maxDate}" value="${r.from_date}" onchange="_oldDataSetFrom(${i}, this.value)"></div>
       </div>
-      <label class="field">Note</label>
+      <div class="row">
+        <div>
+          <label class="field">Covers To (due date)</label>
+          <input id="od_to_${i}" type="date" value="${r.to_date}" readonly disabled>
+        </div>
+        <div></div>
+      </div>
+      <div class="sub" style="color:var(--muted);font-size:11.5px;margin-top:2px;">"Covers To" auto-fills to exactly one month after "Covers From".</div>
+      <label class="field" style="margin-top:8px;">Note</label>
       <input id="od_note_${i}" value="${escapeHtml(r.note)}" placeholder="e.g. paid in cash before app was set up" oninput="_oldData.rows[${i}].note=this.value;">
       ${_oldData.rows.length > 1 ? `<button class="btn btn-ghost" style="margin-top:8px;" onclick="removeOldDataRow(${i})">✕ Remove row</button>` : ''}
     </div>`).join('');
@@ -6302,7 +6331,7 @@ function renderOldDataModal() {
   openModal(`
     <h2>Add Old Data</h2>
     <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
-      Enter this tenant's pre-existing transactions -- one row per past payment or instalment, with its date, due date, and amount. Add as many rows as you need.
+      Enter this tenant's pre-existing transactions -- one row per past payment or installment, with its date, covered period, and amount. All dates here must be before today. Add as many rows as you need.
     </div>
     <div id="oldDataRows">${rowsHtml}</div>
     <button class="btn btn-ghost btn-full" style="margin-top:10px;" onclick="addOldDataRow()">＋ Add Another Row</button>
@@ -6326,7 +6355,7 @@ function renderOldDataModal() {
 }
 
 function addOldDataRow() {
-  _oldData.rows.push({ type: 'payment', date: '', to_date: '', amount: '', note: '' });
+  _oldData.rows.push({ type: 'payment', date: '', from_date: '', to_date: '', amount: '', note: '' });
   renderOldDataModal();
 }
 function removeOldDataRow(i) {
@@ -6339,9 +6368,17 @@ async function submitOldData() {
   const _k = `submitOldData:${idx}`;
   if (!_beginAction(_k)) return;
   try {
-    const records = _oldData.rows
+    const maxDate = _oldDataMaxDateExclusive();
+    const rowsWithData = _oldData.rows.filter(r => r.date || r.from_date);
+    for (const r of rowsWithData) {
+      if ((r.date && r.date > maxDate) || (r.from_date && r.from_date > maxDate) || (r.to_date && r.to_date > maxDate)) {
+        $('#oldDataErr').textContent = 'All dates in Add Old Data must be before today.';
+        return;
+      }
+    }
+    const records = rowsWithData
       .filter(r => r.date)
-      .map(r => ({ type: r.type, date: r.date, to_date: r.to_date, amount: r.amount, note: r.note }));
+      .map(r => ({ type: r.type, date: r.date, from_date: r.from_date, to_date: r.to_date, amount: r.amount, note: r.note }));
     if (!records.length) { $('#oldDataErr').textContent = 'Enter at least one row with a payment date.'; return; }
     const final_state = {
       due_date: $('#od_final_due').value, status: $('#od_final_status').value,
@@ -6360,7 +6397,7 @@ async function submitOldData() {
   }
 }
 
-// ── Month picker (shared by Pay Rent + Record Instalment) ──────────────
+// ── Month picker (shared by Pay Rent + Record Installment) ──────────────
 // Months are always ticked contiguously starting from the tenant's first
 // still-open month: ticking a row ticks it and every open row before it;
 // unticking a row unticks it and every open row after it. Already-paid
@@ -6380,7 +6417,7 @@ async function loadMonthPicker(idx) {
 
 function monthPickerHtml(locked) {
   if (locked) {
-    // Used when an instalment balance is already outstanding on the
+    // Used when an installment balance is already outstanding on the
     // current month: no month-selection dropdown at all -- the current
     // month is the only thing payable until its balance clears, so there's
     // nothing to choose. Fields still populate live via updateMonthPickerFields.
@@ -6452,7 +6489,7 @@ function renderMonthPickerList() {
 
 function mpNetAmount() {
   // The actual amount still to be cleared for the ticked months -- not a
-  // flat rent*months -- if a deposit/instalment has already been paid
+  // flat rent*months -- if a deposit/installment has already been paid
   // toward the current open month, that credit is subtracted here so the
   // figure matches what's really left to collect.
   const gross = (_mp.rent || 0) * _mp.pending;
@@ -6475,7 +6512,7 @@ function updateMonthPickerFields() {
   // the ticked months) directly above the editable "Deposit" field, kept
   // in sync with the month picker here. "Deposit" itself is never
   // auto-filled -- the admin always types the actual amount handed
-  // over, since a deposit/instalment is often a partial amount rather
+  // over, since a deposit/installment is often a partial amount rather
   // than the full total.
   const amountEl = $('#d_amount');
   if (amountEl) amountEl.textContent = fmt(net);
@@ -6572,12 +6609,12 @@ async function submitPayment(idx) {
 async function openDepositModal(idx) {
   await loadMonthPicker(idx);
   // If there's already a partial balance on the current month (an
-  // instalment plan mid-way through), lock the picker to that one month --
+  // installment plan mid-way through), lock the picker to that one month --
   // no dropdown, no picking further months -- until it clears to zero.
   const locked = (_mp.prepaid || 0) > 0;
   if (locked) { _mp.pending = 1; _mp.selected = 1; }
   openModal(`
-    <h2>Record Instalment / Deposit</h2>
+    <h2>Record Installment / Deposit</h2>
     <div class="desc">${locked ? 'Continue clearing the balance for the current month below.' : "Partial payments accumulate toward the selected month(s)' rent."}</div>
     ${monthPickerHtml(locked)}
     <label class="field">Amount (UGX)</label>
@@ -6590,7 +6627,7 @@ async function openDepositModal(idx) {
       <span id="d_balance" style="font-family:var(--font-mono);color:var(--ink);">${fmt(0)}</span>
     </div>
     <div class="err" id="depErr"></div>
-    <button class="btn btn-primary btn-full" style="margin-top:12px;" id="txnSubmitBtn" ${locked ? '' : 'disabled'} onclick="submitDeposit(${idx})">＋ Record Instalment</button>
+    <button class="btn btn-primary btn-full" style="margin-top:12px;" id="txnSubmitBtn" ${locked ? '' : 'disabled'} onclick="submitDeposit(${idx})">＋ Record Installment</button>
   `);
   renderMonthPickerList();
   updateMonthPickerSummary();
@@ -6808,10 +6845,10 @@ function paintAlerts(d) {
   $('#headerSub').textContent = `${d.alerts.length} tenant(s) to watch`;
   const alertsEmptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
-    : (d.alerts.length ? `<div class="empty">No ${state.alertsFilter === 'pending' ? 'pending' : 'instalment'} tenants.</div>`
+    : (d.alerts.length ? `<div class="empty">No ${state.alertsFilter === 'pending' ? 'pending' : 'installment'} tenants.</div>`
       : `<div class="empty"><div class="big">✅</div>No alerts. Everyone's paid up.</div>`);
   const rows = alerts.map(tenantRowHtml).join('') || alertsEmptyMsg;
-  const alertFilters = [['pending','Pending'],['underpaid','Instalments']];
+  const alertFilters = [['pending','Pending'],['underpaid','Installments']];
   const filterRow = `<div class="filters">${alertFilters.map(([k,l])=>`<div class="filter-pill ${state.alertsFilter===k?'active':''}" data-af="${k}">${l}</div>`).join('')}</div>`;
   $('#main').innerHTML = `<div class="section-title">Overdue &amp; Upcoming</div>${filterRow}<div class="card" style="padding:4px 12px;">${rows}</div>`;
   $$('.filter-pill[data-af]').forEach(p => p.addEventListener('click', () => {
@@ -7085,7 +7122,7 @@ async function generateMonthlyReport() {
       </div>
       <div style="display:flex;gap:16px;margin:6px 0 12px;font-size:12px;">
         <div><b style="color:var(--good);">${fmt(report.grand_pay)}</b><div style="color:var(--muted);">Full</div></div>
-        <div><b style="color:var(--teal-ink);">${fmt(report.grand_dep)}</b><div style="color:var(--muted);">Deposits</div></div>
+        <div><b style="color:var(--teal-ink);">${fmt(report.grand_dep)}</b><div style="color:var(--muted);">Installments</div></div>
         <div><b style="color:var(--danger);">${fmt(report.grand_cancelled)}</b><div style="color:var(--muted);">Cancelled</div></div>
       </div>
       ${rowsHtml}
@@ -7241,4 +7278,3 @@ if __name__ == "__main__":
     # already shows its own QR code in-window — nothing should open on the PC.
 
     app.run(host="0.0.0.0", port=port, debug=False)
-    
