@@ -3445,6 +3445,7 @@ def remove_pin():
 def dashboard():
     data = load_state()
     tenants = _with_index(data["tenants"])
+    active = [t for t in tenants if not t.get("archived")]
     units = data["units"]
     today = date.today()
     month_name = today.strftime("%B")
@@ -3457,17 +3458,19 @@ def dashboard():
               if not r.get("_cancelled", False))
     )
     counts = {"paid": 0, "underpaid": 0, "pending": 0}
-    for t in tenants:
+    for t in active:
         level, _ = status_level(t, today)
         counts[level] += 1
 
-    occupied_units = {t.get("unit") for t in tenants if t.get("unit")}
+    occupied_units = {t.get("unit") for t in active if t.get("unit")}
     vacant = [u for u in units if u not in occupied_units]
     occupied = len(units) - len(vacant)
 
     # This-calendar-month income breakdown — mirrors the desktop app's
     # Dashboard "TOTAL INCOME" card exactly (full payments + deposits,
     # minus anything cancelled, all restricted to the current month).
+    # Sums over every tenant, archived included -- the money was actually
+    # collected this month regardless of who's since moved out.
     full_payment_total = int(
         sum(int(r.get("amount", 0)) for t in tenants for r in t.get("payment_history", [])
             if r.get("date", "").startswith(this_month) and not r.get("_cancelled", False)))
@@ -3481,12 +3484,12 @@ def dashboard():
               if r.get("date", "").startswith(this_month) and r.get("_cancelled", False)))
     month_income = full_payment_total + deposit_total
 
-    watchlist = get_watchlist_tenants(tenants, max_days=10)
+    watchlist = get_watchlist_tenants(active, max_days=10)
     watchlist_out = [_tenant_summary(t, today) | {"days_left": d} for t, d in watchlist[:8]]
 
     return jsonify({
         "app_name": APP_NAME,
-        "total_tenants": len(tenants),
+        "total_tenants": len(active),
         "total_units": len(units),
         "vacant_units": len(vacant),
         "occupied_units": occupied,
@@ -3521,6 +3524,8 @@ def _tenant_summary(t, today):
         "deposit_paid": dep_paid,
         "deposit_remaining": dep_remaining,
         "rent_increase_due": rent_increase_due(t),
+        "archived": bool(t.get("archived", False)),
+        "vacated_date": t.get("vacated_date", ""),
     }
 
 
@@ -3541,10 +3546,16 @@ def list_tenants():
 
     out = []
     for t in tenants:
+        is_archived = bool(t.get("archived", False))
+        if flt == "archived":
+            if not is_archived:
+                continue
+        elif is_archived:
+            continue  # past tenants stay out of the live roster by default
         summary = _tenant_summary(t, today)
         if q and q not in summary["name"].lower() and q not in summary["unit"].lower():
             continue
-        if flt != "all" and summary["level"] != flt:
+        if flt not in ("all", "archived") and summary["level"] != flt:
             continue
         out.append(summary)
     out.sort(key=lambda s: (s["days_left"] if s["days_left"] is not None else 99999))
@@ -3638,6 +3649,8 @@ def history():
         out.append({
             "index": t.get("_idx"), "name": name, "unit": unit,
             "entry_date": t.get("entry_date", "") or "—",
+            "archived": bool(t.get("archived", False)),
+            "vacated_date": t.get("vacated_date", ""),
             "transactions": out_txns,
         })
     out.sort(key=lambda r: r["name"].lower())
@@ -3647,7 +3660,7 @@ def history():
 @app.route("/api/units/vacant")
 def vacant_units():
     data = load_state()
-    occupied = {t.get("unit") for t in data["tenants"] if t.get("unit")}
+    occupied = {t.get("unit") for t in data["tenants"] if t.get("unit") and not t.get("archived")}
     exclude = request.args.get("exclude")
     if exclude:
         occupied.discard(exclude)
@@ -3723,6 +3736,7 @@ def add_tenant():
         "status": status, "pay_date": pay_date, "notes": notes,
         "payment_history": [], "deposit_history": [], "arrears_history": [],
         "locked_periods": [], "deposit_cycle_start": 0, "rent_increase_due": 0.0,
+        "archived": False, "vacated_date": "",
     }
     if existing_tenant and due_str:
         # Marks this tenant as having prior rental history (see
@@ -3739,14 +3753,27 @@ def add_tenant():
 
     data = load_state()
     for i, t in enumerate(data["tenants"]):
-        if t.get("unit") == unit:
+        # Only an ACTIVE (not already-archived) tenant blocks/triggers a
+        # replace on this unit -- an archived past tenant left behind on
+        # the unit for accountability should never stop a new one moving
+        # in, and should never itself get re-matched/re-archived here.
+        if t.get("unit") == unit and not t.get("archived"):
             if not replace:
                 return jsonify({"ok": False, "error": "unit_taken",
                                  "message": f"Unit {unit} is already assigned to "
                                             f"{t.get('name', 'Unnamed Tenant')}."}), 409
-            data["tenants"][i] = record
+            # Tenant turnover: the outgoing tenant is archived in place --
+            # their full payment_history/deposit_history/arrears_history
+            # stays attached to this unit for future accountability -- and
+            # the incoming tenant becomes a brand-new record rather than
+            # overwriting theirs, so the unit's record trail stays
+            # continuous instead of restarting from a blank slate.
+            t["archived"] = True
+            t["vacated_date"] = date.today().strftime("%Y-%m-%d")
             save_state(data)
-            return jsonify({"ok": True, "index": i})
+            data["tenants"].append(record)
+            save_state(data)
+            return jsonify({"ok": True, "index": len(data["tenants"]) - 1})
 
     data["tenants"].append(record)
     save_state(data)
@@ -3801,6 +3828,28 @@ def do_add_old_data(idx):
         return jsonify({"ok": False, "error": "None of the rows had a valid date (YYYY-MM-DD)."}), 400
     save_state(data)
     return jsonify({"ok": True, "result": result})
+
+
+@app.route("/api/tenants/<int:idx>/vacate", methods=["POST"])
+def vacate_tenant(idx):
+    """Marks a tenant as moved out without deleting them: their record
+    (and its full payment_history/deposit_history/arrears_history) stays
+    exactly as-is for future accountability, their unit frees up for a
+    new tenant, and they stop counting toward active-tenant totals,
+    occupancy, and rent-due alerts. Mirrors the archiving side of the
+    'replace' flow in add_tenant() -- this is that same step, offered on
+    its own for when there's no new tenant ready yet."""
+    data = load_state()
+    tenants = data["tenants"]
+    if idx < 0 or idx >= len(tenants):
+        return jsonify({"error": "not found"}), 404
+    t = tenants[idx]
+    if t.get("archived"):
+        return jsonify({"ok": False, "error": "This tenant is already marked as moved out."}), 400
+    t["archived"] = True
+    t["vacated_date"] = date.today().strftime("%Y-%m-%d")
+    save_state(data)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/tenants/<int:idx>", methods=["DELETE"])
@@ -3928,7 +3977,7 @@ def do_clear_arrears(idx):
 @app.route("/api/units")
 def list_units():
     data = load_state()
-    occupants = {t.get("unit"): t.get("name") for t in data["tenants"]}
+    occupants = {t.get("unit"): t.get("name") for t in data["tenants"] if not t.get("archived")}
     out = []
     for name, info in data["units"].items():
         rent = parse_amount(info.get("rent", 0) if isinstance(info, dict) else info)
@@ -4029,8 +4078,9 @@ def increase_rent(name):
 def alerts():
     data = load_state()
     tenants = _with_index(data["tenants"])
+    active = [t for t in tenants if not t.get("archived")]
     today = date.today()
-    items = get_watchlist_tenants(tenants, max_days=36500)
+    items = get_watchlist_tenants(active, max_days=36500)
     out = [_tenant_summary(t, today) | {"days_left": d} for t, d in items]
     return jsonify({"alerts": out})
 
@@ -4422,6 +4472,16 @@ INDEX_HTML = """<!DOCTYPE html>
   .hist-row.hist-cancelled{background:var(--danger-soft);color:var(--danger);}
   .hist-period{color:var(--muted);font-size:11px;font-family:var(--font-body);}
   .hist-row.hist-cancelled .hist-period{color:var(--danger);opacity:.8;}
+  .mr-row{
+    display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:9px 10px;font-size:12px;font-family:var(--font-mono);border-top:1px solid var(--line);
+  }
+  .mr-row .mr-name{
+    flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .mr-row .mr-amt{
+    flex:0 0 auto;white-space:nowrap;font-weight:700;
+  }
   .month-picker-control{
     width:100%;border:1.5px solid var(--line);border-radius:var(--radius-sm);padding:11px 12px;
     font-size:14px;background:var(--card);color:var(--ink);display:flex;align-items:center;
@@ -5923,14 +5983,16 @@ function tenantRowHtml(t) {
   const daysTxt = t.days_left===null||t.days_left===undefined ? '' :
     (t.days_left<0 ? `Overdue ${Math.abs(t.days_left)}d` : `${t.days_left}d left`);
   const initials = (t.name||'?').split(' ').filter(Boolean).slice(0,2).map(w=>w[0]).join('').toUpperCase();
-  const chip = (t._pending || t._pendingSync)
-    ? `<span class="chip chip-underpaid">🕓 Pending sync</span>`
-    : `<span class="chip ${chipClass}">${t.label}</span>`;
+  const chip = t.archived
+    ? `<span class="chip" style="background:var(--card-2);color:var(--muted);">Moved out${t.vacated_date ? ' ' + escapeHtml(t.vacated_date) : ''}</span>`
+    : (t._pending || t._pendingSync)
+      ? `<span class="chip chip-underpaid">🕓 Pending sync</span>`
+      : `<span class="chip ${chipClass}">${t.label}</span>`;
   return `<div class="tenant-row" onclick="openTenant(${t.index})">
     <div class="avatar">${initials||'?'}</div>
     <div class="meta">
       <div class="name">${escapeHtml(t.name)}</div>
-      <div class="sub">${escapeHtml(t.unit)} · ${daysTxt}</div>
+      <div class="sub">${escapeHtml(t.unit)} · ${t.archived ? 'Past tenant' : daysTxt}</div>
     </div>
     ${chip}
   </div>`;
@@ -5976,7 +6038,7 @@ async function renderTenants() {
 }
 function paintTenants(d) {
   $('#headerSub').textContent = `${d.tenants.length} shown`;
-  const filters = [['all','All'],['paid','Paid'],['underpaid','Installments'],['pending','Pending']];
+  const filters = [['all','All'],['paid','Paid'],['underpaid','Installments'],['pending','Pending'],['archived','Past']];
   const emptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
     : `<div class="empty"><div class="big">👤</div>No tenants match.</div>`;
@@ -6063,7 +6125,7 @@ async function submitAddTenant(replace=false) {
     const d = await api('/api/tenants', {method:'POST', body: JSON.stringify(body)});
     if (d.ok) { toast('Tenant saved.'); state.tab='tenants'; render(); return; }
     if (d.error === 'unit_taken') {
-      if (confirm(d.message + ' Replace with this new tenant?')) return await submitAddTenant(true);
+      if (confirm(d.message + ' The outgoing tenant will be archived (their history is kept for accountability) and this new tenant added. Continue?')) return await submitAddTenant(true);
       return;
     }
     $('#addErr').textContent = d.error || 'Could not save tenant.';
@@ -6152,7 +6214,9 @@ async function renderTenantDetail(idx) {
       </div>
       <div class="row" style="margin-top:10px;">
         <button class="btn btn-ghost" onclick="openOldDataModal(${idx})">🕘 Add Old Data</button>
+        ${t.archived ? '' : `<button class="btn btn-ghost" onclick="vacateTenant(${idx})">🚪 Mark as Moved Out</button>`}
       </div>
+      ${t.archived ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">This tenant moved out${t.vacated_date ? ' on ' + escapeHtml(t.vacated_date) : ''}. Their unit is free for a new tenant; this record is kept for accountability.</div>` : ''}
     </div>
 
     ${leaseProgressBlock(t)}
@@ -6248,6 +6312,18 @@ async function submitEditTenant(idx) {
     const d = await api('/api/tenants/'+idx, {method:'PUT', body: JSON.stringify(body)});
     if (d.ok) { closeModal(); toast('Tenant updated.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
     else $('#editErr').textContent = d.error || 'Could not save.';
+  } finally {
+    _endAction(_k);
+  }
+}
+async function vacateTenant(idx) {
+  const _k = `vacateTenant:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    if (!confirm('Mark this tenant as moved out? Their unit becomes free for a new tenant and their full history is kept, just archived.')) return;
+    const d = await api(`/api/tenants/${idx}/vacate`, {method:'POST'});
+    if (d.ok) { toast('Tenant marked as moved out.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
+    else toast(d.error || 'Could not update.');
   } finally {
     _endAction(_k);
   }
@@ -6947,7 +7023,7 @@ function paintHistory(d, dash, q) {
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;">
           <div>
-            <div style="font-weight:700;font-size:15px;">${escapeHtml(t.name)}</div>
+            <div style="font-weight:700;font-size:15px;">${escapeHtml(t.name)}${t.archived ? ' <span style="font-weight:500;font-size:11.5px;color:var(--muted);">(Moved out' + (t.vacated_date ? ' ' + escapeHtml(t.vacated_date) : '') + ')</span>' : ''}</div>
             <div class="sub" style="color:var(--muted);font-size:12.5px;">🏠 ${escapeHtml(t.unit)}</div>
           </div>
           <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px;" onclick="openTenant(${t.index})">Profile</button>
@@ -7111,9 +7187,9 @@ async function generateMonthlyReport() {
     if (report.error) { box.innerHTML = `<div class="sub" style="color:var(--danger);">${escapeHtml(report.error)}</div>`; return; }
     const rowsHtml = report.tenant_rows.length
       ? report.tenant_rows.map(r => `
-        <div class="hist-row">
-          <div>${escapeHtml(r.name)} <span style="color:var(--muted);">(${escapeHtml(r.unit)})</span></div>
-          <div style="text-align:right;font-weight:700;">${fmt(r.pay_active + r.dep_active)}</div>
+        <div class="mr-row">
+          <div class="mr-name">${escapeHtml(r.name)} <span style="color:var(--muted);">(${escapeHtml(r.unit)})</span></div>
+          <div class="mr-amt">${fmt(r.pay_active + r.dep_active)}</div>
         </div>`).join('')
       : `<div class="hist-empty">No transactions in ${escapeHtml(report.month_label)}.</div>`;
     box.innerHTML = `
@@ -7278,3 +7354,4 @@ if __name__ == "__main__":
     # already shows its own QR code in-window — nothing should open on the PC.
 
     app.run(host="0.0.0.0", port=port, debug=False)
+    
