@@ -3873,6 +3873,12 @@ def do_record_payment(idx):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
 
+    if t.get("archived"):
+        return jsonify({"ok": False,
+            "error": "This tenant has moved out, so a new rent payment can't be "
+                     "recorded for them. Use \u201cAdd Old Data\u201d instead if this is "
+                     "a backdated correction, or un-archive them first."}), 400
+
     # Once a tenant has an installment/deposit plan in progress, full
     # "Pay Rent" is locked until that balance reaches zero -- enforced
     # here (not just hidden in the UI) so it holds for every caller,
@@ -3904,6 +3910,13 @@ def do_record_deposit(idx):
     if idx < 0 or idx >= len(tenants):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
+
+    if t.get("archived"):
+        return jsonify({"ok": False,
+            "error": "This tenant has moved out, so a new installment can't be "
+                     "recorded for them. Use \u201cAdd Old Data\u201d instead if this is "
+                     "a backdated correction, or un-archive them first."}), 400
+
     body = request.get_json(force=True) or {}
     try:
         months = int(body.get("months", 1))
@@ -4459,21 +4472,18 @@ INDEX_HTML = """<!DOCTYPE html>
     background:var(--card-2);border-radius:var(--radius-sm);padding:12px 14px;
     font-size:12.5px;color:var(--muted);
   }
-  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow-x:hidden;}
+  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow-x:auto;}
   .hist-hdr{
     display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
     background:var(--card-2);padding:8px 10px;font-size:9.5px;font-weight:700;
-    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);white-space:normal;
+    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);white-space:nowrap;
   }
   .hist-row{
     display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
     padding:9px 10px;font-size:11.5px;font-family:var(--font-mono);border-top:1px solid var(--line);
-    align-items:start;white-space:normal;
+    align-items:center;white-space:nowrap;
   }
-  /* Any cell too wide for its column (long dates, "from → to" periods)
-     wraps onto a new line inside that same cell instead of being cut
-     off with an ellipsis -- the row just grows taller to fit it. */
-  .hist-row > div{overflow-wrap:anywhere;word-break:break-word;line-height:1.35;}
+  .hist-row > div{overflow:hidden;text-overflow:ellipsis;}
   .hist-row.hist-cancelled{background:var(--danger-soft);color:var(--danger);}
   .hist-period{color:var(--muted);font-size:11px;font-family:var(--font-body);}
   .hist-row.hist-cancelled .hist-period{color:var(--danger);opacity:.8;}
@@ -4673,13 +4683,8 @@ INDEX_HTML = """<!DOCTYPE html>
     .modal{animation:none;}
     .toast{animation:none;}
   }
-  .txn-item{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:13px;}
+  .txn-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:13px;}
   .txn-item:last-child{border-bottom:none;}
-  /* Left column (date · months · period) can be the long part -- let it
-     shrink and wrap onto a second line rather than pushing the amount/
-     cancel button off the edge of the card. */
-  .txn-item > div:first-child{min-width:0;flex:1 1 auto;overflow-wrap:anywhere;word-break:break-word;}
-  .txn-item > div:last-child{flex:0 0 auto;}
   .txn-item .amt{font-weight:600;font-size:14px;}
   .txn-item .amt.cancelled{color:var(--danger);font-weight:500;}
   .badge-dot{
@@ -5365,7 +5370,12 @@ async function flushQueue() {
   if (progressed) cacheDeletePrefix('/api/');
   syncing = false; updateSyncBadge();
   toast('All changes synced ✓');
-  render();
+  // refreshIfSafe() (not a bare render()) -- this fires as soon as
+  // connectivity returns, which can land in the middle of someone editing
+  // a tenant (modal open) or filling out Add Tenant. A bare render() used
+  // to blow those away out from under the person; refreshIfSafe() knows
+  // to skip in exactly those cases.
+  refreshIfSafe();
 }
 
 // ── PWA: service worker + "Add to Home Screen" / install prompt ───────
@@ -6162,8 +6172,20 @@ async function submitAddTenant(replace=false) {
 }
 
 // ── TENANT DETAIL ────────────────────────────────────────────────────
+// Same cache-first pattern as renderTenants(): paint whatever's already
+// cached for this tenant instantly (no network wait), then repaint with
+// the live data once it arrives. This is what makes tapping into a
+// tenant feel instant on repeat visits instead of showing a blank/loading
+// screen for the length of a full round trip every single time.
 async function renderTenantDetail(idx) {
-  const d = await api('/api/tenants/' + idx);
+  const path = '/api/tenants/' + idx;
+  const cached = cacheGet(path);
+  if (cached) paintTenantDetail(idx, cached);
+  const d = await api(path);
+  if (state.tab !== 'tenant-detail' || state.selectedIdx !== idx) return;
+  paintTenantDetail(idx, d);
+}
+function paintTenantDetail(idx, d) {
   const t = d.tenant;
   if (!t) {
     // Offline, and this specific tenant was never viewed/cached before —
@@ -6251,6 +6273,9 @@ async function renderTenantDetail(idx) {
     ${arrearsBlock}
 
     <div class="card">
+      ${t.archived ? `
+      <div class="sub" style="color:var(--muted);font-size:12px;">🚪 This tenant has moved out, so new payments can't be recorded against them. Use "Add Old Data" above for a backdated correction.</div>
+      ` : `
       <div class="row">
         ${t.level === 'underpaid'
           ? `<button class="btn btn-primary" disabled style="opacity:.5;cursor:not-allowed;">🔒 Pay Rent</button>`
@@ -6262,6 +6287,7 @@ async function renderTenantDetail(idx) {
       ${t.level === 'underpaid'
         ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">🔒 Pay Rent is locked while an installment plan is in progress. Keep recording installments until the balance reaches zero.</div>`
         : ''}
+      `}
     </div>
 
     <div class="section-title">Payment History</div>
@@ -7288,7 +7314,12 @@ async function generateMonthlyReport() {
     indicator.textContent = '⟳ Refreshing…';
     indicator.classList.add('spinning');
     await pingServer();
-    switchTab(state.tab);
+    // refreshIfSafe() (not switchTab(), which always re-renders
+    // unconditionally) -- a pull-to-refresh gesture is easy to trigger by
+    // accident while scrolling a long form, and switchTab() would rebuild
+    // Add Tenant from scratch, silently reverting the New/Existing toggle
+    // and any typed fields. refreshIfSafe() already knows to skip that.
+    refreshIfSafe();
     setTimeout(() => {
       indicator.classList.remove('visible', 'ready', 'spinning');
       refreshing = false;
