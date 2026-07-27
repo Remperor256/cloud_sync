@@ -4459,28 +4459,41 @@ INDEX_HTML = """<!DOCTYPE html>
     background:var(--card-2);border-radius:var(--radius-sm);padding:12px 14px;
     font-size:12.5px;color:var(--muted);
   }
-  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow:hidden;}
+  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow-x:auto;}
   .hist-hdr{
-    display:grid;grid-template-columns:1.1fr 1fr .9fr 1.4fr;gap:4px;
-    background:var(--card-2);padding:8px 10px;font-size:10px;font-weight:700;
-    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);
+    display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
+    background:var(--card-2);padding:8px 10px;font-size:9.5px;font-weight:700;
+    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);white-space:nowrap;
   }
   .hist-row{
-    display:grid;grid-template-columns:1.1fr 1fr .9fr 1.4fr;gap:4px;
-    padding:9px 10px;font-size:12px;font-family:var(--font-mono);border-top:1px solid var(--line);align-items:center;
+    display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
+    padding:9px 10px;font-size:11.5px;font-family:var(--font-mono);border-top:1px solid var(--line);
+    align-items:center;white-space:nowrap;
   }
+  .hist-row > div{overflow:hidden;text-overflow:ellipsis;}
   .hist-row.hist-cancelled{background:var(--danger-soft);color:var(--danger);}
   .hist-period{color:var(--muted);font-size:11px;font-family:var(--font-body);}
   .hist-row.hist-cancelled .hist-period{color:var(--danger);opacity:.8;}
-  .mr-row{
-    display:flex;align-items:center;justify-content:space-between;gap:10px;
-    padding:9px 10px;font-size:12px;font-family:var(--font-mono);border-top:1px solid var(--line);
+  .mr-hdr{
+    display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:6px;
+    padding:8px 10px;font-size:9.5px;font-weight:700;letter-spacing:.3px;
+    text-transform:uppercase;color:var(--muted);background:var(--card-2);
+    border-top-left-radius:var(--radius-sm);border-top-right-radius:var(--radius-sm);white-space:nowrap;
   }
+  .mr-row{
+    display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:6px;align-items:center;
+    padding:9px 10px;font-size:11.5px;font-family:var(--font-mono);border-top:1px solid var(--line);
+    white-space:nowrap;
+  }
+  .mr-row > div{overflow:hidden;text-overflow:ellipsis;}
   .mr-row .mr-name{
-    flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    font-family:var(--font-body);
+  }
+  .mr-row .mr-unit{
+    color:var(--muted);
   }
   .mr-row .mr-amt{
-    flex:0 0 auto;white-space:nowrap;font-weight:700;
+    font-weight:700;text-align:right;
   }
   .month-picker-control{
     width:100%;border:1.5px solid var(--line);border-radius:var(--radius-sm);padding:11px 12px;
@@ -4752,6 +4765,12 @@ INDEX_HTML = """<!DOCTYPE html>
 const $ = (sel, el=document) => el.querySelector(sel);
 const $$ = (sel, el=document) => [...el.querySelectorAll(sel)];
 const fmt = n => 'UGX ' + Math.round(n||0).toLocaleString();
+// Bare number, no "UGX" prefix -- used inside row-level lists (monthly
+// transactions, per-tenant transaction history) where the currency is
+// already labelled once on the column header, so repeating it on every
+// single row is just noise (and the extra characters were what pushed
+// those rows onto two lines on narrow screens).
+const fmtNum = n => Math.round(n||0).toLocaleString();
 const todayStr = () => new Date().toISOString().slice(0,10);
 // Adds `n` (whole, possibly negative) months to an ISO date string,
 // clamping the day to the target month's length -- mirrors the
@@ -7002,7 +7021,7 @@ function paintHistory(d, dash, q) {
     }
     return `<div class="hist-table">
       <div class="hist-hdr">
-        <div>Date</div><div>Type</div><div>Amount</div><div>Period</div>
+        <div>Date</div><div>Type</div><div>Amount (UGX)</div><div>Period</div>
       </div>
       ${t.transactions.map(rec => {
         const cancelled = rec.cancelled;
@@ -7011,7 +7030,7 @@ function paintHistory(d, dash, q) {
         return `<div class="${rowCls}">
           <div>${escapeHtml(rec.date)}</div>
           <div>${typeStr}</div>
-          <div>${fmt(rec.amount)}</div>
+          <div>${fmtNum(rec.amount)}</div>
           <div class="hist-period">${escapeHtml(abbrevPeriod(rec.from, rec.to))}</div>
         </div>`;
       }).join('')}
@@ -7186,11 +7205,15 @@ async function generateMonthlyReport() {
     const report = await res.json();
     if (report.error) { box.innerHTML = `<div class="sub" style="color:var(--danger);">${escapeHtml(report.error)}</div>`; return; }
     const rowsHtml = report.tenant_rows.length
-      ? report.tenant_rows.map(r => `
-        <div class="mr-row">
-          <div class="mr-name">${escapeHtml(r.name)} <span style="color:var(--muted);">(${escapeHtml(r.unit)})</span></div>
-          <div class="mr-amt">${fmt(r.pay_active + r.dep_active)}</div>
-        </div>`).join('')
+      ? `<div class="hist-table">
+          <div class="mr-hdr"><div>Tenant</div><div>Unit</div><div style="text-align:right;">Amount (UGX)</div></div>
+          ${report.tenant_rows.map(r => `
+          <div class="mr-row">
+            <div class="mr-name">${escapeHtml(r.name)}</div>
+            <div class="mr-unit">${escapeHtml(r.unit)}</div>
+            <div class="mr-amt">${fmtNum(r.pay_active + r.dep_active)}</div>
+          </div>`).join('')}
+        </div>`
       : `<div class="hist-empty">No transactions in ${escapeHtml(report.month_label)}.</div>`;
     box.innerHTML = `
       <div style="font-family:var(--font-mono);font-size:20px;font-weight:600;color:var(--teal-ink);margin-top:6px;">
