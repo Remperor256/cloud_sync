@@ -4459,18 +4459,21 @@ INDEX_HTML = """<!DOCTYPE html>
     background:var(--card-2);border-radius:var(--radius-sm);padding:12px 14px;
     font-size:12.5px;color:var(--muted);
   }
-  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow-x:auto;}
+  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow-x:hidden;}
   .hist-hdr{
     display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
     background:var(--card-2);padding:8px 10px;font-size:9.5px;font-weight:700;
-    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);white-space:nowrap;
+    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);white-space:normal;
   }
   .hist-row{
     display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
     padding:9px 10px;font-size:11.5px;font-family:var(--font-mono);border-top:1px solid var(--line);
-    align-items:center;white-space:nowrap;
+    align-items:start;white-space:normal;
   }
-  .hist-row > div{overflow:hidden;text-overflow:ellipsis;}
+  /* Any cell too wide for its column (long dates, "from → to" periods)
+     wraps onto a new line inside that same cell instead of being cut
+     off with an ellipsis -- the row just grows taller to fit it. */
+  .hist-row > div{overflow-wrap:anywhere;word-break:break-word;line-height:1.35;}
   .hist-row.hist-cancelled{background:var(--danger-soft);color:var(--danger);}
   .hist-period{color:var(--muted);font-size:11px;font-family:var(--font-body);}
   .hist-row.hist-cancelled .hist-period{color:var(--danger);opacity:.8;}
@@ -4670,8 +4673,13 @@ INDEX_HTML = """<!DOCTYPE html>
     .modal{animation:none;}
     .toast{animation:none;}
   }
-  .txn-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:13px;}
+  .txn-item{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:13px;}
   .txn-item:last-child{border-bottom:none;}
+  /* Left column (date · months · period) can be the long part -- let it
+     shrink and wrap onto a second line rather than pushing the amount/
+     cancel button off the edge of the card. */
+  .txn-item > div:first-child{min-width:0;flex:1 1 auto;overflow-wrap:anywhere;word-break:break-word;}
+  .txn-item > div:last-child{flex:0 0 auto;}
   .txn-item .amt{font-weight:600;font-size:14px;}
   .txn-item .amt.cancelled{color:var(--danger);font-weight:500;}
   .badge-dot{
@@ -7377,4 +7385,3 @@ if __name__ == "__main__":
     # already shows its own QR code in-window — nothing should open on the PC.
 
     app.run(host="0.0.0.0", port=port, debug=False)
-    
