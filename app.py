@@ -32,7 +32,7 @@ from urllib.parse import quote
 from datetime import datetime, date, timezone
 
 import openpyxl
-from openpyxl.styles import Font, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from reportlab.lib.pagesizes import A4
@@ -885,34 +885,24 @@ def _cloud_gate():
         return None
 
     path = request.path
-    pc_only_paths = (
+    pc_only_prefixes = (
         "/api/device-count",
         "/api/announce-disconnect",
-        "/api/settings/pin",
+        "/api/unlock", "/api/lock", "/api/settings/pin",
         "/api/settings/reset", "/api/shutdown", "/connect", "/qr.png",
         "/api/cloud-config",
     )
-    # /api/lock-status, /api/devices(/…/kick), /api/pairing-token,
-    # /api/unlock, and /api/lock used to be blanket-404'd here along with
-    # the rest of this list -- they made sense only for the PC-hosted LAN
-    # companion. Now that cloud-direct pairing has its own device roster
-    # (cloud_devices) and its own copy of the PIN (settings.pin_hash rides
-    # along in the synced data, see load_state()/_raw_load()'s CLOUD_MODE
-    # branch), they're real, session-authenticated endpoints instead:
-    # /api/lock-status is what a cloud-direct phone's pingServer() polls
-    # to know the cloud service itself is reachable, /api/devices is how
-    # the desktop manages that roster, /api/pairing-token is how the
-    # desktop pushes a fresh scan token every time it (re)shows the QR
-    # code, and /api/unlock/lock let a cloud-direct phone lock/unlock
-    # with its own PIN even while the PC is off, exactly like a phone
-    # still on the LAN can -- see _cloud_pairing_ok().
-    #
-    # This is checked with an exact match, not a prefix/startswith check:
-    # "/api/lock" as a *prefix* used to also swallow "/api/lock-status"
-    # (a completely different, always-meant-to-be-real endpoint) since
-    # the latter literally starts with the former's characters, which is
-    # what made lock-status silently 404 for every cloud-direct phone.
-    if path in pc_only_paths:
+    # /api/lock-status, /api/devices(/…/kick), and /api/pairing-token used
+    # to be blanket-404'd here along with the rest of this list -- they
+    # made sense only for the PC-hosted LAN companion. Now that cloud-
+    # direct pairing has its own device roster (cloud_devices) and its
+    # own single-use scan token (cloud_pairing), they're real, session-
+    # authenticated endpoints instead: /api/lock-status is what a cloud-
+    # direct phone's pingServer() polls to know the cloud service itself
+    # is reachable, /api/devices is how the desktop manages that roster,
+    # and /api/pairing-token is how the desktop pushes a fresh scan token
+    # every time it (re)shows the QR code -- see _cloud_pairing_ok().
+    if path.startswith(pc_only_prefixes):
         return Response("", status=404, mimetype="text/plain")
     if path in ("/manifest.json", "/sw.js") or path.startswith("/icon-"):
         # These carry no tenant data, so there's nothing to gate -- let
@@ -992,8 +982,7 @@ def _cors_headers(resp):
     if CLOUD_MODE:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id, X-Device-Fingerprint, "
-            "X-Device-Screen, X-Idempotency-Key")
+            "Content-Type, X-Session-Id, X-Secret-Key, X-Device-Id, X-Device-Fingerprint")
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         canonical_id = getattr(g, "canonical_device_id", None)
         if canonical_id:
@@ -1681,7 +1670,7 @@ def record_payment(t, months):
     rent = parse_amount(t.get("rent", 0))
     total = rent * months
 
-    # Net off any partial deposit/installment already sitting on the
+    # Net off any partial deposit/instalment already sitting on the
     # account for the current cycle -- e.g. the tenant put down half of
     # this month's rent earlier, then comes back to pay the month off in
     # full. Without this, "amount" below would always be rent*months
@@ -1731,17 +1720,17 @@ def record_payment(t, months):
             "credited_from_deposit": credited_from_deposit}
 
 
-def record_deposit(t, months, installment):
+def record_deposit(t, months, instalment):
     """`months` is the number of consecutive open months ticked in the
-    month picker; the installment accumulates toward rent x months."""
+    month picker; the instalment accumulates toward rent x months."""
     months = max(1, int(months))
 
     rent_target = parse_amount(t.get("rent", 0))
     dep_paid_so_far = deposit_paid_so_far(t)
     effective_target = rent_target * months
     balance_before = max(0.0, effective_target - dep_paid_so_far)
-    excess = max(0.0, installment - balance_before)
-    applied_amount = installment - excess
+    excess = max(0.0, instalment - balance_before)
+    applied_amount = instalment - excess
     new_balance = max(0.0, effective_target - dep_paid_so_far - applied_amount)
     pay_date = date.today().strftime("%Y-%m-%d")
 
@@ -1825,108 +1814,6 @@ def cancel_transaction(t, h_key, idx):
 
     total_amt = sum(float(r.get("amount", 0)) for _, _, r in linked)
     return {"n_records": len(linked), "total_amount": total_amt}
-
-
-def add_old_data(t, records, final_state=None):
-    """Backfills a tenant's pre-existing rental history in one go -- for a
-    tenant who was already renting before this app was set up, where the
-    admin knows every past payment/installment/due-date and is entering it
-    from paper records / memory rather than the app having computed it
-    live. Each item in `records` becomes one payment_history or
-    deposit_history entry, same shape as record_payment/record_deposit
-    produce, except with no `_pre_state` snapshot -- there's no live
-    "before" state to roll back to for a record that was never actually
-    processed through the app, so cancelling one of these later falls
-    back to cancel_transaction's legacy-record path instead.
-
-    `final_state` optionally sets the tenant's current status/due_date/
-    pay_date/notes once every historical record has been added -- the
-    admin-entered "where this tenant stands today" after their backfilled
-    history, since that isn't something to derive automatically from
-    old, out-of-band records the way a live payment would.
-
-    Returns {"added": n} on success."""
-    added = 0
-    today_str = date.today().strftime("%Y-%m-%d")
-    for rec in records or []:
-        kind = "deposit_history" if rec.get("type") == "deposit" else "payment_history"
-        txn_date = (rec.get("date") or "").strip()
-        try:
-            datetime.strptime(txn_date, "%Y-%m-%d")
-        except ValueError:
-            continue  # skip malformed rows rather than fail the whole batch
-        if txn_date >= today_str:
-            continue  # old data must predate today
-        from_date = (rec.get("from_date") or "").strip()
-        if from_date:
-            try:
-                datetime.strptime(from_date, "%Y-%m-%d")
-            except ValueError:
-                from_date = ""
-        to_date = (rec.get("to_date") or "").strip()
-        if to_date:
-            try:
-                datetime.strptime(to_date, "%Y-%m-%d")
-            except ValueError:
-                to_date = ""
-        if from_date:
-            # "To" always equals exactly one month after "From" -- ignore
-            # whatever the client sent and recompute so the two can never
-            # drift apart, whether due to a stale value or a tampered request.
-            to_date = add_months(_parse_date(from_date), 1).strftime("%Y-%m-%d")
-        elif not from_date and to_date:
-            from_date = add_months(_parse_date(to_date), -1).strftime("%Y-%m-%d")
-        if from_date and from_date >= today_str:
-            continue
-        if to_date and to_date >= today_str:
-            continue
-        amount = parse_amount(rec.get("amount", 0))
-        note = (rec.get("note") or "").strip()
-        entry = {
-            "date": txn_date, "months": max(0, int(rec.get("months", 0) or 0)),
-            "amount": amount, "from_date": from_date, "to_date": to_date,
-            "txn_id": f"old-data-{secrets.token_hex(4)}",
-            "note": note or "Old data entered by admin.",
-            "_backfilled": True,
-        }
-        if bool(rec.get("cancelled")):
-            entry["_cancelled"] = True
-            entry["cancelled_on"] = (rec.get("cancelled_on") or "").strip() or txn_date
-        t.setdefault(kind, []).append(entry)
-        added += 1
-
-    # Keep each history array in chronological order so it displays and
-    # exports the same as if these had been entered one at a time as they
-    # actually happened, instead of clumped at the end in entry order.
-    for key in ("payment_history", "deposit_history"):
-        t[key] = sorted(t.get(key, []), key=lambda r: r.get("date", ""))
-
-    if final_state:
-        due_str = (final_state.get("due_date") or "").strip()
-        if due_str:
-            try:
-                datetime.strptime(due_str, "%Y-%m-%d")
-                t["due_date"] = due_str
-            except ValueError:
-                pass
-        status = (final_state.get("status") or "").strip()
-        if status in ("Confirmed", "Pending"):
-            t["status"] = status
-        pay_date = (final_state.get("pay_date") or "").strip()
-        if pay_date:
-            try:
-                datetime.strptime(pay_date, "%Y-%m-%d")
-                t["pay_date"] = pay_date
-            except ValueError:
-                pass
-        notes = final_state.get("notes")
-        if notes is not None:
-            existing = (t.get("notes") or "").strip()
-            addition = str(notes).strip()
-            if addition:
-                t["notes"] = (existing + "\n" + addition).strip() if existing else addition
-
-    return {"added": added}
 
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July",
@@ -2015,15 +1902,20 @@ def export_monthly_excel(report):
     """Writes a single "Monthly Transactions" sheet for one month, styled to
     match the desktop app's dedicated monthly export (separate from the
     all-time Transaction History workbook produced by export_excel())."""
+    C_WHITE, C_GREY_H, C_CANCEL, C_TOTAL = "FFFFFF", "DDDDDD", "FFF0F0", "F0F7FF"
+
     def side():
         s = Side(style="thin", color="000000")
         return Border(left=s, right=s, top=s, bottom=s)
 
     def bold(sz=11):
-        return Font(name="Calibri", bold=True, size=sz)
+        return Font(name="Calibri", bold=True, size=sz, color="000000")
 
     def reg(sz=10):
-        return Font(name="Calibri", size=sz)
+        return Font(name="Calibri", size=sz, color="000000")
+
+    def strike(sz=10):
+        return Font(name="Calibri", size=sz, color="000000", strike=True)
 
     def ctr():
         return Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -2040,7 +1932,8 @@ def export_monthly_excel(report):
     title = ws["A1"]
     title.value = f"Monthly Transactions — {report['month_label']}"
     title.alignment = ctr()
-    title.font = Font(name="Calibri", bold=True, size=13)
+    title.fill = PatternFill("solid", fgColor="1A73E8")
+    title.font = Font(name="Calibri", bold=True, size=13, color="FFFFFF")
     ws.row_dimensions[1].height = 30
 
     hdrs = ["#", "TENANT", "UNIT", "DATE", "TYPE", "AMOUNT (UGX)", "FROM", "TO", "NOTE"]
@@ -2048,6 +1941,7 @@ def export_monthly_excel(report):
     for ci, (h, cw) in enumerate(zip(hdrs, widths), 1):
         cell = ws.cell(row=2, column=ci, value=h)
         cell.font = bold(10)
+        cell.fill = PatternFill("solid", fgColor=C_GREY_H)
         cell.alignment = ctr()
         cell.border = side()
         ws.column_dimensions[get_column_letter(ci)].width = cw
@@ -2056,18 +1950,19 @@ def export_monthly_excel(report):
     row_num = 3
     for seq, dr in enumerate(report["detail_rows"], 1):
         is_c = dr["is_cancelled"]
-        txn_type = dr["txn_type"] + (" (Cancelled)" if is_c else "")
+        fgc = C_WHITE if not is_c else C_CANCEL
         note = f"Cancelled on {dr['cancelled_on']}" if is_c else ""
         row_vals = [
             (seq, ctr()), (dr["name"], lft()), (dr["unit"], ctr()),
-            (dr["date"], ctr()), (txn_type, ctr()), (dr["amount"], ctr()),
+            (dr["date"], ctr()), (dr["txn_type"], ctr()), (dr["amount"], ctr()),
             (dr["from_d"], ctr()), (dr["to_d"], ctr()), (note, lft()),
         ]
         for ci, (val, aln) in enumerate(row_vals, 1):
             cell = ws.cell(row=row_num, column=ci, value=val)
+            cell.fill = PatternFill("solid", fgColor=fgc)
             cell.border = side()
             cell.alignment = aln
-            cell.font = bold(10) if ci in (2, 6) else reg(10)
+            cell.font = strike(10) if is_c else (bold(10) if ci in (2, 6) else reg(10))
         ws.row_dimensions[row_num].height = 20
         row_num += 1
 
@@ -2078,16 +1973,18 @@ def export_monthly_excel(report):
     ws.merge_cells(f"A{row_num}:E{row_num}")
     tc = ws.cell(row=row_num, column=1, value="TOTALS")
     tc.font, tc.alignment, tc.border = bold(11), ctr(), side()
+    tc.fill = PatternFill("solid", fgColor=C_TOTAL)
     for ci in range(2, 6):
         c2 = ws.cell(row=row_num, column=ci)
-        c2.border = side()
+        c2.fill, c2.border = PatternFill("solid", fgColor=C_TOTAL), side()
     pay_cell = ws.cell(row=row_num, column=6,
                         value=f"Pay: {report['grand_pay']:,}  Dep: {int(report['grand_dep']):,}  "
                               f"Cancelled: {int(report['grand_cancelled']):,}")
     pay_cell.font, pay_cell.alignment, pay_cell.border = bold(10), ctr(), side()
+    pay_cell.fill = PatternFill("solid", fgColor=C_TOTAL)
     for ci in range(7, 10):
         c3 = ws.cell(row=row_num, column=ci, value="")
-        c3.border = side()
+        c3.fill, c3.border = PatternFill("solid", fgColor=C_TOTAL), side()
     ws.row_dimensions[row_num].height = 22
 
     monthly_path = os.path.join(DATA_DIR, f"monthly_{report['prefix'].replace('-', '_')}.xlsx")
@@ -2098,16 +1995,21 @@ def export_monthly_excel(report):
 # ── exports (ported near-verbatim from desktop app) ─────────────────────
 def export_excel(data):
     wb = openpyxl.Workbook()
+    C_WHITE = "FFFFFF"
+    C_BLACK = "000000"
 
     def thin_border():
         s = Side(style="thin", color="000000")
         return Border(left=s, right=s, top=s, bottom=s)
 
     def bold(sz=11):
-        return Font(name="Calibri", bold=True, size=sz)
+        return Font(name="Calibri", bold=True, size=sz, color=C_BLACK)
 
     def reg(sz=10):
-        return Font(name="Calibri", size=sz)
+        return Font(name="Calibri", size=sz, color=C_BLACK)
+
+    def cancelled_font(sz=10):
+        return Font(name="Calibri", size=sz, color=C_BLACK, strike=True)
 
     def center():
         return Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -2126,6 +2028,7 @@ def export_excel(data):
     for ci, (h, cw) in enumerate(zip(hdrs, col_widths), 1):
         cell = ws.cell(row=1, column=ci, value=h)
         cell.font = bold(10)
+        cell.fill = PatternFill("solid", fgColor="DDDDDD")
         cell.alignment = center()
         cell.border = thin_border()
         ws.column_dimensions[get_column_letter(ci)].width = cw
@@ -2134,7 +2037,6 @@ def export_excel(data):
     row_num = 2
     seq = 0
     for t in tenants:
-      try:
         all_txns = []
         for rec in t.get("payment_history", []):
             all_txns.append({"_type": "payment", **rec})
@@ -2161,17 +2063,15 @@ def export_excel(data):
             ]
             for ci, (val, aln) in enumerate(row_vals, 1):
                 cell = ws.cell(row=row_num, column=ci, value=val)
+                cell.fill = PatternFill("solid", fgColor=C_WHITE)
                 cell.border = thin_border()
                 cell.alignment = aln
-                cell.font = bold(10) if ci in (2, 6) else reg(10)
+                if is_cancelled:
+                    cell.font = cancelled_font(10)
+                else:
+                    cell.font = bold(10) if ci in (2, 6) else reg(10)
             ws.row_dimensions[row_num].height = 20
             row_num += 1
-      except Exception:
-        # One tenant with an odd/malformed record shouldn't take the
-        # entire export down for everyone else -- skip it and keep going.
-        import traceback
-        traceback.print_exc()
-        continue
 
     if row_num == 2:
         ws.cell(row=2, column=1, value="No transactions recorded yet.").font = reg(11)
@@ -2187,9 +2087,12 @@ def export_pdf(data):
     )
     W = A4[0] - 36 * mm
     styles = getSampleStyleSheet()
-    H1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=18, spaceAfter=4)
-    H2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13, spaceAfter=2, spaceBefore=10)
-    MUTED = ParagraphStyle("MUTED", parent=styles["Normal"], fontSize=9)
+    H1 = ParagraphStyle("H1", parent=styles["Heading1"], fontSize=18,
+                         textColor=colors.HexColor("#0E4F4F"), spaceAfter=4)
+    H2 = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=13,
+                         textColor=colors.HexColor("#1FAD9F"), spaceAfter=2, spaceBefore=10)
+    MUTED = ParagraphStyle("MUTED", parent=styles["Normal"], fontSize=9,
+                            textColor=colors.HexColor("#6E8482"))
     BOLD = ParagraphStyle("BOLD", parent=styles["Normal"], fontSize=10, fontName="Helvetica-Bold")
 
     story = []
@@ -2197,7 +2100,7 @@ def export_pdf(data):
     story.append(Spacer(1, 10 * mm))
     story.append(Paragraph(APP_NAME, H1))
     story.append(Paragraph(f"Data Export — {today_str}", MUTED))
-    story.append(HRFlowable(width=W, thickness=1, color=colors.black, spaceAfter=8))
+    story.append(HRFlowable(width=W, thickness=1, color=colors.HexColor("#1FAD9F"), spaceAfter=8))
 
     tenants = data.get("tenants", [])
     units = data.get("units", {})
@@ -2224,14 +2127,17 @@ def export_pdf(data):
         [str(len(tenants)), str(len(units)), f"UGX {total_collected:,}", today_str],
     ]
     ts = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0E4F4F")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#EAF7F4")),
         ("FONTSIZE", (0, 1), (-1, 1), 11),
         ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
-        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.black),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#1FAD9F")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0D4D0")),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ])
@@ -2247,10 +2153,13 @@ def export_pdf(data):
             tenant_name = next((t.get("name", "Unnamed") for t in tenants if t.get("unit") == h), "Vacant")
             house_rows.append([h, f"{int(rent):,}", location or "—", tenant_name])
         ht = TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1FAD9F")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
-            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.black),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F0FAF8")]),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#B0D4D0")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0E8E4")),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ])
@@ -2283,8 +2192,11 @@ def export_pdf(data):
                 ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
                 ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("BOX", (0, 0), (-1, -1), 0.3, colors.black),
-                ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.black),
+                ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#6E8482")),
+                ("TEXTCOLOR", (2, 0), (2, -1), colors.HexColor("#6E8482")),
+                ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.HexColor("#F6FBFA"), colors.white]),
+                ("BOX", (0, 0), (-1, -1), 0.3, colors.HexColor("#D0E8E4")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.HexColor("#E0F0EC")),
                 ("TOPPADDING", (0, 0), (-1, -1), 3),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ])
@@ -2299,19 +2211,21 @@ def export_pdf(data):
                                       fmt_period(rec.get("from_date", ""), rec.get("to_date", "")),
                                       str(rec.get("months", 1)), f"{int(rec.get('amount', 0)):,}"])
                 pt = TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF7F4")),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("FONTSIZE", (0, 0), (-1, -1), 8),
                     ("ALIGN", (0, 0), (0, -1), "CENTER"),
                     ("ALIGN", (4, 0), (4, -1), "RIGHT"),
-                    ("BOX", (0, 0), (-1, -1), 0.3, colors.black),
-                    ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.black),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F6FBFA")]),
+                    ("BOX", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0D4D0")),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.HexColor("#D8EEEA")),
                     ("TOPPADDING", (0, 0), (-1, -1), 3),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
                 ])
                 story.append(Table(pay_rows, colWidths=[W * 0.06, W * 0.18, W * 0.32, W * 0.12, W * 0.32], style=pt))
             else:
                 story.append(Paragraph("No payments recorded yet.", MUTED))
-            story.append(HRFlowable(width=W, thickness=0.5, color=colors.black,
+            story.append(HRFlowable(width=W, thickness=0.5, color=colors.HexColor("#C8E0DC"),
                                      spaceAfter=4, spaceBefore=4))
     doc.build(story)
     return PDF_FILE
@@ -2823,38 +2737,6 @@ def _guard():
     return None
 
 
-# ── state-mutation lock ─────────────────────────────────────────────────
-# record_payment/record_deposit/cancel_transaction/etc. all follow the same
-# shape: load_state() -> mutate one tenant/unit dict in place -> save_state().
-# Nothing serialized that read-modify-write cycle, so two mutating requests
-# landing close together (the PC and a phone both tapping "Pay" near the
-# same moment, or a slow request racing its own automatic retry) could both
-# read the SAME starting due_date, both compute the SAME shifted period,
-# and then whichever saved last would silently overwrite the other's
-# change -- exactly the "same period on multiple payments" symptom, since
-# due-date-shift math is only correct when each call sees the result of
-# the one before it. Every mutating /api/ request now holds this lock for
-# its entire duration, so they're applied one at a time, strictly in the
-# order they actually arrive -- registered before the idempotency guard
-# below so key-check-then-store also becomes atomic across concurrent
-# duplicate requests, not just within a single request.
-_state_mutation_lock = threading.RLock()
-
-
-@app.before_request
-def _acquire_state_lock():
-    if request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/"):
-        _state_mutation_lock.acquire()
-        g._state_lock_held = True
-
-
-@app.teardown_request
-def _release_state_lock(exc=None):
-    if getattr(g, "_state_lock_held", False):
-        g._state_lock_held = False
-        _state_mutation_lock.release()
-
-
 # ── idempotency guard for mutating requests ───────────────────────────────
 # A POST/PUT/DELETE can reach this server twice for reasons that have
 # nothing to do with someone tapping a button twice: a request that times
@@ -2921,27 +2803,25 @@ WAITING_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, viewport-fit=cover">
 <title>Tenant Management</title>
-<meta name="theme-color" content="#0B2B27">
+<meta name="theme-color" content="#14181A">
 <meta name="color-scheme" content="dark">
 <link rel="icon" href="icon-192.png?v=2">
 <link rel="apple-touch-icon" href="icon-256.png?v=2">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-  html,body{margin:0;padding:0;height:100%;background:radial-gradient(120% 100% at 50% 0%,#123F3A 0%,#0B2B27 55%,#081D1A 100%);color:#fff;font-family:'Inter',-apple-system,'Segoe UI',sans-serif;}
+  html,body{margin:0;padding:0;height:100%;background:radial-gradient(120% 100% at 50% 0%,#1C2124 0%,#14181A 55%,#0F1416 100%);color:#fff;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;}
   .wrap{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:32px;}
-  .mark{width:56px;height:56px;border-radius:16px;margin-bottom:18px;background:linear-gradient(155deg,#1C8F81,#0E4F45);overflow:hidden;
+  .mark{width:56px;height:56px;border-radius:16px;margin-bottom:18px;background:linear-gradient(155deg,#0F9E82,#0C7F69);
         display:flex;align-items:center;justify-content:center;box-shadow:0 12px 28px -10px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.16);}
-  .mark img{width:100%;height:100%;object-fit:cover;display:block;}
-  h1{font-family:'Fraunces',serif;font-weight:600;font-size:21px;margin:0 0 8px;letter-spacing:.2px;}
+  .mark svg{width:28px;height:28px;}
+  h1{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;font-weight:600;font-size:21px;margin:0 0 8px;letter-spacing:.2px;}
   p{font-size:13.5px;line-height:1.55;opacity:.68;max-width:280px;margin:0;}
   .spin{margin-top:26px;width:20px;height:20px;border-radius:50%;border:2.5px solid rgba(255,255,255,.18);
-        border-top-color:#4FCDBC;animation:sp 0.85s linear infinite;}
+        border-top-color:#22D3A6;animation:sp 0.85s linear infinite;}
   @media (prefers-reduced-motion: reduce){.spin{animation-duration:2.4s;}}
   @keyframes sp{to{transform:rotate(360deg);}}
 </style></head>
 <body><div class="wrap">
-  <div class="mark"><img src="icon-256.png?v=2" alt=""></div>
+  <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 11.5 12 4l8 7.5" stroke="#EAFBF7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="#EAFBF7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
   <h1>Tenant Management</h1>
   <p>Waiting to connect. Scan the QR code shown in Connect Phone on the PC to open this device's tenant data.</p>
   <div class="spin"></div>
@@ -3054,8 +2934,8 @@ def manifest():
         "scope": ".",
         "display": "standalone",
         "orientation": "portrait",
-        "background_color": "#0B2B27",
-        "theme_color": "#0B2B27",
+        "background_color": "#14181A",
+        "theme_color": "#14181A",
         "icons": [
             # Separate "any" and "maskable" entries (rather than one combined
             # "any maskable" purpose) per the manifest spec's own guidance --
@@ -3080,10 +2960,9 @@ def service_worker():
     # the whole app, not just its own folder.
     js = """
 // Bumped so every existing install picks up this fix on its next
-// activate() instead of continuing to serve a stale precached shell --
-// bumped again for the header/splash icon swap and the icon-256.png
-// addition to SHELL_URLS below.
-const CACHE = 'rental-app-shell-v6';
+// activate() instead of continuing to serve a stale precached "./" that
+// (pre-fix) never had sid/key on it in the first place.
+const CACHE = 'rental-app-shell-v5';
 // sid/key travel here via this script's OWN url (see the
 // navigator.serviceWorker.register('sw.js?sid=...&key=...') call) --
 // self.location.search is that query string, readable from inside the
@@ -3092,7 +2971,7 @@ const PARAMS = self.location.search;
 const ROOT_URL = './' + PARAMS;
 const MANIFEST_URL = './manifest.json' + PARAMS;
 // Relative, not root-absolute: resolved against this script's own URL.
-const SHELL_URLS = [ROOT_URL, MANIFEST_URL, './icon-192.png?v=2', './icon-256.png?v=2'];
+const SHELL_URLS = [ROOT_URL, MANIFEST_URL, './icon-192.png?v=2'];
 
 self.addEventListener('install', (evt) => {
   self.skipWaiting();
@@ -3445,7 +3324,6 @@ def remove_pin():
 def dashboard():
     data = load_state()
     tenants = _with_index(data["tenants"])
-    active = [t for t in tenants if not t.get("archived")]
     units = data["units"]
     today = date.today()
     month_name = today.strftime("%B")
@@ -3458,19 +3336,17 @@ def dashboard():
               if not r.get("_cancelled", False))
     )
     counts = {"paid": 0, "underpaid": 0, "pending": 0}
-    for t in active:
+    for t in tenants:
         level, _ = status_level(t, today)
         counts[level] += 1
 
-    occupied_units = {t.get("unit") for t in active if t.get("unit")}
+    occupied_units = {t.get("unit") for t in tenants if t.get("unit")}
     vacant = [u for u in units if u not in occupied_units]
     occupied = len(units) - len(vacant)
 
     # This-calendar-month income breakdown — mirrors the desktop app's
     # Dashboard "TOTAL INCOME" card exactly (full payments + deposits,
     # minus anything cancelled, all restricted to the current month).
-    # Sums over every tenant, archived included -- the money was actually
-    # collected this month regardless of who's since moved out.
     full_payment_total = int(
         sum(int(r.get("amount", 0)) for t in tenants for r in t.get("payment_history", [])
             if r.get("date", "").startswith(this_month) and not r.get("_cancelled", False)))
@@ -3484,12 +3360,12 @@ def dashboard():
               if r.get("date", "").startswith(this_month) and r.get("_cancelled", False)))
     month_income = full_payment_total + deposit_total
 
-    watchlist = get_watchlist_tenants(active, max_days=10)
+    watchlist = get_watchlist_tenants(tenants, max_days=10)
     watchlist_out = [_tenant_summary(t, today) | {"days_left": d} for t, d in watchlist[:8]]
 
     return jsonify({
         "app_name": APP_NAME,
-        "total_tenants": len(active),
+        "total_tenants": len(tenants),
         "total_units": len(units),
         "vacant_units": len(vacant),
         "occupied_units": occupied,
@@ -3524,8 +3400,6 @@ def _tenant_summary(t, today):
         "deposit_paid": dep_paid,
         "deposit_remaining": dep_remaining,
         "rent_increase_due": rent_increase_due(t),
-        "archived": bool(t.get("archived", False)),
-        "vacated_date": t.get("vacated_date", ""),
     }
 
 
@@ -3546,16 +3420,10 @@ def list_tenants():
 
     out = []
     for t in tenants:
-        is_archived = bool(t.get("archived", False))
-        if flt == "archived":
-            if not is_archived:
-                continue
-        elif is_archived:
-            continue  # past tenants stay out of the live roster by default
         summary = _tenant_summary(t, today)
         if q and q not in summary["name"].lower() and q not in summary["unit"].lower():
             continue
-        if flt not in ("all", "archived") and summary["level"] != flt:
+        if flt != "all" and summary["level"] != flt:
             continue
         out.append(summary)
     out.sort(key=lambda s: (s["days_left"] if s["days_left"] is not None else 99999))
@@ -3649,8 +3517,6 @@ def history():
         out.append({
             "index": t.get("_idx"), "name": name, "unit": unit,
             "entry_date": t.get("entry_date", "") or "—",
-            "archived": bool(t.get("archived", False)),
-            "vacated_date": t.get("vacated_date", ""),
             "transactions": out_txns,
         })
     out.sort(key=lambda r: r["name"].lower())
@@ -3660,7 +3526,7 @@ def history():
 @app.route("/api/units/vacant")
 def vacant_units():
     data = load_state()
-    occupied = {t.get("unit") for t in data["tenants"] if t.get("unit") and not t.get("archived")}
+    occupied = {t.get("unit") for t in data["tenants"] if t.get("unit")}
     exclude = request.args.get("exclude")
     if exclude:
         occupied.discard(exclude)
@@ -3684,7 +3550,6 @@ def add_tenant():
     entry_str = (body.get("entry_date") or "").strip()
     notes = (body.get("notes") or "").strip()
     replace = bool(body.get("replace"))
-    existing_tenant = bool(body.get("existing_tenant"))
 
     if not name:
         return jsonify({"ok": False, "error": "Tenant name is required."}), 400
@@ -3699,31 +3564,6 @@ def add_tenant():
     except ValueError:
         return jsonify({"ok": False, "error": "Move-in date must be in YYYY-MM-DD format."}), 400
 
-    # Existing/older tenant: every field below is admin-entered rather
-    # than defaulted, since this tenant's rental history predates the
-    # app -- their due date, status, and last-payment date are known
-    # facts, not something to compute from a first payment that never
-    # happens here.
-    due_str = ""
-    status = "Pending"
-    pay_date = ""
-    if existing_tenant:
-        due_str = (body.get("due_date") or "").strip()
-        if due_str:
-            try:
-                datetime.strptime(due_str, "%Y-%m-%d")
-            except ValueError:
-                return jsonify({"ok": False, "error": "Due date must be in YYYY-MM-DD format."}), 400
-        status = "Confirmed" if (body.get("status") or "").strip().lower() == "confirmed" else "Pending"
-        pay_date = (body.get("pay_date") or "").strip()
-        if pay_date:
-            try:
-                datetime.strptime(pay_date, "%Y-%m-%d")
-            except ValueError:
-                return jsonify({"ok": False, "error": "Last payment date must be in YYYY-MM-DD format."}), 400
-        elif status == "Confirmed":
-            pay_date = date.today().strftime("%Y-%m-%d")
-
     rent = parse_amount(rent_str) if rent_str else 0.0
     record = {
         "name": name, "phone": phone,
@@ -3732,53 +3572,26 @@ def add_tenant():
         "emergency_contact": (body.get("emergency_contact") or "").strip(),
         "emergency_phone": (body.get("emergency_phone") or "").strip(),
         "unit": unit, "rent": rent,
-        "entry_date": entry_str, "due_date": due_str,
-        "status": status, "pay_date": pay_date, "notes": notes,
+        "entry_date": entry_str, "due_date": "",
+        "status": "Pending", "pay_date": "", "notes": notes,
         "payment_history": [], "deposit_history": [], "arrears_history": [],
         "locked_periods": [], "deposit_cycle_start": 0, "rent_increase_due": 0.0,
-        "archived": False, "vacated_date": "",
     }
-    if existing_tenant and due_str:
-        # Marks this tenant as having prior rental history (see
-        # has_prior_payment_history / due_date_shift_base) so their NEXT
-        # payment shifts forward from this manually-entered due_date,
-        # exactly like a tenant whose history was built up one payment
-        # at a time in the app -- not from their move-in date, which
-        # only applies to a tenant with no real due_date yet.
-        record["payment_history"] = [{
-            "date": entry_str, "months": 0, "amount": 0.0,
-            "from_date": entry_str, "to_date": due_str,
-            "txn_id": "manual-entry", "note": "Opening balance entered manually by admin.",
-        }]
 
     data = load_state()
     for i, t in enumerate(data["tenants"]):
-        # Only an ACTIVE (not already-archived) tenant blocks/triggers a
-        # replace on this unit -- an archived past tenant left behind on
-        # the unit for accountability should never stop a new one moving
-        # in, and should never itself get re-matched/re-archived here.
-        if t.get("unit") == unit and not t.get("archived"):
+        if t.get("unit") == unit:
             if not replace:
                 return jsonify({"ok": False, "error": "unit_taken",
                                  "message": f"Unit {unit} is already assigned to "
                                             f"{t.get('name', 'Unnamed Tenant')}."}), 409
-            # Tenant turnover: the outgoing tenant is archived in place --
-            # their full payment_history/deposit_history/arrears_history
-            # stays attached to this unit for future accountability -- and
-            # the incoming tenant becomes a brand-new record rather than
-            # overwriting theirs, so the unit's record trail stays
-            # continuous instead of restarting from a blank slate.
-            t["archived"] = True
-            t["vacated_date"] = date.today().strftime("%Y-%m-%d")
+            data["tenants"][i] = record
             save_state(data)
-            data["tenants"].append(record)
-            save_state(data)
-            return jsonify({"ok": True, "index": len(data["tenants"]) - 1})
+            return jsonify({"ok": True, "index": i})
 
     data["tenants"].append(record)
     save_state(data)
     return jsonify({"ok": True, "index": len(data["tenants"]) - 1})
-
 
 
 @app.route("/api/tenants/<int:idx>", methods=["PUT"])
@@ -3806,52 +3619,6 @@ def edit_tenant(idx):
     return jsonify({"ok": True})
 
 
-@app.route("/api/tenants/<int:idx>/old-data", methods=["POST"])
-def do_add_old_data(idx):
-    """Lets the admin backfill a tenant's pre-existing rental history --
-    every past payment/installment plus the tenant's current standing --
-    in one batch, for a tenant who was renting before this app existed.
-    Already covered by the same session-unlock gate as every other /api/
-    call (see _guard()), so no extra PIN check here."""
-    data = load_state()
-    tenants = data["tenants"]
-    if idx < 0 or idx >= len(tenants):
-        return jsonify({"error": "not found"}), 404
-    t = tenants[idx]
-    body = request.get_json(force=True) or {}
-    records = body.get("records") or []
-    if not isinstance(records, list) or not records:
-        return jsonify({"ok": False, "error": "Add at least one old transaction."}), 400
-
-    result = add_old_data(t, records, final_state=body.get("final_state"))
-    if result["added"] == 0:
-        return jsonify({"ok": False, "error": "None of the rows had a valid date (YYYY-MM-DD)."}), 400
-    save_state(data)
-    return jsonify({"ok": True, "result": result})
-
-
-@app.route("/api/tenants/<int:idx>/vacate", methods=["POST"])
-def vacate_tenant(idx):
-    """Marks a tenant as moved out without deleting them: their record
-    (and its full payment_history/deposit_history/arrears_history) stays
-    exactly as-is for future accountability, their unit frees up for a
-    new tenant, and they stop counting toward active-tenant totals,
-    occupancy, and rent-due alerts. Mirrors the archiving side of the
-    'replace' flow in add_tenant() -- this is that same step, offered on
-    its own for when there's no new tenant ready yet."""
-    data = load_state()
-    tenants = data["tenants"]
-    if idx < 0 or idx >= len(tenants):
-        return jsonify({"error": "not found"}), 404
-    t = tenants[idx]
-    if t.get("archived"):
-        return jsonify({"ok": False, "error": "This tenant is already marked as moved out."}), 400
-    t["archived"] = True
-    t["vacated_date"] = date.today().strftime("%Y-%m-%d")
-    save_state(data)
-    return jsonify({"ok": True})
-
-
 @app.route("/api/tenants/<int:idx>", methods=["DELETE"])
 def delete_tenant(idx):
     data = load_state()
@@ -3873,21 +3640,15 @@ def do_record_payment(idx):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
 
-    if t.get("archived"):
-        return jsonify({"ok": False,
-            "error": "This tenant has moved out, so a new rent payment can't be "
-                     "recorded for them. Use \u201cAdd Old Data\u201d instead if this is "
-                     "a backdated correction, or un-archive them first."}), 400
-
-    # Once a tenant has an installment/deposit plan in progress, full
+    # Once a tenant has an instalment/deposit plan in progress, full
     # "Pay Rent" is locked until that balance reaches zero -- enforced
     # here (not just hidden in the UI) so it holds for every caller,
     # including direct API calls, not just the phone-app button.
     _, dep_remaining, dep_cleared, dep_in_progress = current_deposit_cycle(t)
     if dep_in_progress and not dep_cleared:
         return jsonify({"ok": False,
-            "error": f"An installment plan is in progress (UGX {int(dep_remaining):,} "
-                     f"still remaining) — record installments until the balance reaches "
+            "error": f"An instalment plan is in progress (UGX {int(dep_remaining):,} "
+                     f"still remaining) — record instalments until the balance reaches "
                      f"zero before paying rent in full."}), 400
 
     body = request.get_json(force=True) or {}
@@ -3910,13 +3671,6 @@ def do_record_deposit(idx):
     if idx < 0 or idx >= len(tenants):
         return jsonify({"error": "not found"}), 404
     t = tenants[idx]
-
-    if t.get("archived"):
-        return jsonify({"ok": False,
-            "error": "This tenant has moved out, so a new installment can't be "
-                     "recorded for them. Use \u201cAdd Old Data\u201d instead if this is "
-                     "a backdated correction, or un-archive them first."}), 400
-
     body = request.get_json(force=True) or {}
     try:
         months = int(body.get("months", 1))
@@ -3925,13 +3679,13 @@ def do_record_deposit(idx):
     except (ValueError, TypeError):
         return jsonify({"ok": False, "error": "Select at least one month."}), 400
     try:
-        installment = float(str(body.get("amount", "")).strip().replace(",", ""))
-        if installment <= 0:
+        instalment = float(str(body.get("amount", "")).strip().replace(",", ""))
+        if instalment <= 0:
             raise ValueError
     except (ValueError, TypeError):
         return jsonify({"ok": False, "error": "Enter a valid deposit amount greater than zero."}), 400
 
-    result = record_deposit(t, months, installment)
+    result = record_deposit(t, months, instalment)
     save_state(data)
     return jsonify({"ok": True, "result": result})
 
@@ -3990,7 +3744,7 @@ def do_clear_arrears(idx):
 @app.route("/api/units")
 def list_units():
     data = load_state()
-    occupants = {t.get("unit"): t.get("name") for t in data["tenants"] if not t.get("archived")}
+    occupants = {t.get("unit"): t.get("name") for t in data["tenants"]}
     out = []
     for name, info in data["units"].items():
         rent = parse_amount(info.get("rent", 0) if isinstance(info, dict) else info)
@@ -4091,9 +3845,8 @@ def increase_rent(name):
 def alerts():
     data = load_state()
     tenants = _with_index(data["tenants"])
-    active = [t for t in tenants if not t.get("archived")]
     today = date.today()
-    items = get_watchlist_tenants(active, max_days=36500)
+    items = get_watchlist_tenants(tenants, max_days=36500)
     out = [_tenant_summary(t, today) | {"days_left": d} for t, d in items]
     return jsonify({"alerts": out})
 
@@ -4212,7 +3965,7 @@ INDEX_HTML = """<!DOCTYPE html>
      Screen") so it launches full-screen with its own icon, for easy
      repeat access without re-typing the LAN address each time. -->
 <link rel="manifest" href="manifest.json">
-<meta name="theme-color" content="#0B2B27">
+<meta name="theme-color" content="#14181A">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="icon-192.png?v=2">
 <link rel="apple-touch-icon" href="icon-256.png?v=2">
@@ -4220,27 +3973,24 @@ INDEX_HTML = """<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Tenant Management">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
   :root{
     /* ── Brand tokens that don't change between light/dark ── */
-    --teal-deep:#0F3D3A;
-    --teal:#178F82;
-    --teal-bright:#2FBFAE;
-    --brass:#A9793A;
-    --danger:#D6455B;
-    --warn:#B8791E;
-    --good:#2E8F6D;
+    --teal-deep:#0C7F69;
+    --teal:#0F9E82;
+    --teal-bright:#22D3A6;
+    --brass:#F59E0B;
+    --danger:#EF4444;
+    --warn:#F59E0B;
+    --good:#22C55E;
 
     --radius-sm:12px;
     --radius:18px;
     --radius-lg:26px;
 
-    --font-display:'Fraunces',Georgia,serif;
-    --font-body:'Inter',system-ui,-apple-system,sans-serif;
-    --font-mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --font-display:'Segoe UI',system-ui,-apple-system,sans-serif;
+    --font-body:'Segoe UI',system-ui,-apple-system,sans-serif;
+    --font-mono:'Consolas',ui-monospace,SFMono-Regular,Menlo,monospace;
   }
 
   /* ── Light mode: bright white, chosen explicitly in Settings or the
@@ -4251,9 +4001,9 @@ INDEX_HTML = """<!DOCTYPE html>
     --teal-soft:#E7F3F0;
     --teal-soft2:#F1F7F5;
     --brass-soft:#F6EDDC;
-    --ink:#10221E;
-    --muted:#5C6F68;
-    --line:#E4E7E3;
+    --ink:#1E2624;
+    --muted:#6B756F;
+    --line:#E7E2D8;
     --card:#FFFFFF;
     --card-2:#F3F5F2;
     --bg:#FFFFFF;
@@ -4270,22 +4020,11 @@ INDEX_HTML = """<!DOCTYPE html>
        color wheel, differentiated by icon/label, not hue. Solid values
        on purpose: the JS layer reuses these as plain text colors too
        (not just tile backgrounds), where a gradient wouldn't render. */
-    --accent-tenants:#013CEE;
-    --accent-units:#E5922A;
-    --accent-income:#206E3A;
-    --accent-alerts:#D34321;
+    --accent-tenants:#1A73E8;
+    --accent-units:#F9A825;
+    --accent-income:#2E7D32;
+    --accent-alerts:#E65100;
     color-scheme:light;
-
-    /* Text-on-soft-background color -- same dark teal as --teal-deep in
-       light mode, where it reads fine against white/pale-teal
-       backgrounds. See the dark-mode override below: this is the
-       variable that should have been swapped for dark mode everywhere
-       --teal-deep was being used as *text* (as opposed to a button/pill
-       background painted solid, which stays --teal-deep in both modes),
-       and wasn't -- which is what made the back button and various
-       labels in Settings unreadable (dark text on a dark background) in
-       dark mode. */
-    --teal-ink:var(--teal-deep);
   }
 
   /* ── Dark mode: the previous default palette, now an explicit choice
@@ -4298,12 +4037,12 @@ INDEX_HTML = """<!DOCTYPE html>
     --teal-soft:#173934;
     --teal-soft2:#123531;
     --brass-soft:#2E2517;
-    --ink:#EFF5F2;
-    --muted:#93A6A0;
-    --line:#223734;
-    --card:#132B27;
-    --card-2:#17332E;
-    --bg:#0B1E1B;
+    --ink:#ECEDEC;
+    --muted:#8B9592;
+    --line:#2A3033;
+    --card:#1C2124;
+    --card-2:#1B2225;
+    --bg:#14181A;
     --danger-soft:#3A1A20;
     --warn-soft:#332612;
     --amber-soft:#33280f;
@@ -4314,11 +4053,10 @@ INDEX_HTML = """<!DOCTYPE html>
     --shadow-lift:0 22px 44px -18px rgba(0,0,0,.6);
 
     --accent-tenants:var(--teal-bright);
-    --accent-units:#E0AE5C;
-    --accent-income:#3DD9C4;
-    --accent-alerts:#F0955C;
+    --accent-units:#FBBF24;
+    --accent-income:#34D399;
+    --accent-alerts:#F87171;
     color-scheme:dark;
-    --teal-ink:var(--teal-bright);
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
   html,body{margin:0;padding:0;}
@@ -4340,7 +4078,7 @@ INDEX_HTML = """<!DOCTYPE html>
   header.top{
     position:sticky;top:0;z-index:20;
     padding:calc(env(safe-area-inset-top) + 14px) 18px 14px;
-    background:linear-gradient(165deg,rgba(15,61,58,.96),rgba(11,42,39,.98));
+    background:linear-gradient(165deg,rgba(12,127,105,.96),rgba(27,42,46,.98));
     -webkit-backdrop-filter:saturate(160%) blur(14px);
     backdrop-filter:saturate(160%) blur(14px);
     color:#fff;
@@ -4349,15 +4087,12 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   header.top .brand{display:flex;align-items:center;gap:11px;min-width:0;}
   header.top .brand .mark{
-    width:36px;height:36px;border-radius:11px;flex-shrink:0;overflow:hidden;
+    width:36px;height:36px;border-radius:11px;flex-shrink:0;
     background:linear-gradient(155deg,var(--teal-bright),var(--teal-deep));
     box-shadow:0 6px 16px -6px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.18);
     display:flex;align-items:center;justify-content:center;font-weight:700;
   }
-  /* Same bitmap the desktop app uses as its own icon (served from
-     /icon-<size>.png, see app_icon() below) rather than a hand-drawn
-     approximation of it, so the header glyph matches the PC app exactly. */
-  header.top .brand .mark img{width:100%;height:100%;object-fit:cover;display:block;}
+  header.top .brand .mark svg{width:19px;height:19px;display:block;}
   header.top h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.1px;}
   header.top .sub{font-size:11px;opacity:.7;margin-top:2px;font-family:var(--font-body);}
   .icon-btn{
@@ -4377,7 +4112,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
   .stat{padding:14px;border-radius:var(--radius-sm);background:var(--card-2);}
-  .stat .num{font-family:var(--font-mono);font-size:21px;font-weight:600;color:var(--teal-ink);font-variant-numeric:tabular-nums;}
+  .stat .num{font-family:var(--font-mono);font-size:21px;font-weight:600;color:var(--teal-deep);font-variant-numeric:tabular-nums;}
   .stat .lbl{font-size:11.5px;color:var(--muted);margin-top:3px;}
 
   /* ── Dashboard "ledger tile" cards — the signature element: a
@@ -4416,7 +4151,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .btn:active{transform:scale(.97);}
   .btn-primary{background:linear-gradient(155deg,var(--teal-bright),var(--teal));color:#fff;box-shadow:0 8px 18px -8px rgba(23,143,130,.55);}
   .btn-primary:active{filter:brightness(.92);}
-  .btn-ghost{background:var(--teal-soft);color:var(--teal-ink);}
+  .btn-ghost{background:var(--teal-soft);color:var(--teal-deep);}
   .btn-danger{background:var(--danger-soft);color:var(--danger);}
   .btn-full{width:100%;}
   .btn:disabled{opacity:.5;}
@@ -4443,7 +4178,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .tenant-row:active{background:var(--card-2);}
   .tenant-row:last-child{border-bottom:none;}
   .avatar{
-    width:42px;height:42px;border-radius:12px;background:var(--teal-soft);color:var(--teal-ink);
+    width:42px;height:42px;border-radius:12px;background:var(--teal-soft);color:var(--teal-deep);
     display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0;
     font-family:var(--font-display);
   }
@@ -4472,42 +4207,19 @@ INDEX_HTML = """<!DOCTYPE html>
     background:var(--card-2);border-radius:var(--radius-sm);padding:12px 14px;
     font-size:12.5px;color:var(--muted);
   }
-  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow-x:auto;}
+  .hist-table{border:1px solid var(--line);border-radius:var(--radius-sm);overflow:hidden;}
   .hist-hdr{
-    display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
-    background:var(--card-2);padding:8px 10px;font-size:9.5px;font-weight:700;
-    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);white-space:nowrap;
+    display:grid;grid-template-columns:1.1fr 1fr .9fr 1.4fr;gap:4px;
+    background:var(--card-2);padding:8px 10px;font-size:10px;font-weight:700;
+    letter-spacing:.3px;text-transform:uppercase;color:var(--muted);
   }
   .hist-row{
-    display:grid;grid-template-columns:1fr .8fr 1fr 1.3fr;gap:6px;
-    padding:9px 10px;font-size:11.5px;font-family:var(--font-mono);border-top:1px solid var(--line);
-    align-items:center;white-space:nowrap;
+    display:grid;grid-template-columns:1.1fr 1fr .9fr 1.4fr;gap:4px;
+    padding:9px 10px;font-size:12px;font-family:var(--font-mono);border-top:1px solid var(--line);align-items:center;
   }
-  .hist-row > div{overflow:hidden;text-overflow:ellipsis;}
   .hist-row.hist-cancelled{background:var(--danger-soft);color:var(--danger);}
   .hist-period{color:var(--muted);font-size:11px;font-family:var(--font-body);}
   .hist-row.hist-cancelled .hist-period{color:var(--danger);opacity:.8;}
-  .mr-hdr{
-    display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:6px;
-    padding:8px 10px;font-size:9.5px;font-weight:700;letter-spacing:.3px;
-    text-transform:uppercase;color:var(--muted);background:var(--card-2);
-    border-top-left-radius:var(--radius-sm);border-top-right-radius:var(--radius-sm);white-space:nowrap;
-  }
-  .mr-row{
-    display:grid;grid-template-columns:1.3fr 1fr 1fr;gap:6px;align-items:center;
-    padding:9px 10px;font-size:11.5px;font-family:var(--font-mono);border-top:1px solid var(--line);
-    white-space:nowrap;
-  }
-  .mr-row > div{overflow:hidden;text-overflow:ellipsis;}
-  .mr-row .mr-name{
-    font-family:var(--font-body);
-  }
-  .mr-row .mr-unit{
-    color:var(--muted);
-  }
-  .mr-row .mr-amt{
-    font-weight:700;text-align:right;
-  }
   .month-picker-control{
     width:100%;border:1.5px solid var(--line);border-radius:var(--radius-sm);padding:11px 12px;
     font-size:14px;background:var(--card);color:var(--ink);display:flex;align-items:center;
@@ -4537,7 +4249,7 @@ INDEX_HTML = """<!DOCTYPE html>
   .month-row .month-label{flex:1;}
   .month-row.cleared{background:var(--card-2);color:var(--muted);cursor:default;}
   .month-row.cleared .month-tag{
-    font-size:10px;font-weight:700;color:var(--teal-ink);background:var(--teal-soft);
+    font-size:10px;font-weight:700;color:var(--teal-deep);background:var(--teal-soft);
     padding:2px 7px;border-radius:999px;text-transform:uppercase;letter-spacing:.3px;
   }
   .month-row.open:active{background:var(--card-2);}
@@ -4580,7 +4292,7 @@ INDEX_HTML = """<!DOCTYPE html>
   nav.tabbar .tab.active .ic{font-size:21px;}
   .empty{text-align:center;padding:36px 12px;color:var(--muted);}
   .empty .big{font-size:32px;margin-bottom:8px;}
-  .section-title{font-size:12.5px;font-weight:700;color:var(--teal-ink);text-transform:uppercase;letter-spacing:.5px;margin:4px 0 10px;font-family:var(--font-body);}
+  .section-title{font-size:12.5px;font-weight:700;color:var(--teal-deep);text-transform:uppercase;letter-spacing:.5px;margin:4px 0 10px;font-family:var(--font-body);}
   .modal-backdrop{
     position:fixed;inset:0;background:rgba(8,20,18,.55);z-index:100;
     -webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);
@@ -4609,15 +4321,15 @@ INDEX_HTML = """<!DOCTYPE html>
      the app itself. Uses the theme background so it never flashes a
      mismatched color before/after the lock screen or app appear. ── */
   .splash-screen{
-    position:fixed;inset:0;z-index:3000;background:var(--bg);color:var(--teal-ink);
+    position:fixed;inset:0;z-index:3000;background:var(--bg);color:var(--teal-deep);
     display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
   }
   html[data-theme="dark"] .splash-screen{color:var(--teal-bright);}
   /* Static fallback for prefers-reduced-motion (see hideSplash()) -- a
      plain fade instead of the lunge/wipe below. */
   .splash-screen.hidden{opacity:0;pointer-events:none;transition:opacity .25s ease;}
-  .splash-house{width:60px;height:60px;border-radius:16px;overflow:hidden;animation:splash-grow 1.1s ease-in-out infinite;transform-origin:center;}
-  .splash-house img{width:100%;height:100%;object-fit:cover;display:block;}
+  .splash-house{width:60px;height:60px;animation:splash-grow 1.1s ease-in-out infinite;transform-origin:center;}
+  .splash-house svg{width:100%;height:100%;display:block;}
   @keyframes splash-grow{
     0%,100%{transform:scale(.72);opacity:.55;}
     50%{transform:scale(1.18);opacity:1;}
@@ -4652,7 +4364,7 @@ INDEX_HTML = """<!DOCTYPE html>
     .splash-screen.wiping{animation:none;}
   }
   .lockscreen{
-    position:fixed;inset:0;background:radial-gradient(120% 100% at 50% 0%,#164740 0%,#0B2B27 55%,#081D1A 100%);
+    position:fixed;inset:0;background:radial-gradient(120% 100% at 50% 0%,#1B2225 0%,#14181A 55%,#0F1416 100%);
     z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;padding:24px;
   }
   .pin-dots{display:flex;gap:12px;margin:22px 0;}
@@ -4665,7 +4377,7 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .keypad button:active{background:rgba(255,255,255,.22);transform:scale(.94);}
   .disc-screen{
-    position:fixed;inset:0;background:radial-gradient(120% 100% at 50% 0%,#164740 0%,#0B2B27 55%,#081D1A 100%);
+    position:fixed;inset:0;background:radial-gradient(120% 100% at 50% 0%,#1B2225 0%,#14181A 55%,#0F1416 100%);
     z-index:1100;display:flex;flex-direction:column;align-items:center;justify-content:center;
     color:#fff;padding:32px;text-align:center;
   }
@@ -4686,12 +4398,12 @@ INDEX_HTML = """<!DOCTYPE html>
   .txn-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:13px;}
   .txn-item:last-child{border-bottom:none;}
   .txn-item .amt{font-weight:600;font-size:14px;}
-  .txn-item .amt.cancelled{color:var(--danger);font-weight:500;}
+  .txn-item .amt.cancelled{text-decoration:line-through;color:var(--muted);font-weight:500;}
   .badge-dot{
     position:absolute;top:-4px;right:-4px;background:var(--danger);color:#fff;font-size:10px;font-weight:700;
     min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 3px;
   }
-  a.linklike{color:var(--teal-ink);font-weight:600;text-decoration:none;font-size:13px;}
+  a.linklike{color:var(--teal-deep);font-weight:600;text-decoration:none;font-size:13px;}
   .progress-bar{height:8px;border-radius:6px;background:var(--teal-soft);overflow:hidden;margin-top:6px;}
   .progress-bar > div{height:100%;background:linear-gradient(90deg,var(--teal),var(--teal-bright));}
   hr.sep{border:none;border-top:1px solid var(--line);margin:14px 0;}
@@ -4708,7 +4420,7 @@ INDEX_HTML = """<!DOCTYPE html>
     height:0;overflow:hidden;transition:height .15s ease;
   }
   .ptr-indicator.visible{height:34px;line-height:34px;}
-  .ptr-indicator.ready{color:var(--teal-ink);}
+  .ptr-indicator.ready{color:var(--teal-deep);}
   .ptr-indicator.spinning{animation:ptr-pulse 1s ease-in-out infinite;}
   @keyframes ptr-pulse{0%,100%{opacity:.5;}50%{opacity:1;}}
   .pending-note{
@@ -4721,7 +4433,10 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <div id="splashScreen" class="splash-screen">
   <div class="splash-house">
-    <img src="icon-256.png?v=2" alt="">
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M4 11.5 12 4l8 7.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
   </div>
   <div class="splash-label">Tenant Management</div>
 </div>
@@ -4751,12 +4466,13 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="app" id="app" style="display:none;">
   <header class="top">
     <div class="brand">
-      <div class="mark"><img src="icon-256.png?v=2" alt=""></div>
+      <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 11.5 12 4l8 7.5" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
       <div>
         <h1>Tenant Management</h1>
         <div class="sub" id="headerSub">—</div>
       </div>
     </div>
+    <div id="syncBadge" class="sync-badge" style="display:none;"></div>
     <button class="icon-btn" onclick="lockNow()" title="Lock">🔒</button>
   </header>
   <div id="ptrIndicator" class="ptr-indicator">↓ Pull to refresh</div>
@@ -4778,30 +4494,7 @@ INDEX_HTML = """<!DOCTYPE html>
 const $ = (sel, el=document) => el.querySelector(sel);
 const $$ = (sel, el=document) => [...el.querySelectorAll(sel)];
 const fmt = n => 'UGX ' + Math.round(n||0).toLocaleString();
-// Bare number, no "UGX" prefix -- used inside row-level lists (monthly
-// transactions, per-tenant transaction history) where the currency is
-// already labelled once on the column header, so repeating it on every
-// single row is just noise (and the extra characters were what pushed
-// those rows onto two lines on narrow screens).
-const fmtNum = n => Math.round(n||0).toLocaleString();
 const todayStr = () => new Date().toISOString().slice(0,10);
-// Adds `n` (whole, possibly negative) months to an ISO date string,
-// clamping the day to the target month's length -- mirrors the
-// server-side add_months() so autofilled/derived dates always agree
-// with what the backend would compute for the same input.
-function addMonthsISO(dateStr, n) {
-  if (!dateStr) return '';
-  const [y, m, d] = dateStr.split('-').map(Number);
-  if (!y || !m || !d) return '';
-  const totalMonthIndex = (m - 1) + n;
-  const ny = y + Math.floor(totalMonthIndex / 12);
-  const nm = ((totalMonthIndex % 12) + 12) % 12 + 1;
-  const lastDay = new Date(ny, nm, 0).getDate();
-  const nd = Math.min(d, lastDay);
-  const pad = x => String(x).padStart(2, '0');
-  return `${ny}-${pad(nm)}-${pad(nd)}`;
-}
-const oneMonthAheadISO = dateStr => addMonthsISO(dateStr, 1);
 
 // ── theme (Light/Dark, set in Settings) ────────────────────────────────
 // The bootstrap <script> in <head> already set data-theme before this
@@ -4875,7 +4568,7 @@ function leaseProgressBlock(t) {
   </div>`;
 }
 
-let state = { tab:'dashboard', tenants:[], selectedIdx:null, filter:'all', q:'', unitsFilter:'all', alertsFilter:'all' };
+let state = { tab:'dashboard', tenants:[], selectedIdx:null, filter:'all', q:'' };
 
 // ── Offline queue + cache ───────────────────────────────────────────
 // While this phone/browser can't reach the PC (PC is off, or off Wi-Fi),
@@ -5370,12 +5063,7 @@ async function flushQueue() {
   if (progressed) cacheDeletePrefix('/api/');
   syncing = false; updateSyncBadge();
   toast('All changes synced ✓');
-  // refreshIfSafe() (not a bare render()) -- this fires as soon as
-  // connectivity returns, which can land in the middle of someone editing
-  // a tenant (modal open) or filling out Add Tenant. A bare render() used
-  // to blow those away out from under the person; refreshIfSafe() knows
-  // to skip in exactly those cases.
-  refreshIfSafe();
+  render();
 }
 
 // ── PWA: service worker + "Add to Home Screen" / install prompt ───────
@@ -5520,51 +5208,6 @@ async function cloudFetch(path, opts = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) { data.ok = false; data.error = data.error || 'cloud_request_failed'; }
   return data;
-}
-
-// ── file downloads (Excel / PDF exports) ────────────────────────────────
-// Plain <a href="api/export/..."> links used to be the whole
-// implementation here, which works for the PC-local test server but
-// breaks for every phone paired through CLOUD_MODE: a bare browser
-// navigation carries none of the X-Session-Id/X-Secret-Key headers
-// _cloud_gate() requires, so it 401s and the phone's browser just
-// renders the raw {"ok":false,"error":"session_required"} JSON as a
-// page -- which is exactly the "error message instead of a file"
-// people were seeing. Fetching the same way api()/cloudFetch() already
-// do (with those headers attached) and turning the response into a
-// blob download fixes it for both cloud-direct and local/LAN sessions.
-async function downloadFile(path, filename) {
-  try {
-    if (!cloudCfg || !cloudCfg.configured) await loadCloudConfig();
-    let res;
-    if (cloudCfg && cloudCfg.configured) {
-      res = await fetch(cloudCfg.cloud_base_url + path, {
-        headers: {
-          'X-Session-Id': cloudCfg.session_id,
-          'X-Secret-Key': cloudCfg.secret_key,
-          'X-Device-Id': DEVICE_ID,
-        },
-      });
-    } else {
-      res = await fetch(path, { headers: { 'X-Device-Id': DEVICE_ID } });
-    }
-    if (!res.ok) {
-      let msg = `Download failed (HTTP ${res.status}).`;
-      try { const j = await res.json(); if (j && j.error) msg = j.error; } catch (e) {}
-      toast(msg);
-      return;
-    }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-  } catch (e) {
-    toast('Could not download the file — check your connection and try again.');
-  }
 }
 
 // ── api helper ───────────────────────────────────────────────────────
@@ -5799,7 +5442,7 @@ function openModal(html, opts) {
   root.innerHTML = `<div class="modal-backdrop" ${dismissible ? `onclick="if(event.target===this) closeModal()"` : ''}>
     <div class="modal" style="position:relative;">
       <div class="modal-handle"></div>
-      ${dismissible ? `<button class="icon-btn close-x" style="background:var(--teal-soft);color:var(--teal-ink);" onclick="closeModal()">✕</button>` : ''}
+      ${dismissible ? `<button class="icon-btn close-x" style="background:var(--teal-soft);color:var(--teal-deep);" onclick="closeModal()">✕</button>` : ''}
       ${html}
     </div>
   </div>`;
@@ -5967,14 +5610,7 @@ function dcard({accent, icon, title, value, subs, actionLabel, actionTab}) {
 }
 
 async function renderDashboard() {
-  const path = '/api/dashboard';
-  const cached = cacheGet(path);
-  if (cached && !cached.no_cache) paintDashboard(cached);
-  const d = await api(path);
-  if (state.tab !== 'dashboard') return;
-  paintDashboard(d);
-}
-function paintDashboard(d) {
+  const d = await api('/api/dashboard');
   if (d.no_cache) {
     // Offline and the dashboard was never loaded on this device before --
     // showing "0 tenants · 0 units" here would look like real data instead
@@ -6000,7 +5636,7 @@ function paintDashboard(d) {
         accent: D_GREEN, icon:'💰', title:`Total Income — ${d.month_name}`,
         value: fmt(d.month_income),
         subs: [['Full', fmt(d.full_payment_total), 'var(--good)'],
-               ['Deposits', fmt(d.deposit_total), 'var(--teal-ink)'],
+               ['Deposits', fmt(d.deposit_total), 'var(--teal-deep)'],
                ['Cancelled', fmt(d.cancelled_total), 'var(--danger)']],
         actionLabel:'View Records', actionTab:'history'
       })}
@@ -6008,7 +5644,7 @@ function paintDashboard(d) {
         accent: D_ORANGE, icon:'🔔', title:'Rent Alerts', value: d.counts.pending,
         subs: [['Pending', d.counts.pending, 'var(--warn)'],
                ['Paid in Full', d.counts.paid, 'var(--good)'],
-               ['Installments', d.counts.underpaid, 'var(--teal-ink)']],
+               ['Installments', d.counts.underpaid, 'var(--teal-deep)']],
         actionLabel:'View Alerts', actionTab:'alerts'
       })}
     </div>
@@ -6020,16 +5656,14 @@ function tenantRowHtml(t) {
   const daysTxt = t.days_left===null||t.days_left===undefined ? '' :
     (t.days_left<0 ? `Overdue ${Math.abs(t.days_left)}d` : `${t.days_left}d left`);
   const initials = (t.name||'?').split(' ').filter(Boolean).slice(0,2).map(w=>w[0]).join('').toUpperCase();
-  const chip = t.archived
-    ? `<span class="chip" style="background:var(--card-2);color:var(--muted);">Moved out${t.vacated_date ? ' ' + escapeHtml(t.vacated_date) : ''}</span>`
-    : (t._pending || t._pendingSync)
-      ? `<span class="chip chip-underpaid">🕓 Pending sync</span>`
-      : `<span class="chip ${chipClass}">${t.label}</span>`;
+  const chip = (t._pending || t._pendingSync)
+    ? `<span class="chip chip-underpaid">🕓 Pending sync</span>`
+    : `<span class="chip ${chipClass}">${t.label}</span>`;
   return `<div class="tenant-row" onclick="openTenant(${t.index})">
     <div class="avatar">${initials||'?'}</div>
     <div class="meta">
       <div class="name">${escapeHtml(t.name)}</div>
-      <div class="sub">${escapeHtml(t.unit)} · ${t.archived ? 'Past tenant' : daysTxt}</div>
+      <div class="sub">${escapeHtml(t.unit)} · ${daysTxt}</div>
     </div>
     ${chip}
   </div>`;
@@ -6061,27 +5695,13 @@ function openTenant(idx) { state.selectedIdx = idx; state.tab = 'tenant-detail';
 // ── TENANTS LIST ─────────────────────────────────────────────────────
 async function renderTenants() {
   const params = new URLSearchParams({q: state.q, filter: state.filter});
-  const path = '/api/tenants?' + params.toString();
-  // Paint whatever's cached for this exact query immediately -- no need
-  // to wait on the network round trip just to show what was already on
-  // screen a moment ago. The live api() call below still runs right
-  // after and repaints with the real, current numbers as soon as they
-  // arrive (or leaves the cached view up if this tab's been left by then).
-  const cached = cacheGet(path);
-  if (cached) paintTenants(cached);
-  const d = await api(path);
-  if (state.tab !== 'tenants') return;
-  paintTenants(d);
-}
-function paintTenants(d) {
+  const d = await api('/api/tenants?' + params.toString());
   $('#headerSub').textContent = `${d.tenants.length} shown`;
-  const filters = [['all','All'],['paid','Paid'],['underpaid','Installments'],['pending','Pending'],['archived','Past']];
+  const filters = [['all','All'],['paid','Paid'],['underpaid','Instalments'],['pending','Pending']];
   const emptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
     : `<div class="empty"><div class="big">👤</div>No tenants match.</div>`;
   const rows = d.tenants.map(tenantRowHtml).join('') || emptyMsg;
-  const hadFocus = document.activeElement && document.activeElement.id === 'searchInput';
-  const selStart = hadFocus ? document.activeElement.selectionStart : null;
   $('#main').innerHTML = `
     <div class="searchbar"><span>🔎</span><input id="searchInput" placeholder="Search name or unit" value="${escapeHtml(state.q)}"></div>
     <div class="filters">${filters.map(([k,l])=>`<div class="filter-pill ${state.filter===k?'active':''}" data-f="${k}">${l}</div>`).join('')}</div>
@@ -6090,7 +5710,6 @@ function paintTenants(d) {
   `;
   $('#searchInput').addEventListener('input', debounce(e => { state.q = e.target.value; renderTenants(); }, 300));
   $$('.filter-pill').forEach(p => p.addEventListener('click', () => { state.filter = p.dataset.f; renderTenants(); }));
-  if (hadFocus) { const el = $('#searchInput'); el.focus(); el.setSelectionRange(selStart, selStart); }
 }
 function debounce(fn, ms) { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
 
@@ -6103,11 +5722,6 @@ async function renderAddTenant() {
     <button class="btn btn-ghost" style="margin-bottom:12px;" onclick="state.tab='tenants'; render();">← Back</button>
     <div class="card">
       <h2 style="margin-top:0;">Add Tenant</h2>
-      <div class="row" style="margin-bottom:14px;">
-        <button type="button" class="btn filter-pill active" id="modeNewBtn" onclick="setAddTenantMode(false)">New Tenant</button>
-        <button type="button" class="btn filter-pill" id="modeExistingBtn" onclick="setAddTenantMode(true)">Existing / Older Tenant</button>
-      </div>
-      <div class="desc" id="modeHint" style="margin-bottom:12px;">A brand-new tenant with no rental history yet — their due date is set automatically once their first payment is recorded.</div>
       <label class="field">Full Name *</label><input id="f_name">
       <label class="field">Unit *</label><select id="f_unit"><option value="">Select a vacant unit…</option>${opts}</select>
       <label class="field">Phone *</label><input id="f_phone">
@@ -6117,12 +5731,6 @@ async function renderAddTenant() {
       <div><label class="field">Emergency Phone</label><input id="f_emergency_phone"></div></div>
       <label class="field">Monthly Rent (UGX)</label><input id="f_rent" inputmode="numeric">
       <label class="field">Move-in Date *</label><input id="f_entry_date" type="date" value="${todayStr()}">
-      <div id="existingFields" style="display:none;">
-        <label class="field">Current Due Date *</label><input id="f_due_date" type="date">
-        <label class="field">Current Status</label>
-        <select id="f_status"><option value="Pending">Pending (rent owed)</option><option value="Confirmed">Confirmed (paid up)</option></select>
-        <label class="field">Last Payment Date</label><input id="f_pay_date" type="date">
-      </div>
       <label class="field">Notes</label><textarea id="f_notes" rows="2"></textarea>
       <div class="err" id="addErr"></div>
       <button class="btn btn-primary btn-full" style="margin-top:12px;" onclick="submitAddTenant()">Save Tenant</button>
@@ -6133,36 +5741,19 @@ async function renderAddTenant() {
     if (opt && opt.dataset.rent) $('#f_rent').value = opt.dataset.rent;
   });
 }
-function setAddTenantMode(existing) {
-  state._addTenantExisting = existing;
-  $('#modeNewBtn').classList.toggle('active', !existing);
-  $('#modeExistingBtn').classList.toggle('active', existing);
-  $('#existingFields').style.display = existing ? 'block' : 'none';
-  $('#modeHint').textContent = existing
-    ? 'This tenant already has rental history before being added here — fill in their current due date, status, and last payment date exactly as they stand today.'
-    : 'A brand-new tenant with no rental history yet — their due date is set automatically once their first payment is recorded.';
-}
 async function submitAddTenant(replace=false) {
   if (!replace && !_beginAction('submitAddTenant')) return;
   try {
-    const existing = !!state._addTenantExisting;
     const body = {
       name: $('#f_name').value, unit: $('#f_unit').value, phone: $('#f_phone').value,
       email: $('#f_email').value, occupation: $('#f_occupation').value,
       emergency_contact: $('#f_emergency_contact').value, emergency_phone: $('#f_emergency_phone').value,
       rent: $('#f_rent').value, entry_date: $('#f_entry_date').value, notes: $('#f_notes').value, replace,
-      existing_tenant: existing,
     };
-    if (existing) {
-      body.due_date = $('#f_due_date').value;
-      body.status = $('#f_status').value;
-      body.pay_date = $('#f_pay_date').value;
-      if (!body.due_date) { $('#addErr').textContent = 'Current due date is required for an existing tenant.'; return; }
-    }
     const d = await api('/api/tenants', {method:'POST', body: JSON.stringify(body)});
     if (d.ok) { toast('Tenant saved.'); state.tab='tenants'; render(); return; }
     if (d.error === 'unit_taken') {
-      if (confirm(d.message + ' The outgoing tenant will be archived (their history is kept for accountability) and this new tenant added. Continue?')) return await submitAddTenant(true);
+      if (confirm(d.message + ' Replace with this new tenant?')) return await submitAddTenant(true);
       return;
     }
     $('#addErr').textContent = d.error || 'Could not save tenant.';
@@ -6172,20 +5763,8 @@ async function submitAddTenant(replace=false) {
 }
 
 // ── TENANT DETAIL ────────────────────────────────────────────────────
-// Same cache-first pattern as renderTenants(): paint whatever's already
-// cached for this tenant instantly (no network wait), then repaint with
-// the live data once it arrives. This is what makes tapping into a
-// tenant feel instant on repeat visits instead of showing a blank/loading
-// screen for the length of a full round trip every single time.
 async function renderTenantDetail(idx) {
-  const path = '/api/tenants/' + idx;
-  const cached = cacheGet(path);
-  if (cached) paintTenantDetail(idx, cached);
-  const d = await api(path);
-  if (state.tab !== 'tenant-detail' || state.selectedIdx !== idx) return;
-  paintTenantDetail(idx, d);
-}
-function paintTenantDetail(idx, d) {
+  const d = await api('/api/tenants/' + idx);
   const t = d.tenant;
   if (!t) {
     // Offline, and this specific tenant was never viewed/cached before —
@@ -6222,7 +5801,7 @@ function paintTenantDetail(idx, d) {
   const depPct = t.rent>0 ? Math.min(100, Math.round((t.deposit_paid/t.rent)*100)) : 0;
   const depBlock = (t.level==='underpaid') ? `
     <div class="card">
-      <div class="section-title" style="margin-top:0;">Installment Progress</div>
+      <div class="section-title" style="margin-top:0;">Instalment Progress</div>
       <div style="display:flex;justify-content:space-between;font-size:13px;"><span>${fmt(t.deposit_paid)} paid</span><span>${fmt(t.deposit_remaining)} left</span></div>
       <div class="progress-bar"><div style="width:${depPct}%"></div></div>
     </div>` : '';
@@ -6261,11 +5840,6 @@ function paintTenantDetail(idx, d) {
         <button class="btn btn-ghost" onclick="openEditTenant(${idx})">✎ Edit Tenant</button>
         <button class="btn btn-danger" onclick="deleteTenant(${idx})">🗑 Delete Tenant</button>
       </div>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn btn-ghost" onclick="openOldDataModal(${idx})">🕘 Add Old Data</button>
-        ${t.archived ? '' : `<button class="btn btn-ghost" onclick="vacateTenant(${idx})">🚪 Mark as Moved Out</button>`}
-      </div>
-      ${t.archived ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">This tenant moved out${t.vacated_date ? ' on ' + escapeHtml(t.vacated_date) : ''}. Their unit is free for a new tenant; this record is kept for accountability.</div>` : ''}
     </div>
 
     ${leaseProgressBlock(t)}
@@ -6273,28 +5847,24 @@ function paintTenantDetail(idx, d) {
     ${arrearsBlock}
 
     <div class="card">
-      ${t.archived ? `
-      <div class="sub" style="color:var(--muted);font-size:12px;">🚪 This tenant has moved out, so new payments can't be recorded against them. Use "Add Old Data" above for a backdated correction.</div>
-      ` : `
       <div class="row">
         ${t.level === 'underpaid'
           ? `<button class="btn btn-primary" disabled style="opacity:.5;cursor:not-allowed;">🔒 Pay Rent</button>`
           : `<button class="btn btn-primary" onclick="openPaymentModal(${idx})">💳 Pay Rent</button>`}
       </div>
       <div class="row" style="margin-top:10px;">
-        <button class="btn btn-ghost" onclick="openDepositModal(${idx})">＋ Record Installment</button>
+        <button class="btn btn-ghost" onclick="openDepositModal(${idx})">＋ Record Instalment</button>
       </div>
       ${t.level === 'underpaid'
-        ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">🔒 Pay Rent is locked while an installment plan is in progress. Keep recording installments until the balance reaches zero.</div>`
+        ? `<div class="sub" style="color:var(--muted);font-size:12px;margin-top:8px;">🔒 Pay Rent is locked while an instalment plan is in progress. Keep recording instalments until the balance reaches zero.</div>`
         : ''}
-      `}
     </div>
 
     <div class="section-title">Payment History</div>
     <div class="card" style="padding:4px 14px;">${payHist || '<div class="empty" style="padding:16px;">No full payments yet.</div>'}</div>
 
-    <div class="section-title">Installment / Deposit History</div>
-    <div class="card" style="padding:4px 14px;">${depHist || '<div class="empty" style="padding:16px;">No installments yet.</div>'}</div>
+    <div class="section-title">Instalment / Deposit History</div>
+    <div class="card" style="padding:4px 14px;">${depHist || '<div class="empty" style="padding:16px;">No instalments yet.</div>'}</div>
   `;
 }
 // history arrays are returned reversed (most-recent-first); recover original index for cancel calls
@@ -6313,7 +5883,7 @@ function txnRow(t, r, key, origI) {
     </div>
     <div style="display:flex;align-items:center;gap:10px;">
       <span class="amt ${cancelled?'cancelled':''}">${fmt(r.amount)}</span>
-      ${!cancelled ? `<button class="icon-btn" style="width:30px;height:30px;background:var(--teal-soft);color:var(--teal-ink);font-size:13px;" onclick="cancelTxn(${t.index}, '${key}', ${origI})">↺</button>`:''}
+      ${!cancelled ? `<button class="icon-btn" style="width:30px;height:30px;background:var(--teal-soft);color:var(--teal-deep);font-size:13px;" onclick="cancelTxn(${t.index}, '${key}', ${origI})">↺</button>`:''}
     </div>
   </div>`;
 }
@@ -6369,18 +5939,6 @@ async function submitEditTenant(idx) {
     _endAction(_k);
   }
 }
-async function vacateTenant(idx) {
-  const _k = `vacateTenant:${idx}`;
-  if (!_beginAction(_k)) return;
-  try {
-    if (!confirm('Mark this tenant as moved out? Their unit becomes free for a new tenant and their full history is kept, just archived.')) return;
-    const d = await api(`/api/tenants/${idx}/vacate`, {method:'POST'});
-    if (d.ok) { toast('Tenant marked as moved out.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
-    else toast(d.error || 'Could not update.');
-  } finally {
-    _endAction(_k);
-  }
-}
 async function deleteTenant(idx) {
   const _k = `deleteTenant:${idx}`;
   if (!_beginAction(_k)) return;
@@ -6393,140 +5951,7 @@ async function deleteTenant(idx) {
   }
 }
 
-// ── Add Old Data (admin backfill of pre-existing rental history) ──────
-// Lets the admin key in every past payment/installment for a tenant who
-// was already renting before this app existed -- each row becomes one
-// history record, plus optional fields for where the tenant stands
-// *today* (current due date / status / last-payment date), which the
-// backend sets on the tenant record itself once every row is saved.
-let _oldData = { idx: null, rows: [] };
-
-// Every date entered in this modal describes something that already
-// happened, so none of them may land on or after today -- this is the
-// shared upper bound (exclusive) applied to the Payment Date, Covers
-// From, and Covers To fields via the <input type="date" max="..."> attr.
-function _oldDataMaxDateExclusive() {
-  // "less than the current date" -- one day before today.
-  const t = todayStr().split('-').map(Number);
-  const d = new Date(t[0], t[1] - 1, t[2]);
-  d.setDate(d.getDate() - 1);
-  const pad = x => String(x).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-}
-
-function openOldDataModal(idx) {
-  _oldData = { idx, rows: [{ type: 'payment', date: '', from_date: '', to_date: '', amount: '', note: '' }] };
-  renderOldDataModal();
-}
-
-function _oldDataSetFrom(i, val) {
-  _oldData.rows[i].from_date = val;
-  _oldData.rows[i].to_date = oneMonthAheadISO(val);
-  const toEl = document.getElementById(`od_to_${i}`);
-  if (toEl) toEl.value = _oldData.rows[i].to_date;
-}
-
-function renderOldDataModal() {
-  const maxDate = _oldDataMaxDateExclusive();
-  const rowsHtml = _oldData.rows.map((r, i) => `
-    <div class="card" style="margin-top:${i===0?'0':'10px'};padding:12px;">
-      <div class="row">
-        <div>
-          <label class="field">Type</label>
-          <select id="od_type_${i}" onchange="_oldData.rows[${i}].type=this.value;">
-            <option value="payment" ${r.type==='payment'?'selected':''}>Full Payment</option>
-            <option value="deposit" ${r.type==='deposit'?'selected':''}>Installment / Deposit</option>
-          </select>
-        </div>
-        <div><label class="field">Amount (UGX)</label><input id="od_amount_${i}" value="${escapeHtml(String(r.amount))}" oninput="_oldData.rows[${i}].amount=this.value;"></div>
-      </div>
-      <div class="row">
-        <div><label class="field">Payment Date</label><input id="od_date_${i}" type="date" max="${maxDate}" value="${r.date}" onchange="_oldData.rows[${i}].date=this.value;"></div>
-        <div><label class="field">Covers From</label><input id="od_from_${i}" type="date" max="${maxDate}" value="${r.from_date}" onchange="_oldDataSetFrom(${i}, this.value)"></div>
-      </div>
-      <div class="row">
-        <div>
-          <label class="field">Covers To (due date)</label>
-          <input id="od_to_${i}" type="date" value="${r.to_date}" readonly disabled>
-        </div>
-        <div></div>
-      </div>
-      <div class="sub" style="color:var(--muted);font-size:11.5px;margin-top:2px;">"Covers To" auto-fills to exactly one month after "Covers From".</div>
-      <label class="field" style="margin-top:8px;">Note</label>
-      <input id="od_note_${i}" value="${escapeHtml(r.note)}" placeholder="e.g. paid in cash before app was set up" oninput="_oldData.rows[${i}].note=this.value;">
-      ${_oldData.rows.length > 1 ? `<button class="btn btn-ghost" style="margin-top:8px;" onclick="removeOldDataRow(${i})">✕ Remove row</button>` : ''}
-    </div>`).join('');
-
-  openModal(`
-    <h2>Add Old Data</h2>
-    <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
-      Enter this tenant's pre-existing transactions -- one row per past payment or installment, with its date, covered period, and amount. All dates here must be before today. Add as many rows as you need.
-    </div>
-    <div id="oldDataRows">${rowsHtml}</div>
-    <button class="btn btn-ghost btn-full" style="margin-top:10px;" onclick="addOldDataRow()">＋ Add Another Row</button>
-    <hr class="sep">
-    <div class="section-title" style="margin-top:0;">Tenant's Current Standing (optional)</div>
-    <div class="row">
-      <div><label class="field">Current Due Date</label><input id="od_final_due" type="date"></div>
-      <div><label class="field">Status</label>
-        <select id="od_final_status">
-          <option value="">Leave as-is</option>
-          <option value="Confirmed">Confirmed</option>
-          <option value="Pending">Pending</option>
-        </select>
-      </div>
-    </div>
-    <label class="field">Additional Notes</label>
-    <input id="od_final_notes" placeholder="Appended to the tenant's notes">
-    <div class="err" id="oldDataErr"></div>
-    <button class="btn btn-primary btn-full" style="margin-top:12px;" onclick="submitOldData()">Save Old Data</button>
-  `);
-}
-
-function addOldDataRow() {
-  _oldData.rows.push({ type: 'payment', date: '', from_date: '', to_date: '', amount: '', note: '' });
-  renderOldDataModal();
-}
-function removeOldDataRow(i) {
-  _oldData.rows.splice(i, 1);
-  renderOldDataModal();
-}
-
-async function submitOldData() {
-  const idx = _oldData.idx;
-  const _k = `submitOldData:${idx}`;
-  if (!_beginAction(_k)) return;
-  try {
-    const maxDate = _oldDataMaxDateExclusive();
-    const rowsWithData = _oldData.rows.filter(r => r.date || r.from_date);
-    for (const r of rowsWithData) {
-      if ((r.date && r.date > maxDate) || (r.from_date && r.from_date > maxDate) || (r.to_date && r.to_date > maxDate)) {
-        $('#oldDataErr').textContent = 'All dates in Add Old Data must be before today.';
-        return;
-      }
-    }
-    const records = rowsWithData
-      .filter(r => r.date)
-      .map(r => ({ type: r.type, date: r.date, from_date: r.from_date, to_date: r.to_date, amount: r.amount, note: r.note }));
-    if (!records.length) { $('#oldDataErr').textContent = 'Enter at least one row with a payment date.'; return; }
-    const final_state = {
-      due_date: $('#od_final_due').value, status: $('#od_final_status').value,
-      notes: $('#od_final_notes').value,
-    };
-    const d = await api(`/api/tenants/${idx}/old-data`, {method:'POST', body: JSON.stringify({records, final_state})});
-    if (d.ok) {
-      closeModal();
-      toast(`Added ${d.result.added} old record${d.result.added===1?'':'s'}.`);
-      state.selectedIdx = idx; state.tab = 'tenant-detail'; render();
-    } else {
-      $('#oldDataErr').textContent = d.error || 'Could not save old data.';
-    }
-  } finally {
-    _endAction(_k);
-  }
-}
-
-// ── Month picker (shared by Pay Rent + Record Installment) ──────────────
+// ── Month picker (shared by Pay Rent + Record Instalment) ──────────────
 // Months are always ticked contiguously starting from the tenant's first
 // still-open month: ticking a row ticks it and every open row before it;
 // unticking a row unticks it and every open row after it. Already-paid
@@ -6546,7 +5971,7 @@ async function loadMonthPicker(idx) {
 
 function monthPickerHtml(locked) {
   if (locked) {
-    // Used when an installment balance is already outstanding on the
+    // Used when an instalment balance is already outstanding on the
     // current month: no month-selection dropdown at all -- the current
     // month is the only thing payable until its balance clears, so there's
     // nothing to choose. Fields still populate live via updateMonthPickerFields.
@@ -6618,7 +6043,7 @@ function renderMonthPickerList() {
 
 function mpNetAmount() {
   // The actual amount still to be cleared for the ticked months -- not a
-  // flat rent*months -- if a deposit/installment has already been paid
+  // flat rent*months -- if a deposit/instalment has already been paid
   // toward the current open month, that credit is subtracted here so the
   // figure matches what's really left to collect.
   const gross = (_mp.rent || 0) * _mp.pending;
@@ -6637,14 +6062,18 @@ function updateMonthPickerFields() {
   const credit = Math.min(_mp.prepaid || 0, (_mp.rent || 0) * _mp.pending);
   if (monthsVal) monthsVal.textContent = String(_mp.pending);
   if (amountVal) amountVal.textContent = fmt(net);
-  // The Deposit modal shows a read-only "Amount" field (amount due for
-  // the ticked months) directly above the editable "Deposit" field, kept
-  // in sync with the month picker here. "Deposit" itself is never
-  // auto-filled -- the admin always types the actual amount handed
-  // over, since a deposit/installment is often a partial amount rather
-  // than the full total.
-  const amountEl = $('#d_amount');
-  if (amountEl) amountEl.textContent = fmt(net);
+  // The Deposit modal has its own editable "Deposit" field (Pay Rent
+  // doesn't -- it always charges the full computed amount). It was
+  // starting out blank/zero instead of pre-filled with the computed
+  // amount = rent * months. Keep it in sync with the month picker here,
+  // but only while the user hasn't typed their own custom deposit --
+  // once they touch the field (see the 'input' listener in
+  // openDepositModal), this stops overwriting what they entered, since
+  // a deposit is often a partial amount rather than the full total.
+  const depositEl = $('#d_deposit');
+  if (depositEl && !depositEl.dataset.userEdited) {
+    depositEl.value = net > 0 ? String(net) : '';
+  }
   updateDepositBalance();
   if (creditNote) {
     if (credit > 0) {
@@ -6738,31 +6167,27 @@ async function submitPayment(idx) {
 async function openDepositModal(idx) {
   await loadMonthPicker(idx);
   // If there's already a partial balance on the current month (an
-  // installment plan mid-way through), lock the picker to that one month --
+  // instalment plan mid-way through), lock the picker to that one month --
   // no dropdown, no picking further months -- until it clears to zero.
   const locked = (_mp.prepaid || 0) > 0;
   if (locked) { _mp.pending = 1; _mp.selected = 1; }
   openModal(`
-    <h2>Record Installment / Deposit</h2>
+    <h2>Record Instalment / Deposit</h2>
     <div class="desc">${locked ? 'Continue clearing the balance for the current month below.' : "Partial payments accumulate toward the selected month(s)' rent."}</div>
     ${monthPickerHtml(locked)}
-    <label class="field">Amount (UGX)</label>
-    <div class="month-picker-control" style="cursor:default;">
-      <span id="d_amount" style="font-family:var(--font-mono);color:var(--ink);">${fmt(0)}</span>
-    </div>
-    <label class="field">Deposit (UGX)</label><input id="d_deposit" inputmode="numeric" placeholder="Amount handed over">
+    <label class="field">Deposit (UGX)</label><input id="d_deposit" inputmode="numeric">
     <label class="field">Balance (UGX)</label>
     <div class="month-picker-control" style="cursor:default;">
       <span id="d_balance" style="font-family:var(--font-mono);color:var(--ink);">${fmt(0)}</span>
     </div>
     <div class="err" id="depErr"></div>
-    <button class="btn btn-primary btn-full" style="margin-top:12px;" id="txnSubmitBtn" ${locked ? '' : 'disabled'} onclick="submitDeposit(${idx})">＋ Record Installment</button>
+    <button class="btn btn-primary btn-full" style="margin-top:12px;" id="txnSubmitBtn" ${locked ? '' : 'disabled'} onclick="submitDeposit(${idx})">＋ Record Instalment</button>
   `);
   renderMonthPickerList();
   updateMonthPickerSummary();
   const depositEl = $('#d_deposit');
   if (depositEl) {
-    depositEl.addEventListener('input', updateDepositBalance);
+    depositEl.addEventListener('input', () => { depositEl.dataset.userEdited = '1'; updateDepositBalance(); });
   }
 }
 async function submitDeposit(idx) {
@@ -6817,20 +6242,13 @@ function unitRowHtml(u) {
         <div class="sub">${fmt(u.rent)}/mo · ${u.occupant ? 'Occupied: '+escapeHtml(u.occupant) : 'Vacant'}${u.location?' · '+escapeHtml(u.location):''}</div>
       </div>
       <div style="display:flex;gap:6px;">
-        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-ink);font-size:13px;width:32px;height:32px;" onclick="openEditUnit('${encodeURIComponent(u.name)}')">✎</button>
-        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-ink);font-size:13px;width:32px;height:32px;" onclick="openIncreaseRent('${encodeURIComponent(u.name)}', ${u.rent})">↑</button>
+        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openEditUnit('${encodeURIComponent(u.name)}')">✎</button>
+        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openIncreaseRent('${encodeURIComponent(u.name)}', ${u.rent})">↑</button>
       </div>
     </div>`;
 }
 async function renderUnits() {
-  const path = '/api/units';
-  const cached = cacheGet(path);
-  if (cached) paintUnits(cached);
-  const d = await api(path);
-  if (state.tab !== 'units') return;
-  paintUnits(d);
-}
-function paintUnits(d) {
+  const d = await api('/api/units');
   $('#headerSub').textContent = `${d.units.length} units`;
   const unitsEmptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
@@ -6852,23 +6270,11 @@ function paintUnits(d) {
       <span style="background:${color};color:#fff;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700;">${list.length}</span>
     </div>
     <div class="card" style="padding:4px 12px;">${list.map(unitRowHtml).join('')}</div>` : '';
-  const unitFilters = [['occupied','Occupied'],['vacant','Vacant']];
-  const filterRow = `<div class="filters">${unitFilters.map(([k,l])=>`<div class="filter-pill ${state.unitsFilter===k?'active':''}" data-uf="${k}">${l}</div>`).join('')}</div>`;
-  const noMatchMsg = `<div class="card" style="padding:4px 12px;"><div class="empty">No ${state.unitsFilter} units.</div></div>`;
-  let sections;
-  if (state.unitsFilter === 'occupied') sections = occupied.length ? section('Occupied', 'var(--teal-ink)', occupied) : noMatchMsg;
-  else if (state.unitsFilter === 'vacant') sections = vacant.length ? section('Vacant', 'var(--muted)', vacant) : noMatchMsg;
-  else sections = section('Occupied', 'var(--teal-ink)', occupied) + section('Vacant', 'var(--muted)', vacant);
   $('#main').innerHTML = `
     <button class="btn btn-primary btn-full" style="margin-bottom:14px;" onclick="openAddUnit()">＋ Add Unit</button>
-    ${filterRow}
-    ${sections}
+    ${section('Occupied', 'var(--teal-deep)', occupied)}
+    ${section('Vacant', 'var(--muted)', vacant)}
   `;
-  $$('.filter-pill[data-uf]').forEach(p => p.addEventListener('click', () => {
-    const k = p.dataset.uf;
-    state.unitsFilter = (state.unitsFilter === k) ? 'all' : k;
-    renderUnits();
-  }));
 }
 function openAddUnit() {
   openModal(`
@@ -6961,30 +6367,13 @@ async function submitIncreaseRent(nameEnc) {
 
 // ── ALERTS ───────────────────────────────────────────────────────────
 async function renderAlerts() {
-  const path = '/api/alerts';
-  const cached = cacheGet(path);
-  if (cached) paintAlerts(cached);
-  const d = await api(path);
-  if (state.tab !== 'alerts') return;
-  paintAlerts(d);
-}
-function paintAlerts(d) {
-  const alerts = state.alertsFilter === 'all' ? d.alerts
-    : d.alerts.filter(t => t.level === state.alertsFilter);
+  const d = await api('/api/alerts');
   $('#headerSub').textContent = `${d.alerts.length} tenant(s) to watch`;
   const alertsEmptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
-    : (d.alerts.length ? `<div class="empty">No ${state.alertsFilter === 'pending' ? 'pending' : 'installment'} tenants.</div>`
-      : `<div class="empty"><div class="big">✅</div>No alerts. Everyone's paid up.</div>`);
-  const rows = alerts.map(tenantRowHtml).join('') || alertsEmptyMsg;
-  const alertFilters = [['pending','Pending'],['underpaid','Installments']];
-  const filterRow = `<div class="filters">${alertFilters.map(([k,l])=>`<div class="filter-pill ${state.alertsFilter===k?'active':''}" data-af="${k}">${l}</div>`).join('')}</div>`;
-  $('#main').innerHTML = `<div class="section-title">Overdue &amp; Upcoming</div>${filterRow}<div class="card" style="padding:4px 12px;">${rows}</div>`;
-  $$('.filter-pill[data-af]').forEach(p => p.addEventListener('click', () => {
-    const k = p.dataset.af;
-    state.alertsFilter = (state.alertsFilter === k) ? 'all' : k;
-    paintAlerts(d);
-  }));
+    : `<div class="empty"><div class="big">✅</div>No alerts. Everyone's paid up.</div>`;
+  const rows = d.alerts.map(tenantRowHtml).join('') || alertsEmptyMsg;
+  $('#main').innerHTML = `<div class="section-title">Overdue &amp; Upcoming</div><div class="card" style="padding:4px 12px;">${rows}</div>`;
 }
 
 // ── SETTINGS ─────────────────────────────────────────────────────────
@@ -7014,24 +6403,19 @@ function renderMoreMenu() {
 
 async function renderHistory() {
   const q = state.historyQ || '';
-  const histPath = '/api/history' + (q ? ('?q=' + encodeURIComponent(q)) : '');
-  const dashPath = '/api/dashboard';
   $('#headerSub').textContent = 'Transaction History';
-  const cachedHist = cacheGet(histPath), cachedDash = cacheGet(dashPath);
-  if (cachedHist && cachedDash) paintHistory(cachedHist, cachedDash, q);
-  const [d, dash] = await Promise.all([api(histPath), api(dashPath)]);
-  if (state.tab !== 'history') return;
-  paintHistory(d, dash, q);
-}
-function paintHistory(d, dash, q) {
+  const [d, dash] = await Promise.all([
+    api('/api/history' + (q ? ('?q=' + encodeURIComponent(q)) : '')),
+    api('/api/dashboard'),
+  ]);
   const tenants = d.tenants || [];
 
   const incomeCard = `<div class="card" style="background:var(--teal-soft2);border-color:var(--teal-soft);">
     <div class="section-title" style="margin-top:0;">Monthly Income — ${escapeHtml(dash.month_name || '')}</div>
-    <div style="font-family:var(--font-mono);font-size:24px;font-weight:600;color:var(--teal-ink);">${fmt(dash.month_income || 0)}</div>
+    <div style="font-family:var(--font-mono);font-size:24px;font-weight:600;color:var(--teal-deep);">${fmt(dash.month_income || 0)}</div>
     <div style="display:flex;gap:16px;margin-top:8px;font-size:12px;">
       <div><b style="color:var(--good);">${fmt(dash.full_payment_total || 0)}</b><div style="color:var(--muted);">Full</div></div>
-      <div><b style="color:var(--teal-ink);">${fmt(dash.deposit_total || 0)}</b><div style="color:var(--muted);">Deposits</div></div>
+      <div><b style="color:var(--teal-deep);">${fmt(dash.deposit_total || 0)}</b><div style="color:var(--muted);">Deposits</div></div>
       <div><b style="color:var(--danger);">${fmt(dash.cancelled_total || 0)}</b><div style="color:var(--muted);">Cancelled</div></div>
     </div>
   </div>`;
@@ -7055,7 +6439,7 @@ function paintHistory(d, dash, q) {
     }
     return `<div class="hist-table">
       <div class="hist-hdr">
-        <div>Date</div><div>Type</div><div>Amount (UGX)</div><div>Period</div>
+        <div>Date</div><div>Type</div><div>Amount</div><div>Period</div>
       </div>
       ${t.transactions.map(rec => {
         const cancelled = rec.cancelled;
@@ -7064,7 +6448,7 @@ function paintHistory(d, dash, q) {
         return `<div class="${rowCls}">
           <div>${escapeHtml(rec.date)}</div>
           <div>${typeStr}</div>
-          <div>${fmtNum(rec.amount)}</div>
+          <div>${fmt(rec.amount)}</div>
           <div class="hist-period">${escapeHtml(abbrevPeriod(rec.from, rec.to))}</div>
         </div>`;
       }).join('')}
@@ -7076,7 +6460,7 @@ function paintHistory(d, dash, q) {
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;">
           <div>
-            <div style="font-weight:700;font-size:15px;">${escapeHtml(t.name)}${t.archived ? ' <span style="font-weight:500;font-size:11.5px;color:var(--muted);">(Moved out' + (t.vacated_date ? ' ' + escapeHtml(t.vacated_date) : '') + ')</span>' : ''}</div>
+            <div style="font-weight:700;font-size:15px;">${escapeHtml(t.name)}</div>
             <div class="sub" style="color:var(--muted);font-size:12.5px;">🏠 ${escapeHtml(t.unit)}</div>
           </div>
           <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px;" onclick="openTenant(${t.index})">Profile</button>
@@ -7124,8 +6508,8 @@ async function renderSettings() {
     </div>
     <div class="section-title">Reports</div>
     <div class="card">
-      <a class="linklike" href="javascript:void(0)" onclick="downloadFile('/api/export/excel','tenant_records.xlsx')">⬇ Download Excel (.xlsx)</a><br><br>
-      <a class="linklike" href="javascript:void(0)" onclick="downloadFile('/api/export/pdf','tenant_data.pdf')">⬇ Download PDF Report</a>
+      <a class="linklike" href="api/export/excel">⬇ Download Excel (.xlsx)</a><br><br>
+      <a class="linklike" href="api/export/pdf">⬇ Download PDF Report</a>
     </div>
     <div class="section-title">Danger Zone</div>
     <div class="card">
@@ -7239,27 +6623,23 @@ async function generateMonthlyReport() {
     const report = await res.json();
     if (report.error) { box.innerHTML = `<div class="sub" style="color:var(--danger);">${escapeHtml(report.error)}</div>`; return; }
     const rowsHtml = report.tenant_rows.length
-      ? `<div class="hist-table">
-          <div class="mr-hdr"><div>Tenant</div><div>Unit</div><div style="text-align:right;">Amount (UGX)</div></div>
-          ${report.tenant_rows.map(r => `
-          <div class="mr-row">
-            <div class="mr-name">${escapeHtml(r.name)}</div>
-            <div class="mr-unit">${escapeHtml(r.unit)}</div>
-            <div class="mr-amt">${fmtNum(r.pay_active + r.dep_active)}</div>
-          </div>`).join('')}
-        </div>`
+      ? report.tenant_rows.map(r => `
+        <div class="hist-row">
+          <div>${escapeHtml(r.name)} <span style="color:var(--muted);">(${escapeHtml(r.unit)})</span></div>
+          <div style="text-align:right;font-weight:700;">${fmt(r.pay_active + r.dep_active)}</div>
+        </div>`).join('')
       : `<div class="hist-empty">No transactions in ${escapeHtml(report.month_label)}.</div>`;
     box.innerHTML = `
-      <div style="font-family:var(--font-mono);font-size:20px;font-weight:600;color:var(--teal-ink);margin-top:6px;">
+      <div style="font-family:var(--font-mono);font-size:20px;font-weight:600;color:var(--teal-deep);margin-top:6px;">
         ${fmt(report.grand_combined)}
       </div>
       <div style="display:flex;gap:16px;margin:6px 0 12px;font-size:12px;">
         <div><b style="color:var(--good);">${fmt(report.grand_pay)}</b><div style="color:var(--muted);">Full</div></div>
-        <div><b style="color:var(--teal-ink);">${fmt(report.grand_dep)}</b><div style="color:var(--muted);">Installments</div></div>
+        <div><b style="color:var(--teal-deep);">${fmt(report.grand_dep)}</b><div style="color:var(--muted);">Deposits</div></div>
         <div><b style="color:var(--danger);">${fmt(report.grand_cancelled)}</b><div style="color:var(--muted);">Cancelled</div></div>
       </div>
       ${rowsHtml}
-      <a class="linklike" style="display:block;margin-top:12px;" href="javascript:void(0)" onclick="downloadFile('/api/export/monthly-excel?year=${year}&month=${month}','monthly_report.xlsx')">⬇ Download Monthly Excel (.xlsx)</a>
+      <a class="linklike" style="display:block;margin-top:12px;" href="api/export/monthly-excel?year=${year}&month=${month}">⬇ Download Monthly Excel (.xlsx)</a>
     `;
   } catch (e) {
     box.innerHTML = `<div class="sub" style="color:var(--danger);">Couldn't generate the report — check the connection and try again.</div>`;
@@ -7314,12 +6694,7 @@ async function generateMonthlyReport() {
     indicator.textContent = '⟳ Refreshing…';
     indicator.classList.add('spinning');
     await pingServer();
-    // refreshIfSafe() (not switchTab(), which always re-renders
-    // unconditionally) -- a pull-to-refresh gesture is easy to trigger by
-    // accident while scrolling a long form, and switchTab() would rebuild
-    // Add Tenant from scratch, silently reverting the New/Existing toggle
-    // and any typed fields. refreshIfSafe() already knows to skip that.
-    refreshIfSafe();
+    switchTab(state.tab);
     setTimeout(() => {
       indicator.classList.remove('visible', 'ready', 'spinning');
       refreshing = false;
