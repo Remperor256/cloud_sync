@@ -3363,6 +3363,94 @@ def dashboard():
     watchlist = get_watchlist_tenants(tenants, max_days=10)
     watchlist_out = [_tenant_summary(t, today) | {"days_left": d} for t, d in watchlist[:8]]
 
+    # First few tenant names, for the Home dashboard's avatar-stack card
+    # (mirrors the desktop app's DashboardPage, which shows the first 3
+    # active tenants as overlapping avatars plus a "+N" overflow bubble).
+    tenant_names = [t.get("name", "Unnamed") for t in tenants[:3]]
+
+    # ── Revenue history (trailing 12 months) + a simple next-month
+    # forecast, for the Home dashboard's Revenue Forecast card. Mirrors
+    # the desktop app's revenue_history()/revenue_forecast(): predicted
+    # income is the average of the last up-to-3 months on record, growth
+    # compares the two most recent months.
+    def _month_income_amount(tenants_list, yy, mm):
+        prefix = f"{yy:04d}-{mm:02d}"
+        total = sum(
+            int(r.get("amount", 0)) for t in tenants_list for r in t.get("payment_history", [])
+            if r.get("date", "").startswith(prefix) and not r.get("_cancelled", False)
+        )
+        total += sum(
+            float(r.get("amount", 0)) for t in tenants_list for r in t.get("deposit_history", [])
+            if r.get("date", "").startswith(prefix) and not r.get("_cancelled", False)
+        )
+        return int(total)
+
+    yy, mm = today.year, today.month
+    ym_list = []
+    for _ in range(12):
+        ym_list.append((yy, mm))
+        mm -= 1
+        if mm == 0:
+            mm, yy = 12, yy - 1
+    ym_list.reverse()
+    revenue_history = [
+        {"label": date(yy_, mm_, 1).strftime("%b"), "amount": _month_income_amount(tenants, yy_, mm_)}
+        for (yy_, mm_) in ym_list
+    ]
+    recent_amounts = [h["amount"] for h in revenue_history[-3:]]
+    revenue_predicted = int(sum(recent_amounts) / len(recent_amounts)) if recent_amounts else 0
+    if len(revenue_history) >= 2 and revenue_history[-2]["amount"] > 0:
+        revenue_growth = ((revenue_history[-1]["amount"] - revenue_history[-2]["amount"])
+                           / revenue_history[-2]["amount"] * 100)
+    else:
+        revenue_growth = 0.0
+
+    # ── Recent activity feed, for the Home dashboard's Recent Alerts
+    # card: up to 3 overdue tenants (oldest due date first), then the
+    # most recent confirmed payments, newest first, filling the rest.
+    overdue = []
+    for t in tenants:
+        level, _ = status_level(t, today)
+        if level == "pending":
+            due = _parse_date(t.get("due_date", ""))
+            if due is not None and due < today:
+                overdue.append((t.get("due_date", ""), t))
+    overdue.sort(key=lambda pair: pair[0])
+
+    recent_activity = []
+    for due_str, t in overdue[:3]:
+        recent_activity.append({
+            "type": "overdue",
+            "title": "Rent Overdue",
+            "subtitle": f"Unit {t.get('unit') or '—'} · {t.get('name', 'Unnamed Tenant')}",
+            "time_label": f"Due {due_str}" if due_str else "Overdue",
+            "tag": "OVERDUE",
+        })
+
+    payments = []
+    for t in tenants:
+        for r in t.get("payment_history", []) + t.get("deposit_history", []):
+            if r.get("_cancelled") or not r.get("date"):
+                continue
+            payments.append((r["date"], t, r))
+    payments.sort(key=lambda p: p[0], reverse=True)
+
+    remaining = max(0, 5 - len(recent_activity))
+    for dt_str, t, r in payments[:remaining]:
+        try:
+            amt = f"UGX {int(float(r.get('amount', 0))):,}"
+        except (ValueError, TypeError):
+            amt = ""
+        recent_activity.append({
+            "type": "payment",
+            "title": "Payment Received",
+            "subtitle": f"Unit {t.get('unit') or '—'} · {t.get('name', 'Unnamed Tenant')}"
+                        + (f" · {amt}" if amt else ""),
+            "time_label": dt_str,
+            "tag": "PAID",
+        })
+    recent_activity = recent_activity[:5]
+
     return jsonify({
         "app_name": APP_NAME,
         "total_tenants": len(tenants),
@@ -3377,6 +3465,11 @@ def dashboard():
         "deposit_total": deposit_total,
         "cancelled_total": cancelled_total,
         "watchlist": watchlist_out,
+        "tenant_names": tenant_names,
+        "revenue_history": revenue_history,
+        "revenue_predicted": revenue_predicted,
+        "revenue_growth": revenue_growth,
+        "recent_activity": recent_activity,
     })
 
 
@@ -4102,6 +4195,23 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .icon-btn:active{transform:scale(.9);background:rgba(255,255,255,.22);}
   .icon-btn:disabled{opacity:.5;cursor:default;}
+
+  /* ── Home bar: on the Dashboard tab only, the header switches to the
+     same plain "page title + today's date, hairline rule below" bar
+     used atop the desktop app's Dashboard page, instead of the frosted
+     teal brand bar shown on every other screen. ───────────────────── */
+  header.top.dash-style{
+    background:var(--card);
+    -webkit-backdrop-filter:none;backdrop-filter:none;
+    color:var(--ink);
+    border-bottom:1px solid var(--line);
+    box-shadow:none;
+  }
+  header.top.dash-style .brand .mark{display:none;}
+  header.top.dash-style h1{font-size:21px;font-weight:800;letter-spacing:0;color:var(--ink);}
+  header.top.dash-style .sub{font-size:13px;opacity:1;color:var(--muted);margin-top:3px;font-weight:400;}
+  header.top.dash-style .icon-btn{background:var(--card-2);color:var(--ink);}
+  header.top.dash-style .icon-btn:active{background:var(--line);}
   main{padding:16px 16px 8px;}
 
   .card{
@@ -4118,30 +4228,96 @@ INDEX_HTML = """<!DOCTYPE html>
   /* ── Dashboard "ledger tile" cards — the signature element: a
      colored ticket-stub header perforated from a plain white body,
      figures set in mono for a receipt-like feel ───────────────── */
-  .dgrid{display:grid;grid-template-columns:1fr;gap:14px;margin-top:2px;}
-  .dcard{
-    border-radius:var(--radius-lg);overflow:hidden;display:flex;flex-direction:column;
-    box-shadow:var(--shadow-md);border:1px solid var(--line);
+  /* ── Dashboard KPI cards — ported from the desktop app's Dashboard
+     tab: plain white cards, a small tinted icon badge + caps label up
+     top, a big bold value, and a compact body slot (avatar stack /
+     occupancy bar / percentage breakdown / status pills) unique to
+     each card. The whole card is a tap target, same as the desktop
+     app (no separate footer link). ───────────────────────────────── */
+  .kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:2px;}
+  .kpi-card{
+    background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:18px 16px;cursor:pointer;min-width:0;
+    display:flex;flex-direction:column;gap:10px;
+    transition:transform .12s ease,background .15s ease;
   }
-  .dcard-top{padding:18px 16px 20px;color:#fff;position:relative;}
-  .dcard-top::before{
-    content:'';position:absolute;inset:0;pointer-events:none;
-    background:linear-gradient(155deg,rgba(255,255,255,.16),rgba(255,255,255,0) 55%);
+  .kpi-card:active{transform:scale(.97);background:var(--card-2);}
+  .kpi-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;}
+  .kpi-label{
+    font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;
+    color:var(--muted);line-height:1.3;padding-right:2px;
   }
-  .dcard-icon{position:absolute;top:14px;right:16px;font-size:22px;opacity:.85;}
-  .dcard-title{font-size:10.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;opacity:.78;padding-right:32px;}
-  .dcard-value{font-family:var(--font-mono);font-size:27px;font-weight:600;margin-top:8px;line-height:1.05;word-break:break-word;font-variant-numeric:tabular-nums;}
-  .dcard-footer{background:var(--card);padding:13px 14px 4px;}
-  .dcard-subrow{display:flex;gap:8px;padding-bottom:10px;}
-  .dcard-sub{flex:1;min-width:0;}
-  .dcard-sub .v{font-family:var(--font-mono);font-weight:600;font-size:13px;word-break:break-word;font-variant-numeric:tabular-nums;}
-  .dcard-sub .l{font-size:9.5px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:.3px;}
-  .dcard-action{
-    display:block;border-top:1px solid var(--line);text-align:right;
-    padding:11px 4px;font-size:13px;font-weight:600;background:none;border-left:none;border-right:none;border-bottom:none;
-    width:100%;cursor:pointer;font-family:var(--font-body);
+  .kpi-icon{
+    width:38px;height:38px;border-radius:10px;flex-shrink:0;
+    display:flex;align-items:center;justify-content:center;font-size:15px;
   }
-  .dcard-action:active{background:var(--card-2);}
+  .kpi-value{font-size:26px;font-weight:800;color:var(--ink);line-height:1.05;word-break:break-word;font-variant-numeric:tabular-nums;}
+  .kpi-avatars{display:flex;align-items:center;}
+  .kpi-avatar{
+    width:28px;height:28px;border-radius:50%;border:2px solid var(--card);
+    display:flex;align-items:center;justify-content:center;color:#fff;
+    font-size:10px;font-weight:700;margin-left:-9px;flex-shrink:0;
+  }
+  .kpi-avatar:first-child{margin-left:0;}
+  .kpi-progress{height:8px;border-radius:999px;background:var(--line);overflow:hidden;}
+  .kpi-progress > div{height:100%;border-radius:999px;}
+  .kpi-occ-row{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);}
+  .kpi-breakdown{display:flex;flex-direction:column;gap:6px;}
+  .kpi-breakdown-row{display:flex;justify-content:space-between;font-size:11px;}
+  .kpi-breakdown-row .l{color:var(--ink);}
+  .kpi-breakdown-row .v{font-weight:700;color:var(--ink);}
+  .kpi-breakdown-row.danger .l,.kpi-breakdown-row.danger .v{color:var(--danger);}
+  .kpi-pills{display:flex;gap:8px;flex-wrap:wrap;}
+  .kpi-pill{padding:4px 12px;border-radius:11px;font-size:10px;font-weight:700;}
+
+  /* ── Revenue Forecast card — ported from the desktop app's
+     RevenueForecastCard: title + 6/12-month toggle, bar+line chart,
+     predicted-income / growth-rate footer stats. ─────────────────── */
+  .rf-card{
+    background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:18px 16px;margin-top:14px;
+  }
+  .rf-header{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px;}
+  .rf-title{font-size:16px;font-weight:700;color:var(--ink);}
+  .rf-toggle{display:flex;gap:4px;}
+  .rf-toggle-btn{
+    border:none;cursor:pointer;padding:5px 10px;border-radius:7px;
+    font-size:11px;font-weight:700;font-family:var(--font-body);
+    background:var(--card-2);color:var(--muted);
+  }
+  .rf-toggle-btn.active{background:var(--teal);color:#fff;}
+  .rf-empty{padding:30px 0;text-align:center;color:var(--muted);font-size:13px;}
+  .rf-footer{display:flex;gap:28px;margin-top:12px;flex-wrap:wrap;}
+  .rf-stat .dot-row{display:flex;align-items:center;gap:6px;}
+  .rf-stat .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+  .rf-stat .lbl{font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);}
+  .rf-stat .val{font-size:18px;font-weight:800;color:var(--ink);margin-top:3px;}
+
+  /* ── Recent Alerts card — ported from the desktop app's
+     RecentAlertsCard: overdue tenants first, then the most recent
+     confirmed payments, each row icon+title+subtitle+tag / time. ──── */
+  .ra-card{
+    background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:16px 16px 4px;margin-top:14px;
+  }
+  .ra-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:2px;}
+  .ra-title{font-size:16px;font-weight:700;color:var(--ink);}
+  .ra-viewall{background:none;border:none;cursor:pointer;color:var(--link-blue,#3B82F6);font-size:12px;font-weight:700;font-family:var(--font-body);}
+  .ra-row{display:flex;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);}
+  .ra-row:last-child{border-bottom:none;}
+  .ra-icon{width:32px;height:32px;border-radius:9px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:14px;}
+  .ra-text{flex:1;min-width:0;}
+  .ra-text .t{font-size:12px;font-weight:700;color:var(--ink);}
+  .ra-text .s{font-size:11px;color:var(--muted);margin-top:1px;}
+  .ra-tag{display:inline-block;margin-top:4px;padding:1px 7px;border-radius:8px;font-size:9px;font-weight:700;}
+  .ra-time{font-size:10px;color:var(--muted);white-space:nowrap;flex-shrink:0;padding-top:1px;}
+  .ra-empty{text-align:center;color:var(--muted);font-size:13px;padding:14px 0;}
+  .ra-footer-btn{
+    display:block;width:100%;text-align:left;background:none;cursor:pointer;
+    border:none;border-top:1px solid var(--line);color:var(--muted);
+    font-size:12px;font-weight:600;font-family:var(--font-body);padding:9px 0;
+  }
+  .ra-footer-btn:active{color:var(--ink);}
 
   .btn{
     border:none;border-radius:var(--radius-sm);font-weight:600;font-size:14px;
@@ -4468,7 +4644,7 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="brand">
       <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 11.5 12 4l8 7.5" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
       <div>
-        <h1>Tenant Management</h1>
+        <h1 id="headerTitle">Tenant Management</h1>
         <div class="sub" id="headerSub">—</div>
       </div>
     </div>
@@ -4568,7 +4744,7 @@ function leaseProgressBlock(t) {
   </div>`;
 }
 
-let state = { tab:'dashboard', tenants:[], selectedIdx:null, filter:'all', q:'' };
+let state = { tab:'dashboard', tenants:[], selectedIdx:null, filter:'all', q:'', revenueRange:6 };
 
 // ── Offline queue + cache ───────────────────────────────────────────
 // While this phone/browser can't reach the PC (PC is off, or off Wi-Fi),
@@ -5540,8 +5716,24 @@ async function refreshAlertBadge() {
   } catch(e) {}
 }
 
+// ── header bar (mirrors the desktop app's per-page title bar: plain
+// title left, contextual text right, hairline rule below -- switched on
+// only for the Dashboard/Home tab, since every other tab keeps the
+// frosted brand bar) ───────────────────────────────────────────────────
+const WEEKDAY_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+function todayFullLabel() {
+  const d = new Date();
+  return `${WEEKDAY_NAMES[d.getDay()]}, ${String(d.getDate()).padStart(2,'0')} ${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
+}
+function applyHeaderStyle() {
+  const isDash = state.tab === 'dashboard';
+  $('header.top').classList.toggle('dash-style', isDash);
+  $('#headerTitle').textContent = isDash ? 'Dashboard' : 'Tenant Management';
+}
+
 // ── render router ────────────────────────────────────────────────────
 async function render() {
+  applyHeaderStyle();
   const main = $('#main');
   // Don't blank the screen immediately -- on a fast LAN the fetch below
   // usually resolves in well under 100ms, so clearing main first just
@@ -5579,75 +5771,214 @@ async function render() {
 }
 
 // ── DASHBOARD (Home) ───────────────────────────────────────────────────
-// Mirrors the desktop app's Dashboard tab: four colored stat cards in a
-// 2×2 grid, each with a clickable footer link that jumps to the matching
-// section — same accent colors, same card contents, nothing else on the
-// page (no Add Tenant button, no extra list below).
-const D_BLUE   = 'var(--accent-tenants)';   // Total Tenants
-const D_AMBER  = 'var(--accent-units)';     // Total Units
-const D_GREEN  = 'var(--accent-income)';    // Total Income
-const D_ORANGE = 'var(--accent-alerts)';    // Rent Alerts
+// Ported from the desktop app's DashboardPage/DashboardCard: four white
+// KPI cards in a 2×2 grid, same accent colors (fixed, not theme-tinted —
+// the desktop app's CARD_BLUE/AMBER/GREEN/ORANGE don't change between
+// light/dark either), same labels, same per-card content (avatar stack,
+// occupancy bar, income % breakdown, status pills), whole card tappable.
+const KPI_BLUE   = '#1A73E8';   // Total Tenants
+const KPI_AMBER  = '#F9A825';   // Total Units
+const KPI_GREEN  = '#2E7D32';   // Total Income
+const KPI_ORANGE = '#E65100';   // Rent Alerts
+const AVATAR_COLORS = ['#0F9E82','#3B82F6','#F97362','#8E7CF0','#F5A623','#34C795','#EF5A78','#0E8AA0'];
 
-function dcard({accent, icon, title, value, subs, actionLabel, actionTab}) {
-  const subRow = subs ? `<div class="dcard-subrow">${
-    subs.map(([label, val, color]) => `
-      <div class="dcard-sub">
-        <div class="v" style="color:${color}">${val}</div>
-        <div class="l">${label}</div>
-      </div>`).join('')
-  }</div>` : '';
-  return `<div class="dcard">
-    <div class="dcard-top" style="background:${accent}">
-      <span class="dcard-icon">${icon}</span>
-      <div class="dcard-title">${title}</div>
-      <div class="dcard-value">${value}</div>
+function kpiAlpha(hex, a) {
+  const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+// Mirrors the desktop app's initials_of(): first letter of the first
+// word + first letter of the last word, or the 2nd letter of the same
+// word if there's only one.
+function initialsOf(name) {
+  const parts = (name || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '?';
+  const first = parts[0][0];
+  const last = parts.length > 1 ? parts[parts.length - 1][0] : (parts[0][1] || '');
+  return (first + last).toUpperCase();
+}
+// Mirrors the desktop app's avatar_color(): deterministic sum-of-codepoints
+// hash into AVATAR_COLORS, so a given name always lands on the same color.
+function avatarColorFor(name) {
+  let h = 0;
+  for (const ch of (name || '')) h += ch.codePointAt(0);
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+
+function kpiCard({accent, iconAlpha, icon, label, value, valueColor, tab, bodyHtml}) {
+  return `<div class="kpi-card" onclick="switchTab('${tab}')">
+    <div class="kpi-top">
+      <div class="kpi-label">${label}</div>
+      <div class="kpi-icon" style="background:${kpiAlpha(accent, iconAlpha)};color:${accent}">${icon}</div>
     </div>
-    <div class="dcard-footer">
-      ${subRow}
-      <button class="dcard-action" style="color:${accent}" onclick="switchTab('${actionTab}')">${actionLabel} ›</button>
+    <div class="kpi-value"${valueColor ? ` style="color:${valueColor}"` : ''}>${value}</div>
+    ${bodyHtml || ''}
+  </div>`;
+}
+
+// ── Revenue Forecast card — ported from the desktop app's
+// RevenueForecastCard/MiniRevenueChart: a hand-drawn bar+smooth-line
+// combo chart (here an inline SVG instead of QPainter), a 6/12-month
+// toggle, and predicted-income / growth-rate footer stats.
+let _dashData = null;
+
+function buildRevenueChartSvg(history) {
+  if (!history.length || !history.some(d => d.amount > 0)) {
+    return `<div class="rf-empty">No revenue recorded yet</div>`;
+  }
+  const w = 320, h = 150, padL = 6, padR = 6, padT = 10, padB = 22;
+  const chartW = w - padL - padR, chartH = h - padT - padB;
+  const n = history.length;
+  const maxAmt = Math.max(...history.map(d => d.amount)) * 1.15 || 1;
+  const slotW = chartW / n;
+  const barW = Math.min(26, slotW * 0.42);
+  const yFor = amt => padT + chartH - (amt / maxAmt) * chartH;
+  const centers = history.map((_, i) => padL + slotW * i + slotW / 2);
+
+  const bars = history.map((d, i) => {
+    const by = yFor(d.amount);
+    const bh = Math.max(2, (padT + chartH) - by);
+    return `<rect x="${(centers[i]-barW/2).toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh.toFixed(1)}" rx="6" style="fill:${kpiAlpha(KPI_BLUE,0.16)}"/>`;
+  }).join('');
+
+  const points = history.map((d, i) => [centers[i], yFor(d.amount)]);
+  let path = `M ${points[0][0].toFixed(1)} ${points[0][1].toFixed(1)}`;
+  for (let i = 1; i < points.length; i++) {
+    const [x0, y0] = points[i-1], [x1, y1] = points[i];
+    const midX = (x0 + x1) / 2;
+    path += ` C ${midX.toFixed(1)} ${y0.toFixed(1)}, ${midX.toFixed(1)} ${y1.toFixed(1)}, ${x1.toFixed(1)} ${y1.toFixed(1)}`;
+  }
+  const dots = points.map(([x,y]) => `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3" style="fill:${KPI_BLUE}"/>`).join('');
+  const labels = history.map((d, i) => `<text x="${centers[i].toFixed(1)}" y="${h-6}" text-anchor="middle" font-size="8" style="fill:var(--muted)">${escapeHtml(d.label)}</text>`).join('');
+
+  return `<svg viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;">
+    ${bars}
+    <path d="${path}" fill="none" style="stroke:${KPI_BLUE}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    ${dots}${labels}
+  </svg>`;
+}
+
+function rfCardHtml(d) {
+  const months = state.revenueRange;
+  const history = (d.revenue_history || []).slice(-months);
+  const growth = d.revenue_growth || 0;
+  const arrow = growth >= 0 ? '▲' : '▼';
+  const growthColor = growth >= 0 ? 'var(--good)' : 'var(--danger)';
+  return `<div class="rf-card">
+    <div class="rf-header">
+      <div class="rf-title">Revenue Forecast</div>
+      <div class="rf-toggle">
+        <button class="rf-toggle-btn ${months===6?'active':''}" onclick="setRevenueRange(6)">6 Months</button>
+        <button class="rf-toggle-btn ${months===12?'active':''}" onclick="setRevenueRange(12)">12 Months</button>
+      </div>
     </div>
+    ${buildRevenueChartSvg(history)}
+    <div class="rf-footer">
+      <div class="rf-stat">
+        <div class="dot-row"><span class="dot" style="background:${KPI_BLUE}"></span><span class="lbl">Predicted Income</span></div>
+        <div class="val">${d.revenue_predicted ? fmt(d.revenue_predicted) : 'UGX 0'}</div>
+      </div>
+      <div class="rf-stat">
+        <div class="dot-row"><span class="dot" style="background:var(--muted)"></span><span class="lbl">Growth Rate</span></div>
+        <div class="val" style="color:${growthColor}">${arrow} ${Math.abs(growth).toFixed(1)}%</div>
+      </div>
+    </div>
+  </div>`;
+}
+function setRevenueRange(months) {
+  state.revenueRange = months;
+  const el = $('#rfCardWrap');
+  if (el && _dashData) el.innerHTML = rfCardHtml(_dashData);
+}
+
+// ── Recent Alerts card — ported from the desktop app's
+// RecentAlertsCard: overdue tenants first, then the most recent
+// confirmed payments, each as an icon+title+subtitle+tag row.
+function raCardHtml(d) {
+  const items = d.recent_activity || [];
+  const rows = items.length ? items.map(it => {
+    const isOverdue = it.type === 'overdue';
+    const tint = isOverdue ? '#EF4444' : '#22C55E';
+    const color = isOverdue ? 'var(--danger)' : 'var(--good)';
+    const icon = isOverdue ? '📅' : '✅';
+    return `<div class="ra-row">
+      <div class="ra-icon" style="background:${kpiAlpha(tint,0.10)}">${icon}</div>
+      <div class="ra-text">
+        <div class="t">${escapeHtml(it.title)}</div>
+        <div class="s">${escapeHtml(it.subtitle)}</div>
+        <span class="ra-tag" style="background:${kpiAlpha(tint,0.13)};color:${color}">${escapeHtml(it.tag)}</span>
+      </div>
+      <div class="ra-time">${escapeHtml(it.time_label)}</div>
+    </div>`;
+  }).join('') : `<div class="ra-empty">No recent activity yet.</div>`;
+  return `<div class="ra-card">
+    <div class="ra-header">
+      <div class="ra-title">Recent Alerts</div>
+      <button class="ra-viewall" onclick="switchTab('alerts')">View All</button>
+    </div>
+    ${rows}
+    <button class="ra-footer-btn" onclick="switchTab('alerts')">See Full Notification Log ›</button>
   </div>`;
 }
 
 async function renderDashboard() {
+  // Matches the desktop app's Dashboard header, which always shows
+  // today's date on the right regardless of load state.
+  $('#headerSub').textContent = todayFullLabel();
   const d = await api('/api/dashboard');
   if (d.no_cache) {
     // Offline and the dashboard was never loaded on this device before --
     // showing "0 tenants · 0 units" here would look like real data instead
     // of "we don't know yet", so say that plainly instead.
-    $('#headerSub').textContent = '';
     $('#main').innerHTML = `<div class="empty"><div class="big">📴</div>You're offline, and this device hasn't loaded any data yet. Connect to the same Wi-Fi as the PC (or check its internet), then try again.</div>`;
     return;
   }
-  $('#headerSub').textContent = `${d.total_tenants} tenants · ${d.total_units} units`;
+  _dashData = d;
+
+  const shownNames = (d.tenant_names || []).slice(0, 3);
+  const overflow = Math.max(0, d.total_tenants - shownNames.length);
+  const avatarsBody = `<div class="kpi-avatars">${
+    shownNames.map(n => `<div class="kpi-avatar" style="background:${avatarColorFor(n)}">${initialsOf(n)}</div>`).join('')
+  }${overflow > 0 ? `<div class="kpi-avatar" style="background:${KPI_BLUE}">+${overflow}</div>` : ''}</div>`;
+
+  const occFrac = d.total_units ? (d.occupied_units / d.total_units) : 0;
+  const unitsBody = `
+    <div class="kpi-progress"><div style="width:${Math.round(occFrac*100)}%;background:${KPI_BLUE}"></div></div>
+    <div class="kpi-occ-row"><span>${d.occupied_units} Occupied</span><span>${d.vacant_units} Vacant</span></div>`;
+
+  const gross = d.full_payment_total + d.deposit_total + d.cancelled_total;
+  const pct = amt => gross ? Math.round(amt / gross * 100) : 0;
+  const incomeBody = `<div class="kpi-breakdown">
+    <div class="kpi-breakdown-row"><span class="l">Full</span><span class="v">${pct(d.full_payment_total)}%</span></div>
+    <div class="kpi-breakdown-row"><span class="l">Deposits</span><span class="v">${pct(d.deposit_total)}%</span></div>
+    <div class="kpi-breakdown-row danger"><span class="l">Cancelled</span><span class="v">${pct(d.cancelled_total)}%</span></div>
+  </div>`;
+
+  const alertsBody = `<div class="kpi-pills">
+    <div class="kpi-pill" style="background:${kpiAlpha('#F59E0B',0.13)};color:var(--warn)">PENDING: ${d.counts.pending}</div>
+    <div class="kpi-pill" style="background:${kpiAlpha('#22C55E',0.13)};color:var(--good)">PAID: ${d.counts.paid}</div>
+  </div>`;
 
   $('#main').innerHTML = `
-    <div class="dgrid">
-      ${dcard({
-        accent: D_BLUE, icon:'🧑', title:'Total Tenants', value: d.total_tenants,
-        actionLabel:'View Tenants', actionTab:'tenants'
+    <div class="kpi-grid">
+      ${kpiCard({
+        accent: KPI_BLUE, iconAlpha: 0.10, icon:'🧑', label:'Total Tenants', value: d.total_tenants,
+        tab:'tenants', bodyHtml: avatarsBody
       })}
-      ${dcard({
-        accent: D_AMBER, icon:'🏢', title:'Total Units', value: d.total_units,
-        subs: [['Occupied', d.occupied_units, D_BLUE], ['Vacant', d.vacant_units, 'var(--muted)']],
-        actionLabel:'View Units', actionTab:'units'
+      ${kpiCard({
+        accent: KPI_AMBER, iconAlpha: 0.13, icon:'🏢', label:'Total Units', value: d.total_units,
+        tab:'units', bodyHtml: unitsBody
       })}
-      ${dcard({
-        accent: D_GREEN, icon:'💰', title:`Total Income — ${d.month_name}`,
-        value: fmt(d.month_income),
-        subs: [['Full', fmt(d.full_payment_total), 'var(--good)'],
-               ['Deposits', fmt(d.deposit_total), 'var(--teal-deep)'],
-               ['Cancelled', fmt(d.cancelled_total), 'var(--danger)']],
-        actionLabel:'View Records', actionTab:'history'
+      ${kpiCard({
+        accent: KPI_GREEN, iconAlpha: 0.13, icon:'💰', label:`Total Income — ${d.month_name}`,
+        value: fmt(d.month_income), tab:'history', bodyHtml: incomeBody
       })}
-      ${dcard({
-        accent: D_ORANGE, icon:'🔔', title:'Rent Alerts', value: d.counts.pending,
-        subs: [['Pending', d.counts.pending, 'var(--warn)'],
-               ['Paid in Full', d.counts.paid, 'var(--good)'],
-               ['Installments', d.counts.underpaid, 'var(--teal-deep)']],
-        actionLabel:'View Alerts', actionTab:'alerts'
+      ${kpiCard({
+        accent: KPI_ORANGE, iconAlpha: 0.13, icon:'⚠️', label:'Rent Alerts', value: d.counts.pending,
+        valueColor:'var(--danger)', tab:'alerts', bodyHtml: alertsBody
       })}
     </div>
+    <div id="rfCardWrap">${rfCardHtml(d)}</div>
+    ${raCardHtml(d)}
   `;
 }
 
