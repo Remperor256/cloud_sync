@@ -846,17 +846,39 @@ if CLOUD_MODE:
             conn.commit()
             return matched
 
-    def _cloud_pairing_ok(session_id, token):
+    def _cloud_pairing_ok(session_id, token, device_id=""):
         """Cloud-mode counterpart of the LAN model's _pairing_ok(): '/'
         may only bootstrap the app shell for (a) a browser that already
         paired successfully before -- a persistent cookie, so reopening
         an already-installed PWA doesn't demand a fresh scan every time
-        -- or (b) a request presenting the current, unconsumed token. A
-        plain forwarded link (sid+key with no valid token, from a
-        browser that never scanned) gets neither."""
+        -- (b) a request presenting the current, unconsumed token, or
+        (c) a request whose X-Device-Id already belongs to a known,
+        non-kicked device on this session's cloud_devices roster. (c)
+        is what the LAN model's _pairing_ok/_device_known already gave
+        it and this was missing: the session cookie alone is what a
+        browser silently drops (private/incognito tabs, iOS Safari
+        clearing session-only cookies when the app is fully closed, a
+        'cloud_paired_<sid>' cookie tied to a session_id that predates
+        a cloud_sync.json recovery, etc.) -- and without this
+        fallback, that cookie loss permanently strands an
+        already-paired phone on the waiting page (its own background
+        retry loop keeps hitting this same gate) until someone
+        physically rescans a fresh QR code. A plain forwarded link
+        (sid+key with no valid token and no recognized device) still
+        gets none of the three."""
         cookie_key = "cloud_paired_" + session_id
         if session.get(cookie_key):
             return True
+        if device_id:
+            with _cloud_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT kicked FROM cloud_devices WHERE session_id=%s AND device_id=%s",
+                    (session_id, device_id))
+                row = cur.fetchone()
+            if row and not row[0]:
+                session[cookie_key] = True
+                session.permanent = True
+                return True
         if _cloud_check_and_consume_pairing_token(session_id, token):
             session[cookie_key] = True
             session.permanent = True
@@ -1607,6 +1629,90 @@ def display_status_level(t, today):
         if due is not None and due < today:
             return "overdue", "Overdue"
     return level, label
+
+
+def dashboard_recent_activity(data, today=None, limit=10):
+    """Feed for the Home dashboard's Recent Activity card: a single
+    reverse-chronological timeline of real actions taken in the app --
+    payments and deposits received, cancelled transactions, tenants
+    moved out, and rent increases scheduled -- newest first, capped at
+    `limit`. Verbatim logic port of the desktop app's
+    dashboard_recent_activity (icon/color are left to the client here,
+    keyed off "tag"; everything else -- title, subtitle, time_label,
+    tag, and the ordering/fallback rules -- matches exactly)."""
+    today = today or date.today()
+    tenants = data.get("tenants", [])
+    events = []
+
+    for t in tenants:
+        name = t.get("name", "Unnamed Tenant")
+        unit = t.get("unit") or "—"
+
+        for hist_key, label in (("payment_history", "Full Payment"), ("deposit_history", "Deposit")):
+            for r in t.get(hist_key, []):
+                d = r.get("date", "")
+                if not d:
+                    continue
+                try:
+                    amt = f"UGX {int(float(r.get('amount', 0))):,}"
+                except (ValueError, TypeError):
+                    amt = ""
+                if r.get("_cancelled"):
+                    events.append({
+                        "_date": d, "title": f"{label} Cancelled",
+                        "subtitle": f"Unit {unit} · {name}" + (f" · {amt}" if amt else ""),
+                        "time_label": d, "tag": "CANCELLED",
+                    })
+                else:
+                    events.append({
+                        "_date": d, "title": f"{label} Received",
+                        "subtitle": f"Unit {unit} · {name}" + (f" · {amt}" if amt else ""),
+                        "time_label": d, "tag": "PAID",
+                    })
+
+        if t.get("archived") and t.get("vacated_date"):
+            events.append({
+                "_date": t["vacated_date"], "title": "Tenant Moved Out",
+                "subtitle": f"Unit {unit} · {name}",
+                "time_label": t["vacated_date"], "tag": "ARCHIVED",
+            })
+
+    for name, info in data.get("units", {}).items():
+        pending = info.get("pending_rent_increase") if isinstance(info, dict) else None
+        if pending:
+            eff = pending.get("effective_month") or pending.get("effective_date") or ""
+            try:
+                new_rent = f"UGX {int(float(pending.get('new_rent', 0))):,}"
+            except (ValueError, TypeError):
+                new_rent = ""
+            events.append({
+                "_date": eff or today.strftime("%Y-%m-%d"),
+                "title": "Rent Increase Scheduled",
+                "subtitle": f"Unit {name}" + (f" · {new_rent}" if new_rent else ""),
+                "time_label": f"Effective {eff}" if eff else "Scheduled",
+                "tag": "SCHEDULED",
+            })
+
+    events.sort(key=lambda e: e["_date"], reverse=True)
+
+    if not events:
+        overdue = []
+        for t in tenants:
+            if t.get("archived"):
+                continue
+            level, _ = display_status_level(t, today)
+            if level == "overdue":
+                overdue.append((t.get("due_date", ""), t))
+        overdue.sort(key=lambda pair: pair[0])
+        for due_str, t in overdue[:limit]:
+            events.append({
+                "_date": due_str, "title": "Rent Overdue",
+                "subtitle": f"Unit {t.get('unit') or '—'} · {t.get('name', 'Unnamed Tenant')}",
+                "time_label": f"Due {due_str}" if due_str else "Overdue",
+                "tag": "OVERDUE",
+            })
+
+    return events[:limit]
 
 
 def rent_increase_due(t):
@@ -2996,7 +3102,7 @@ def index():
         row = _cloud_get_row(session_id) if session_id else None
         if not session_id or not secret_key or not row or row["secret_key"] != secret_key:
             return Response("", status=404, mimetype="text/plain")
-        if not _cloud_pairing_ok(session_id, pt):
+        if not _cloud_pairing_ok(session_id, pt, request.headers.get("X-Device-Id", "")):
             return Response(WAITING_HTML, status=404, mimetype="text/html")
         bootstrap = (
             "<script>window.__CLOUD_DIRECT__=" + json.dumps({
@@ -3544,51 +3650,7 @@ def dashboard():
     else:
         revenue_growth = 0.0
 
-    # ── Recent activity feed, for the Home dashboard's Recent Alerts
-    # card: up to 3 overdue tenants (oldest due date first), then the
-    # most recent confirmed payments, newest first, filling the rest.
-    overdue = []
-    for t in tenants:
-        level, _ = status_level(t, today)
-        if level == "pending":
-            due = _parse_date(t.get("due_date", ""))
-            if due is not None and due < today:
-                overdue.append((t.get("due_date", ""), t))
-    overdue.sort(key=lambda pair: pair[0])
-
-    recent_activity = []
-    for due_str, t in overdue[:3]:
-        recent_activity.append({
-            "type": "overdue",
-            "title": "Rent Overdue",
-            "subtitle": f"Unit {t.get('unit') or '—'} · {t.get('name', 'Unnamed Tenant')}",
-            "time_label": f"Due {due_str}" if due_str else "Overdue",
-            "tag": "OVERDUE",
-        })
-
-    payments = []
-    for t in tenants:
-        for r in t.get("payment_history", []) + t.get("deposit_history", []):
-            if r.get("_cancelled") or not r.get("date"):
-                continue
-            payments.append((r["date"], t, r))
-    payments.sort(key=lambda p: p[0], reverse=True)
-
-    remaining = max(0, 5 - len(recent_activity))
-    for dt_str, t, r in payments[:remaining]:
-        try:
-            amt = f"UGX {int(float(r.get('amount', 0))):,}"
-        except (ValueError, TypeError):
-            amt = ""
-        recent_activity.append({
-            "type": "payment",
-            "title": "Payment Received",
-            "subtitle": f"Unit {t.get('unit') or '—'} · {t.get('name', 'Unnamed Tenant')}"
-                        + (f" · {amt}" if amt else ""),
-            "time_label": dt_str,
-            "tag": "PAID",
-        })
-    recent_activity = recent_activity[:5]
+    recent_activity = dashboard_recent_activity(data, today, limit=10)
 
     return jsonify({
         "app_name": APP_NAME,
@@ -4514,9 +4576,10 @@ INDEX_HTML = """<!DOCTYPE html>
   .rf-stat .lbl{font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--muted);}
   .rf-stat .val{font-size:18px;font-weight:800;color:var(--ink);margin-top:3px;}
 
-  /* ── Recent Alerts card — ported from the desktop app's
-     RecentAlertsCard: overdue tenants first, then the most recent
-     confirmed payments, each row icon+title+subtitle+tag / time. ──── */
+  /* ── Recent Activity card — ported from the desktop app's
+     RecentActivityCard: a reverse-chronological feed of real actions
+     (payments, cancellations, move-outs, rent increases), each row
+     icon+title+subtitle+tag / time. ──── */
   .ra-card{
     background:var(--card);border:1px solid var(--line);border-radius:16px;
     padding:16px 16px 4px;margin-top:14px;
@@ -4880,11 +4943,11 @@ INDEX_HTML = """<!DOCTYPE html>
 </div>
 
 <nav class="tabbar" id="tabbar" style="display:none;">
-  <div class="tab" data-tab="dashboard"><span class="ic">🏠</span>Home</div>
-  <div class="tab" data-tab="tenants"><span class="ic">👥</span>Tenants</div>
-  <div class="tab" data-tab="units"><span class="ic">🏢</span>Units</div>
-  <div class="tab" data-tab="alerts" style="position:relative;"><span class="ic">🔔</span>Alerts<span class="badge-dot" id="alertDot" style="display:none;"></span></div>
-  <div class="tab" data-tab="more"><span class="ic">⚙️</span>More</div>
+  <div class="tab" data-tab="dashboard"><span class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;vertical-align:middle;flex-shrink:0"><polyline points="3,3 11,3 11,11 3,11 3,3"/><polyline points="13,3 21,3 21,11 13,11 13,3"/><polyline points="3,13 11,13 11,21 3,21 3,13"/><polyline points="13,13 21,13 21,21 13,21 13,13"/></svg></span>Home</div>
+  <div class="tab" data-tab="tenants"><span class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;vertical-align:middle;flex-shrink:0"><polyline points="9,3.5 6.7,4.4 5.7,6.6 6.7,8.8 9,9.7 11.3,8.8 12.3,6.6 11.3,4.4 9,3.5"/><polyline points="2.5,19.5 3.2,15.5 6.3,13.3 11.7,13.3 14.8,15.5 15.5,19.5"/><polyline points="15,4.2 17,5.3 17.5,7.2 16.7,9 15,9.7"/><polyline points="16.5,13.6 19.3,15.3 20,19.5"/></svg></span>Tenants</div>
+  <div class="tab" data-tab="units"><span class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;vertical-align:middle;flex-shrink:0"><polyline points="4,21 4,3.5 14,3.5 14,21"/><polyline points="14,9 20,9 20,21"/><polyline points="7,7 7,7.3"/><polyline points="10.5,7 10.5,7.3"/><polyline points="7,11 7,11.3"/><polyline points="10.5,11 10.5,11.3"/><polyline points="7,15 7,15.3"/><polyline points="10.5,15 10.5,15.3"/><polyline points="7,21 7,17.5 10.5,17.5 10.5,21"/></svg></span>Units</div>
+  <div class="tab" data-tab="alerts" style="position:relative;"><span class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;vertical-align:middle;flex-shrink:0"><polyline points="12,2.7 12,4.2"/><polyline points="5,10.5 5,15 3,18.5 21,18.5 19,15 19,10.5 16.9,5.9 12,4.9 7.1,5.9 5,10.5"/><polyline points="9.3,18.5 9.3,20 10.6,21.3 13.4,21.3 14.7,20 14.7,18.5"/></svg></span>Alerts<span class="badge-dot" id="alertDot" style="display:none;"></span></div>
+  <div class="tab" data-tab="more"><span class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;vertical-align:middle;flex-shrink:0"><polyline points="12,8.3 9.9,9.1 8.7,11 8.9,13.2 10.5,14.7 12.7,15 14.6,13.8 15.3,11.7 14.5,9.6 12,8.3"/><polyline points="12,2.8 12,5.3"/><polyline points="12,18.7 12,21.2"/><polyline points="3.8,12 6.3,12"/><polyline points="17.7,12 20.2,12"/><polyline points="6.2,6.2 7.9,7.9"/><polyline points="16.1,16.1 17.8,17.8"/><polyline points="6.2,17.8 7.9,16.1"/><polyline points="16.1,7.9 17.8,6.2"/></svg></span>More</div>
 </nav>
 
 <div id="modalRoot"></div>
@@ -6003,8 +6066,54 @@ async function render() {
 const KPI_BLUE   = '#1A73E8';   // Total Tenants
 const KPI_AMBER  = '#F9A825';   // Total Units
 const KPI_GREEN  = '#2E7D32';   // Total Income
-const KPI_ORANGE = '#E65100';   // Rent Alerts
+const KPI_ORANGE = '#E65100';   // Payment Alerts
 const AVATAR_COLORS = ['#0F9E82','#3B82F6','#F97362','#8E7CF0','#F5A623','#34C795','#EF5A78','#0E8AA0'];
+
+// ── Icon set — same stroke-only Feather/Lucide-traced glyphs as the
+// desktop app's _outline_icon() (identical point coordinates, just
+// drawn as SVG <polyline>s here instead of QPainter paths), so every
+// icon that has a desktop-app counterpart looks the same on both.
+// Glyphs the desktop app itself renders as emoji (💰, and the Recent
+// Activity feed's ✅/❌/📦/📈/📅) are deliberately left as emoji here
+// too, to match — not everything the desktop app shows is an outline
+// icon there either.
+const ICON_POLYLINES = {
+  grid: [[[3,3],[11,3],[11,11],[3,11],[3,3]],[[13,3],[21,3],[21,11],[13,11],[13,3]],
+         [[3,13],[11,13],[11,21],[3,21],[3,13]],[[13,13],[21,13],[21,21],[13,21],[13,13]]],
+  people: [[[9,3.5],[6.7,4.4],[5.7,6.6],[6.7,8.8],[9,9.7],[11.3,8.8],[12.3,6.6],[11.3,4.4],[9,3.5]],
+           [[2.5,19.5],[3.2,15.5],[6.3,13.3],[11.7,13.3],[14.8,15.5],[15.5,19.5]],
+           [[15,4.2],[17,5.3],[17.5,7.2],[16.7,9],[15,9.7]],
+           [[16.5,13.6],[19.3,15.3],[20,19.5]]],
+  building: [[[4,21],[4,3.5],[14,3.5],[14,21]],[[14,9],[20,9],[20,21]],
+             [[7,7],[7,7.3]],[[10.5,7],[10.5,7.3]],[[7,11],[7,11.3]],[[10.5,11],[10.5,11.3]],
+             [[7,15],[7,15.3]],[[10.5,15],[10.5,15.3]],[[7,21],[7,17.5],[10.5,17.5],[10.5,21]]],
+  bell: [[[12,2.7],[12,4.2]],
+         [[5,10.5],[5,15],[3,18.5],[21,18.5],[19,15],[19,10.5],[16.9,5.9],[12,4.9],[7.1,5.9],[5,10.5]],
+         [[9.3,18.5],[9.3,20],[10.6,21.3],[13.4,21.3],[14.7,20],[14.7,18.5]]],
+  gear: [[[12,8.3],[9.9,9.1],[8.7,11],[8.9,13.2],[10.5,14.7],[12.7,15],[14.6,13.8],[15.3,11.7],[14.5,9.6],[12,8.3]],
+         [[12,2.8],[12,5.3]],[[12,18.7],[12,21.2]],[[3.8,12],[6.3,12]],[[17.7,12],[20.2,12]],
+         [[6.2,6.2],[7.9,7.9]],[[16.1,16.1],[17.8,17.8]],[[6.2,17.8],[7.9,16.1]],[[16.1,7.9],[17.8,6.2]]],
+  edit: [[[3,21],[4,19],[19,4],[21,6],[6,21],[3,21]],[[7.5,17.5],[11,21]]],
+  trash: [[[3,6],[21,6]],[[8,6],[8,4],[10,2],[14,2],[16,4],[16,6]],
+          [[19,6],[19,20],[17,22],[7,22],[5,20],[5,6]],[[10,11],[10,17]],[[14,11],[14,17]]],
+  clock: [[[12,21],[7,19.8],[3.5,16],[2.5,11],[4.5,6.3],[9,3.2],[14,3.5],[18.5,6.7],[20.5,11.5],[19,16.5],[15.5,19.8],[12,21]],
+          [[12,7.5],[12,12.5],[16,15]]],
+  calendar: [[[3,5.5],[21,5.5],[21,20.5],[3,20.5],[3,5.5]],[[3,9.5],[21,9.5]],[[7,3],[7,7.5]],[[17,3],[17,7.5]]],
+  alert: [[[12,2.5],[22.5,20.5],[1.5,20.5],[12,2.5]],[[12,9],[12,14]],[[12,17],[12,17.2]]],
+  phone: [[[5.5,3.5],[9,3.5],[10.5,8],[8,9.5],[9.5,12.5],[11.5,14.5],[14.5,16],[16,13.5],[20.5,15],[20.5,18.5],[19,20.5],[16,20.5],[8.5,17.5],[3.5,8.5],[5.5,3.5]]],
+  mail: [[[3,5],[21,5],[21,19],[3,19],[3,5]],[[3,5.5],[12,13],[21,5.5]]],
+  user: [[[12,3.5],[9.2,4.6],[8,7.3],[9.2,10],[12,11.1],[14.8,10],[16,7.3],[14.8,4.6],[12,3.5]],
+         [[4,21],[4.8,16.5],[8.5,14],[15.5,14],[19.2,16.5],[20,21]]],
+};
+function svgIcon(kind, size, color, strokeWidth) {
+  const polys = ICON_POLYLINES[kind];
+  if (!polys) return '';
+  size = size || 18; color = color || 'currentColor'; strokeWidth = strokeWidth || 1.8;
+  const parts = polys.map(p => `<polyline points="${p.map(xy => xy.join(',')).join(' ')}"/>`).join('');
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" `
+       + `stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round" `
+       + `style="display:block;vertical-align:middle;flex-shrink:0">${parts}</svg>`;
+}
 
 function kpiAlpha(hex, a) {
   const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
@@ -6114,29 +6223,38 @@ function setRevenueRange(months) {
   if (el && _dashData) el.innerHTML = rfCardHtml(_dashData);
 }
 
-// ── Recent Alerts card — ported from the desktop app's
-// RecentAlertsCard: overdue tenants first, then the most recent
-// confirmed payments, each as an icon+title+subtitle+tag row.
+// ── Recent Activity card — ported from the desktop app's
+// RecentActivityCard/dashboard_recent_activity: a single reverse-
+// chronological timeline of real actions (payments/deposits received,
+// cancellations, tenants moved out, rent increases scheduled), newest
+// first; overdue tenants only ever appear as a fallback, and only when
+// there's no real activity at all yet. Tag values and their colors/
+// icons mirror the desktop app's event dicts exactly (PAID/CANCELLED/
+// ARCHIVED/SCHEDULED/OVERDUE).
+const RA_TAG_STYLE = {
+  PAID:      { tint: '#22C55E', color: 'var(--good)',   icon: '✅' },
+  CANCELLED: { tint: '#EF4444', color: 'var(--danger)', icon: '❌' },
+  ARCHIVED:  { tint: '#9AA5B1', color: 'var(--muted)',  icon: '📦' },
+  SCHEDULED: { tint: '#F59E0B', color: 'var(--warn)',   icon: '📈' },
+  OVERDUE:   { tint: '#EF4444', color: 'var(--danger)', icon: '📅' },
+};
 function raCardHtml(d) {
   const items = d.recent_activity || [];
   const rows = items.length ? items.map(it => {
-    const isOverdue = it.type === 'overdue';
-    const tint = isOverdue ? '#EF4444' : '#22C55E';
-    const color = isOverdue ? 'var(--danger)' : 'var(--good)';
-    const icon = isOverdue ? '📅' : '✅';
+    const style = RA_TAG_STYLE[it.tag] || RA_TAG_STYLE.PAID;
     return `<div class="ra-row">
-      <div class="ra-icon" style="background:${kpiAlpha(tint,0.10)}">${icon}</div>
+      <div class="ra-icon" style="background:${kpiAlpha(style.tint,0.10)}">${style.icon}</div>
       <div class="ra-text">
         <div class="t">${escapeHtml(it.title)}</div>
         <div class="s">${escapeHtml(it.subtitle)}</div>
-        <span class="ra-tag" style="background:${kpiAlpha(tint,0.13)};color:${color}">${escapeHtml(it.tag)}</span>
+        <span class="ra-tag" style="background:${kpiAlpha(style.tint,0.13)};color:${style.color}">${escapeHtml(it.tag)}</span>
       </div>
       <div class="ra-time">${escapeHtml(it.time_label)}</div>
     </div>`;
   }).join('') : `<div class="ra-empty">No recent activity yet.</div>`;
   return `<div class="ra-card">
     <div class="ra-header">
-      <div class="ra-title">Recent Alerts</div>
+      <div class="ra-title">Recent Activity</div>
       <button class="ra-viewall" onclick="switchTab('alerts')">View All</button>
     </div>
     ${rows}
@@ -6185,11 +6303,11 @@ async function renderDashboard() {
   $('#main').innerHTML = `
     <div class="kpi-grid">
       ${kpiCard({
-        accent: KPI_BLUE, iconAlpha: 0.10, icon:'🧑', label:'Total Tenants', value: d.total_tenants,
+        accent: KPI_BLUE, iconAlpha: 0.10, icon: svgIcon('people'), label:'Total Tenants', value: d.total_tenants,
         tab:'tenants', bodyHtml: avatarsBody
       })}
       ${kpiCard({
-        accent: KPI_AMBER, iconAlpha: 0.13, icon:'🏢', label:'Total Units', value: d.total_units,
+        accent: KPI_AMBER, iconAlpha: 0.13, icon: svgIcon('building'), label:'Total Units', value: d.total_units,
         tab:'units', bodyHtml: unitsBody
       })}
       ${kpiCard({
@@ -6197,7 +6315,7 @@ async function renderDashboard() {
         value: fmt(d.month_income), tab:'history', bodyHtml: incomeBody
       })}
       ${kpiCard({
-        accent: KPI_ORANGE, iconAlpha: 0.13, icon:'⚠️', label:'Rent Alerts', value: d.counts.pending,
+        accent: KPI_ORANGE, iconAlpha: 0.13, icon: svgIcon('bell'), label:'Payment Alerts', value: d.counts.pending,
         valueColor:'var(--danger)', tab:'alerts', bodyHtml: alertsBody
       })}
     </div>
@@ -6218,7 +6336,7 @@ function tenantRowHtml(t) {
     (t.days_left<0 ? `Overdue ${Math.abs(t.days_left)}d` : `${t.days_left}d left`);
   const initials = (t.name||'?').split(' ').filter(Boolean).slice(0,2).map(w=>w[0]).join('').toUpperCase();
   const chip = (t._pending || t._pendingSync)
-    ? `<span class="chip chip-underpaid">🕓 Pending sync</span>`
+    ? `<span class="chip chip-underpaid">${svgIcon('clock',12)} Pending sync</span>`
     : (t.archived
         ? `<span class="chip" style="background:var(--card-2);color:var(--muted);">Moved out</span>`
         : `<span class="chip ${chipClass}">${t.label}</span>`);
@@ -6263,7 +6381,7 @@ async function renderTenants() {
   const filters = [['all','All'],['paid','Paid'],['underpaid','Instalments'],['pending','Pending'],['overdue','Overdue'],['archived','Archived']];
   const emptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
-    : `<div class="empty"><div class="big">👤</div>No tenants match.</div>`;
+    : `<div class="empty"><div class="big">${svgIcon('user',40)}</div>No tenants match.</div>`;
   const rows = d.tenants.map(tenantRowHtml).join('') || emptyMsg;
   $('#main').innerHTML = `
     <div class="searchbar"><span>🔎</span><input id="searchInput" placeholder="Search name or unit" value="${escapeHtml(state.q)}"></div>
@@ -6346,7 +6464,7 @@ async function renderTenantDetail(idx) {
     // there's nothing to safely edit/pay against until it syncs.
     $('#main').innerHTML = `
       <button class="btn btn-ghost" style="margin-bottom:12px;" onclick="state.tab='tenants'; render();">← Back</button>
-      <div class="pending-note">🕓 This tenant was added while offline and hasn't synced to the PC yet. It'll sync automatically once reconnected — editing and payments open up after that.</div>
+      <div class="pending-note">${svgIcon('clock',13)} This tenant was added while offline and hasn't synced to the PC yet. It'll sync automatically once reconnected — editing and payments open up after that.</div>
       <div class="card">
         <h2 style="margin-top:0;">${escapeHtml(t.name)}</h2>
         <div style="font-size:13.5px;color:var(--muted);">${escapeHtml(t.unit)} · ${fmt(t.rent)}/mo</div>
@@ -6357,7 +6475,7 @@ async function renderTenantDetail(idx) {
     return;
   }
   const pendingBanner = t._pendingSync
-    ? `<div class="pending-note">🕓 A change to this tenant is queued and will sync as soon as this PC is reachable again. Figures below are from the last sync.</div>`
+    ? `<div class="pending-note">${svgIcon('clock',13)} A change to this tenant is queued and will sync as soon as this PC is reachable again. Figures below are from the last sync.</div>`
     : '';
   const chipClass = chipClassFor(t.level);
 
@@ -6396,18 +6514,18 @@ async function renderTenantDetail(idx) {
       </div>
       <hr class="sep">
       <div style="font-size:13px;line-height:1.9;">
-        <div>📞 ${escapeHtml(t.phone||'—')}</div>
-        <div>✉️ ${escapeHtml(t.email||'—')}</div>
+        <div>${svgIcon('phone',13)} ${escapeHtml(t.phone||'—')}</div>
+        <div>${svgIcon('mail',13)} ${escapeHtml(t.email||'—')}</div>
         <div>💼 ${escapeHtml(t.occupation||'—')}</div>
         <div>🏁 Move-in: ${escapeHtml(t.entry_date||'—')}</div>
-        <div>📅 Due date: ${escapeHtml(t.due_date||'Not yet set')}</div>
+        <div>${svgIcon('calendar',13)} Due date: ${escapeHtml(t.due_date||'Not yet set')}</div>
       </div>
       <div class="row" style="margin-top:10px;">
-        <button class="btn btn-ghost" onclick="openEditTenant(${idx})">✎ Edit Tenant</button>
+        <button class="btn btn-ghost" onclick="openEditTenant(${idx})">${svgIcon('edit',13)} Edit Tenant</button>
         ${!t.archived ? `<button class="btn btn-ghost" onclick="moveOutTenant(${idx})">🏚 Move Out</button>` : ''}
       </div>
       <div class="row" style="margin-top:10px;">
-        <button class="btn btn-danger btn-full" onclick="deleteTenant(${idx})">🗑 Delete Tenant</button>
+        <button class="btn btn-danger btn-full" onclick="deleteTenant(${idx})">${svgIcon('trash',13)} Delete Tenant</button>
       </div>
       <div style="text-align:right;margin-top:10px;">
         <button onclick="openAddOldData(${idx})" style="background:none;border:none;color:var(--muted);font-size:12px;font-weight:600;font-family:var(--font-body);cursor:pointer;padding:0;">+ Add Old Data</button>
@@ -6916,13 +7034,13 @@ async function submitArrears(idx) {
 function unitRowHtml(u) {
   return `
     <div class="tenant-row" style="cursor:default;">
-      <div class="avatar">🏢</div>
+      <div class="avatar">${svgIcon('building',18,'currentColor')}</div>
       <div class="meta">
         <div class="name">${escapeHtml(u.name)} ${u.pending_rent_increase?`<span style="font-size:11px;color:var(--warn);font-weight:700;">↑ scheduled</span>`:''}</div>
         <div class="sub">${fmt(u.rent)}/mo · ${u.occupant ? 'Occupied: '+escapeHtml(u.occupant) : 'Vacant'}${u.location?' · '+escapeHtml(u.location):''}</div>
       </div>
       <div style="display:flex;gap:6px;">
-        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openEditUnit('${encodeURIComponent(u.name)}')">✎</button>
+        <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openEditUnit('${encodeURIComponent(u.name)}')">${svgIcon('edit',14)}</button>
         <button class="icon-btn" style="background:var(--teal-soft);color:var(--teal-deep);font-size:13px;width:32px;height:32px;" onclick="openIncreaseRent('${encodeURIComponent(u.name)}', ${u.rent})">↑</button>
       </div>
     </div>`;
@@ -6932,7 +7050,7 @@ async function renderUnits() {
   $('#headerSub').textContent = `${d.units.length} units`;
   const unitsEmptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
-    : `<div class="empty"><div class="big">🏢</div>No units yet.</div>`;
+    : `<div class="empty"><div class="big">${svgIcon('building',40)}</div>No units yet.</div>`;
   if (!d.units.length) {
     $('#main').innerHTML = `
       <button class="btn btn-primary btn-full" style="margin-bottom:14px;" onclick="openAddUnit()">＋ Add Unit</button>
@@ -7070,7 +7188,7 @@ function renderMoreMenu() {
         <span class="menu-chevron">›</span>
       </div>
       <div class="menu-row" onclick="switchTab('settings')">
-        <span class="menu-icon">⚙️</span>
+        <span class="menu-icon">${svgIcon('gear',18)}</span>
         <div class="menu-text">
           <div class="menu-title">Settings</div>
           <div class="menu-sub">App, security, reports &amp; data</div>
@@ -7141,7 +7259,7 @@ async function renderHistory() {
         <div style="display:flex;justify-content:space-between;align-items:flex-start;">
           <div>
             <div style="font-weight:700;font-size:15px;">${escapeHtml(t.name)}</div>
-            <div class="sub" style="color:var(--muted);font-size:12.5px;">🏠 ${escapeHtml(t.unit)}</div>
+            <div class="sub" style="color:var(--muted);font-size:12.5px;">${svgIcon('building',12)} ${escapeHtml(t.unit)}</div>
           </div>
           <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px;" onclick="openTenant(${t.index})">Profile</button>
         </div>
@@ -7196,7 +7314,7 @@ async function renderSettings() {
       <div class="sub" style="color:var(--muted);font-size:12.5px;margin-bottom:10px;">
         Permanently erases every tenant, unit, and transaction shared with the desktop app. A backup of the current data is kept automatically before wiping, and the PC's admin PIN is required.
       </div>
-      <button class="btn btn-danger btn-full" onclick="openResetData()">🗑 Reset All Data</button>
+      <button class="btn btn-danger btn-full" onclick="openResetData()">${svgIcon('trash',13)} Reset All Data</button>
     </div>
     <div class="section-title">About</div>
     <div class="card sub" style="color:var(--muted);font-size:12.5px;">
