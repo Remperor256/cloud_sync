@@ -422,6 +422,8 @@ TENANT_FIELD_DEFAULTS = {
     "locked_periods":      list,
     "deposit_cycle_start": 0,
     "rent_increase_due":   0.0,
+    "archived":            False,
+    "vacated_date":        "",
 }
 
 MONTH_PICKER_HORIZON = 24  # how many future open months to offer in the month picker
@@ -1435,6 +1437,24 @@ def load_state():
                     _bill_rent_increase_shortfall(t, old_tenant_rent, new_rent, eff)
                     t["rent"] = new_rent
 
+    # apply deferred unit-change rent, once its effective (due) date arrives
+    # -- mirrors the desktop app's apply_due_tenant_unit_changes: a tenant
+    # moved to a different unit while still paid ahead keeps billing at
+    # the old rate until that due date, then the new rate kicks in here.
+    for t in data["tenants"]:
+        pending = t.get("pending_unit_change")
+        if not pending:
+            continue
+        eff = _parse_date(str(pending.get("effective_date", "")))
+        if eff is None:
+            t.pop("pending_unit_change", None)
+            changed = True
+            continue
+        if eff <= today:
+            t["rent"] = parse_amount(pending.get("rent", t.get("rent", 0)))
+            t.pop("pending_unit_change", None)
+            changed = True
+
     # auto revert expired "Confirmed" tenants back to Pending
     for t in data["tenants"]:
         if t.get("status") != "Confirmed":
@@ -1574,6 +1594,21 @@ def status_level(t, today):
     return "pending", "Pending"
 
 
+def display_status_level(t, today):
+    """Display-only refinement of status_level: splits the 'pending'
+    bucket into 'pending' (never paid / not yet due) and 'overdue' (due
+    date has already passed), so the Tenants list can show a distinct
+    red "Overdue" chip and filter. Business logic (status_level,
+    arrears, cascades, dashboard counts, etc.) is untouched -- this only
+    decides how a tenant is *labelled* in the UI."""
+    level, label = status_level(t, today)
+    if level == "pending":
+        due = _parse_date(t.get("due_date", ""))
+        if due is not None and due < today:
+            return "overdue", "Overdue"
+    return level, label
+
+
 def rent_increase_due(t):
     try:
         return max(0.0, float(t.get("rent_increase_due", 0) or 0))
@@ -1595,6 +1630,107 @@ def _bill_rent_increase_shortfall(t, old_rent, new_rent, effective):
     shortfall = (new_rent - old_rent) * months_prepaid_past_effective
     if shortfall > 0:
         t["rent_increase_due"] = float(t.get("rent_increase_due", 0) or 0) + shortfall
+
+
+def apply_tenant_unit_change(record, old_unit, old_rent, due_str, new_unit, new_rent):
+    """Moves a tenant to `new_unit`, deciding whether the accompanying rent
+    change lands right away or is deferred. Verbatim logic port of the
+    desktop app's apply_tenant_unit_change: a first-ever assignment or a
+    move to a same-priced unit takes effect immediately; otherwise, if the
+    tenant is still paid ahead (due date in the future), the old rent
+    keeps billing until that due date and the new rate is stashed in
+    record['pending_unit_change'] for load_state() to pick up later."""
+    record["unit"] = new_unit
+    if not old_unit or new_rent == old_rent:
+        record["rent"] = new_rent
+        record.pop("pending_unit_change", None)
+        return
+    paid_ahead = False
+    due_d = _parse_date(due_str)
+    if due_d is not None:
+        paid_ahead = due_d > date.today()
+    if paid_ahead:
+        record["rent"] = old_rent
+        record["pending_unit_change"] = {"rent": new_rent, "effective_date": due_str}
+    else:
+        record["rent"] = new_rent
+        record.pop("pending_unit_change", None)
+
+
+def add_old_data_records(t, records, final_state=None):
+    """Backfills a tenant's pre-existing rental history in one go, for a
+    tenant who was already renting before this data was tracked here.
+    Verbatim logic port of the desktop app's add_old_data_records:
+    history entered here looks and behaves identically to a normal
+    recorded payment/deposit, minus the '_pre_state' snapshot a live
+    transaction gets. `final_state` optionally sets the tenant's current
+    status/due_date/pay_date/notes once every historical record is added.
+    Returns {"added": n}."""
+    added = 0
+    today_str = date.today().strftime("%Y-%m-%d")
+    for rec in records or []:
+        kind = "deposit_history" if rec.get("type") == "deposit" else "payment_history"
+        txn_date = (rec.get("date") or "").strip()
+        if _parse_date(txn_date) is None:
+            continue  # skip malformed rows rather than fail the whole batch
+        if txn_date >= today_str:
+            continue  # old data must predate today
+        from_date = (rec.get("from_date") or "").strip()
+        if from_date and _parse_date(from_date) is None:
+            from_date = ""
+        to_date = (rec.get("to_date") or "").strip()
+        if to_date and _parse_date(to_date) is None:
+            to_date = ""
+        if from_date:
+            # "To" always equals exactly one month after "From" -- recompute
+            # rather than trust whatever the client sent, so the two can
+            # never drift apart.
+            to_date = add_months(_parse_date(from_date), 1).strftime("%Y-%m-%d")
+        elif not from_date and to_date:
+            from_date = add_months(_parse_date(to_date), -1).strftime("%Y-%m-%d")
+        if from_date and from_date >= today_str:
+            continue
+        if to_date and to_date >= today_str:
+            continue
+        amount = parse_amount(rec.get("amount", 0))
+        note = (rec.get("note") or "").strip()
+        entry = {
+            "date": txn_date, "months": max(0, int(rec.get("months", 0) or 0)),
+            "amount": amount, "from_date": from_date, "to_date": to_date,
+            "txn_id": f"old-data-{secrets.token_hex(4)}",
+            "note": note or "Old data entered by admin.",
+            "_backfilled": True,
+        }
+        if bool(rec.get("cancelled")):
+            entry["_cancelled"] = True
+            entry["cancelled_on"] = (rec.get("cancelled_on") or "").strip() or txn_date
+        t.setdefault(kind, []).append(entry)
+        added += 1
+
+    # Keep each history array in chronological order so it displays and
+    # exports the same as if these had been entered one at a time as they
+    # actually happened, instead of clumped at the end in entry order.
+    for key in ("payment_history", "deposit_history"):
+        t[key] = sorted(t.get(key, []), key=lambda r: r.get("date", ""))
+
+    if final_state:
+        due_str = (final_state.get("due_date") or "").strip()
+        if due_str and _parse_date(due_str) is not None:
+            t["due_date"] = due_str
+        status = (final_state.get("status") or "").strip()
+        if status in ("Confirmed", "Pending"):
+            t["status"] = status
+        pay_date = (final_state.get("pay_date") or "").strip()
+        if pay_date and _parse_date(pay_date) is not None:
+            t["pay_date"] = pay_date
+        notes = final_state.get("notes")
+        if notes is not None:
+            existing = (t.get("notes") or "").strip()
+            addition = str(notes).strip()
+            if addition:
+                t["notes"] = (existing + "\n" + addition).strip() if existing else addition
+
+    return {"added": added}
 
 
 def record_arrears_payment(t, amount, method):
@@ -2810,9 +2946,9 @@ WAITING_HTML = """<!DOCTYPE html>
 <style>
   html,body{margin:0;padding:0;height:100%;background:radial-gradient(120% 100% at 50% 0%,#1C2124 0%,#14181A 55%,#0F1416 100%);color:#fff;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;}
   .wrap{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:32px;}
-  .mark{width:56px;height:56px;border-radius:16px;margin-bottom:18px;background:linear-gradient(155deg,#0F9E82,#0C7F69);
-        display:flex;align-items:center;justify-content:center;box-shadow:0 12px 28px -10px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.16);}
-  .mark svg{width:28px;height:28px;}
+  .mark{width:56px;height:56px;border-radius:16px;margin-bottom:18px;background:#fff;overflow:hidden;
+        display:flex;align-items:center;justify-content:center;box-shadow:0 12px 28px -10px rgba(0,0,0,.55);}
+  .mark img{width:100%;height:100%;display:block;object-fit:cover;}
   h1{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;font-weight:600;font-size:21px;margin:0 0 8px;letter-spacing:.2px;}
   p{font-size:13.5px;line-height:1.55;opacity:.68;max-width:280px;margin:0;}
   .spin{margin-top:26px;width:20px;height:20px;border-radius:50%;border:2.5px solid rgba(255,255,255,.18);
@@ -2821,7 +2957,7 @@ WAITING_HTML = """<!DOCTYPE html>
   @keyframes sp{to{transform:rotate(360deg);}}
 </style></head>
 <body><div class="wrap">
-  <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 11.5 12 4l8 7.5" stroke="#EAFBF7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="#EAFBF7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+  <div class="mark"><img src="icon-128.png?v=2" alt=""></div>
   <h1>Tenant Management</h1>
   <p>Waiting to connect. Scan the QR code shown in Connect Phone on the PC to open this device's tenant data.</p>
   <div class="spin"></div>
@@ -3324,6 +3460,7 @@ def remove_pin():
 def dashboard():
     data = load_state()
     tenants = _with_index(data["tenants"])
+    active_tenants = [t for t in tenants if not t.get("archived")]
     units = data["units"]
     today = date.today()
     month_name = today.strftime("%B")
@@ -3336,11 +3473,13 @@ def dashboard():
               if not r.get("_cancelled", False))
     )
     counts = {"paid": 0, "underpaid": 0, "pending": 0}
-    for t in tenants:
+    for t in active_tenants:
         level, _ = status_level(t, today)
         counts[level] += 1
 
-    occupied_units = {t.get("unit") for t in tenants if t.get("unit")}
+    # Archived (moved-out) tenants keep their history for records/exports
+    # but don't count toward "occupied", same as the desktop app.
+    occupied_units = {t.get("unit") for t in active_tenants if t.get("unit")}
     vacant = [u for u in units if u not in occupied_units]
     occupied = len(units) - len(vacant)
 
@@ -3366,7 +3505,7 @@ def dashboard():
     # First few tenant names, for the Home dashboard's avatar-stack card
     # (mirrors the desktop app's DashboardPage, which shows the first 3
     # active tenants as overlapping avatars plus a "+N" overflow bubble).
-    tenant_names = [t.get("name", "Unnamed") for t in tenants[:3]]
+    tenant_names = [t.get("name", "Unnamed") for t in active_tenants[:3]]
 
     # ── Revenue history (trailing 12 months) + a simple next-month
     # forecast, for the Home dashboard's Revenue Forecast card. Mirrors
@@ -3474,7 +3613,7 @@ def dashboard():
 
 
 def _tenant_summary(t, today):
-    level, label = status_level(t, today)
+    level, label = display_status_level(t, today)
     due = _parse_date(t.get("due_date", "")) or _parse_date(t.get("entry_date", ""))
     days_left = (due - today).days if due else None
     dep_paid, dep_remaining, dep_cleared, dep_in_progress = current_deposit_cycle(t)
@@ -3493,6 +3632,8 @@ def _tenant_summary(t, today):
         "deposit_paid": dep_paid,
         "deposit_remaining": dep_remaining,
         "rent_increase_due": rent_increase_due(t),
+        "archived": bool(t.get("archived")),
+        "vacated_date": t.get("vacated_date", ""),
     }
 
 
@@ -3513,10 +3654,19 @@ def list_tenants():
 
     out = []
     for t in tenants:
+        # Archived (moved-out) tenants only ever show under the
+        # "Archived" filter, never mixed into the active-tenant filters
+        # -- mirrors the desktop app's TenantsPage filtering.
+        is_archived = bool(t.get("archived"))
+        if flt == "archived":
+            if not is_archived:
+                continue
+        elif is_archived:
+            continue
         summary = _tenant_summary(t, today)
         if q and q not in summary["name"].lower() and q not in summary["unit"].lower():
             continue
-        if flt != "all" and summary["level"] != flt:
+        if flt not in ("all", "archived") and summary["level"] != flt:
             continue
         out.append(summary)
     out.sort(key=lambda s: (s["days_left"] if s["days_left"] is not None else 99999))
@@ -3619,7 +3769,7 @@ def history():
 @app.route("/api/units/vacant")
 def vacant_units():
     data = load_state()
-    occupied = {t.get("unit") for t in data["tenants"] if t.get("unit")}
+    occupied = {t.get("unit") for t in data["tenants"] if t.get("unit") and not t.get("archived")}
     exclude = request.args.get("exclude")
     if exclude:
         occupied.discard(exclude)
@@ -3673,14 +3823,17 @@ def add_tenant():
 
     data = load_state()
     for i, t in enumerate(data["tenants"]):
-        if t.get("unit") == unit:
+        if t.get("unit") == unit and not t.get("archived"):
             if not replace:
                 return jsonify({"ok": False, "error": "unit_taken",
                                  "message": f"Unit {unit} is already assigned to "
                                             f"{t.get('name', 'Unnamed Tenant')}."}), 409
-            data["tenants"][i] = record
-            save_state(data)
-            return jsonify({"ok": True, "index": i})
+            # Archive the outgoing tenant (their history is kept, just
+            # marked moved-out) instead of overwriting their record —
+            # mirrors the desktop app's open_add_dialog.
+            t["archived"] = True
+            t["vacated_date"] = date.today().strftime("%Y-%m-%d")
+            break
 
     data["tenants"].append(record)
     save_state(data)
@@ -3702,7 +3855,33 @@ def edit_tenant(idx):
         if key in body:
             val = str(body[key]).strip()
             t[key] = val.upper() if key == "name" else val
-    if "rent" in body:
+
+    # Unit reassignment — mirrors the desktop app's edit-tenant flow: a
+    # move to a different unit is allowed as long as that unit isn't
+    # already occupied by another active tenant, and the rent change
+    # is handled by apply_tenant_unit_change (immediate, or deferred to
+    # the tenant's due date if they're still paid ahead).
+    unit_changed = False
+    if "unit" in body:
+        new_unit = str(body["unit"]).strip()
+        if new_unit and new_unit != t.get("unit", ""):
+            for other_i, other in enumerate(tenants):
+                if other_i != idx and other.get("unit") == new_unit and not other.get("archived"):
+                    return jsonify({"ok": False, "error": "unit_taken",
+                                     "message": f"Unit {new_unit} is already assigned to "
+                                                f"{other.get('name', 'Unnamed Tenant')}."}), 409
+            old_unit = t.get("unit", "")
+            old_rent = parse_amount(t.get("rent", 0))
+            due_str = t.get("due_date", "")
+            if "rent" in body and str(body["rent"]).strip():
+                new_rent = parse_amount(body["rent"])
+            else:
+                unit_info = data["units"].get(new_unit)
+                new_rent = parse_amount(unit_info.get("rent", old_rent)) if isinstance(unit_info, dict) else old_rent
+            apply_tenant_unit_change(t, old_unit, old_rent, due_str, new_unit, new_rent)
+            unit_changed = True
+
+    if "rent" in body and not unit_changed:
         rent_str = str(body["rent"]).strip()
         if rent_str and not re.search(r"\d", rent_str):
             return jsonify({"ok": False, "error": "Enter a valid rent amount."}), 400
@@ -3722,6 +3901,46 @@ def delete_tenant(idx):
     del tenants[idx]
     save_state(data)
     return jsonify({"ok": True})
+
+
+@app.route("/api/tenants/<int:idx>/move-out", methods=["POST"])
+def move_out_tenant(idx):
+    """Marks a tenant as moved out: their unit becomes free and their
+    history is kept, just archived — a reversible-in-spirit alternative
+    to permanent Delete. Mirrors the desktop app's TenantsPage.move_out."""
+    data = load_state()
+    tenants = data["tenants"]
+    if idx < 0 or idx >= len(tenants):
+        return jsonify({"error": "not found"}), 404
+    t = tenants[idx]
+    if t.get("archived"):
+        return jsonify({"ok": False, "error": "This tenant is already marked as moved out."}), 400
+    t["archived"] = True
+    t["vacated_date"] = date.today().strftime("%Y-%m-%d")
+    save_state(data)
+    return jsonify({"ok": True, "vacated_date": t["vacated_date"]})
+
+
+@app.route("/api/tenants/<int:idx>/old-data", methods=["POST"])
+def old_data_tenant(idx):
+    """Backfills a tenant's pre-existing rental history (payments/
+    deposits from before this app was tracking them) in one batch, and
+    optionally sets their current status/due date/pay date/notes once
+    every historical record is in. Mirrors the desktop app's Add Old
+    Data dialog / add_old_data_records."""
+    data = load_state()
+    tenants = data["tenants"]
+    if idx < 0 or idx >= len(tenants):
+        return jsonify({"error": "not found"}), 404
+    t = tenants[idx]
+    body = request.get_json(force=True) or {}
+    records = body.get("records") or []
+    if not isinstance(records, list) or not records:
+        return jsonify({"ok": False, "error": "Add at least one record."}), 400
+    final_state = body.get("final_state") if isinstance(body.get("final_state"), dict) else None
+    result = add_old_data_records(t, records, final_state=final_state)
+    save_state(data)
+    return jsonify({"ok": True, "added": result["added"]})
 
 
 # ── payments / deposits ───────────────────────────────────────────────────
@@ -3837,7 +4056,7 @@ def do_clear_arrears(idx):
 @app.route("/api/units")
 def list_units():
     data = load_state()
-    occupants = {t.get("unit"): t.get("name") for t in data["tenants"]}
+    occupants = {t.get("unit"): t.get("name") for t in data["tenants"] if not t.get("archived")}
     out = []
     for name, info in data["units"].items():
         rent = parse_amount(info.get("rent", 0) if isinstance(info, dict) else info)
@@ -4117,6 +4336,7 @@ INDEX_HTML = """<!DOCTYPE html>
     --accent-units:#F9A825;
     --accent-income:#2E7D32;
     --accent-alerts:#E65100;
+    --link-blue:#3B82F6;
     color-scheme:light;
   }
 
@@ -4149,6 +4369,7 @@ INDEX_HTML = """<!DOCTYPE html>
     --accent-units:#FBBF24;
     --accent-income:#34D399;
     --accent-alerts:#F87171;
+    --link-blue:#60A5FA;
     color-scheme:dark;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
@@ -4181,11 +4402,11 @@ INDEX_HTML = """<!DOCTYPE html>
   header.top .brand{display:flex;align-items:center;gap:11px;min-width:0;}
   header.top .brand .mark{
     width:36px;height:36px;border-radius:11px;flex-shrink:0;
-    background:linear-gradient(155deg,var(--teal-bright),var(--teal-deep));
-    box-shadow:0 6px 16px -6px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.18);
-    display:flex;align-items:center;justify-content:center;font-weight:700;
+    background:#fff;overflow:hidden;
+    box-shadow:0 6px 16px -6px rgba(0,0,0,.5);
+    display:flex;align-items:center;justify-content:center;
   }
-  header.top .brand .mark svg{width:19px;height:19px;display:block;}
+  header.top .brand .mark img{width:100%;height:100%;display:block;object-fit:cover;}
   header.top h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.1px;}
   header.top .sub{font-size:11px;opacity:.7;margin-top:2px;font-family:var(--font-body);}
   .icon-btn{
@@ -4345,8 +4566,9 @@ INDEX_HTML = """<!DOCTYPE html>
     padding:5px 10px;border-radius:999px;
   }
   .chip-paid{background:var(--good-soft);color:var(--good);}
-  .chip-underpaid{background:var(--amber-soft);color:var(--warn);}
-  .chip-pending{background:var(--danger-soft);color:var(--danger);}
+  .chip-underpaid{background:rgba(59,130,246,.14);color:var(--link-blue);}
+  .chip-pending{background:var(--warn-soft);color:var(--warn);}
+  .chip-overdue{background:var(--danger-soft);color:var(--danger);}
   .tenant-row{
     display:flex;align-items:center;gap:12px;padding:12px 4px;border-bottom:1px solid var(--line);cursor:pointer;
     transition:background .12s ease;
@@ -4504,8 +4726,13 @@ INDEX_HTML = """<!DOCTYPE html>
   /* Static fallback for prefers-reduced-motion (see hideSplash()) -- a
      plain fade instead of the lunge/wipe below. */
   .splash-screen.hidden{opacity:0;pointer-events:none;transition:opacity .25s ease;}
-  .splash-house{width:60px;height:60px;animation:splash-grow 1.1s ease-in-out infinite;transform-origin:center;}
-  .splash-house svg{width:100%;height:100%;display:block;}
+  .splash-house{
+    width:64px;height:64px;border-radius:50%;background:#fff;overflow:hidden;
+    box-shadow:0 10px 24px -10px rgba(0,0,0,.35);
+    display:flex;align-items:center;justify-content:center;
+    animation:splash-grow 1.1s ease-in-out infinite;transform-origin:center;
+  }
+  .splash-house img{width:100%;height:100%;display:block;object-fit:cover;}
   @keyframes splash-grow{
     0%,100%{transform:scale(.72);opacity:.55;}
     50%{transform:scale(1.18);opacity:1;}
@@ -4609,10 +4836,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <div id="splashScreen" class="splash-screen">
   <div class="splash-house">
-    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M4 11.5 12 4l8 7.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
+    <img src="icon-128.png?v=2" alt="">
   </div>
   <div class="splash-label">Tenant Management</div>
 </div>
@@ -4642,7 +4866,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="app" id="app" style="display:none;">
   <header class="top">
     <div class="brand">
-      <div class="mark"><svg viewBox="0 0 24 24" fill="none"><path d="M4 11.5 12 4l8 7.5" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9.2c0 .44.36.8.8.8H10v-5.4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V20h3.2c.44 0 .8-.36.8-.8V10" stroke="#EAFBF7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="mark"><img src="icon-128.png?v=2" alt=""></div>
       <div>
         <h1 id="headerTitle">Tenant Management</h1>
         <div class="sub" id="headerSub">—</div>
@@ -5982,19 +6206,27 @@ async function renderDashboard() {
   `;
 }
 
+function chipClassFor(level) {
+  if (level === 'paid') return 'chip-paid';
+  if (level === 'underpaid') return 'chip-underpaid';
+  if (level === 'overdue') return 'chip-overdue';
+  return 'chip-pending';
+}
 function tenantRowHtml(t) {
-  const chipClass = t.level === 'paid' ? 'chip-paid' : (t.level==='underpaid'?'chip-underpaid':'chip-pending');
+  const chipClass = chipClassFor(t.level);
   const daysTxt = t.days_left===null||t.days_left===undefined ? '' :
     (t.days_left<0 ? `Overdue ${Math.abs(t.days_left)}d` : `${t.days_left}d left`);
   const initials = (t.name||'?').split(' ').filter(Boolean).slice(0,2).map(w=>w[0]).join('').toUpperCase();
   const chip = (t._pending || t._pendingSync)
     ? `<span class="chip chip-underpaid">🕓 Pending sync</span>`
-    : `<span class="chip ${chipClass}">${t.label}</span>`;
+    : (t.archived
+        ? `<span class="chip" style="background:var(--card-2);color:var(--muted);">Moved out</span>`
+        : `<span class="chip ${chipClass}">${t.label}</span>`);
   return `<div class="tenant-row" onclick="openTenant(${t.index})">
     <div class="avatar">${initials||'?'}</div>
     <div class="meta">
       <div class="name">${escapeHtml(t.name)}</div>
-      <div class="sub">${escapeHtml(t.unit)} · ${daysTxt}</div>
+      <div class="sub">${escapeHtml(t.unit)} · ${t.archived ? ('Moved out ' + (t.vacated_date||'')) : daysTxt}</div>
     </div>
     ${chip}
   </div>`;
@@ -6028,7 +6260,7 @@ async function renderTenants() {
   const params = new URLSearchParams({q: state.q, filter: state.filter});
   const d = await api('/api/tenants?' + params.toString());
   $('#headerSub').textContent = `${d.tenants.length} shown`;
-  const filters = [['all','All'],['paid','Paid'],['underpaid','Instalments'],['pending','Pending']];
+  const filters = [['all','All'],['paid','Paid'],['underpaid','Instalments'],['pending','Pending'],['overdue','Overdue'],['archived','Archived']];
   const emptyMsg = d.no_cache
     ? `<div class="empty"><div class="big">📴</div>You're offline and this hasn't loaded before, so there's nothing cached to show yet.</div>`
     : `<div class="empty"><div class="big">👤</div>No tenants match.</div>`;
@@ -6084,7 +6316,7 @@ async function submitAddTenant(replace=false) {
     const d = await api('/api/tenants', {method:'POST', body: JSON.stringify(body)});
     if (d.ok) { toast('Tenant saved.'); state.tab='tenants'; render(); return; }
     if (d.error === 'unit_taken') {
-      if (confirm(d.message + ' Replace with this new tenant?')) return await submitAddTenant(true);
+      if (confirm(d.message + ' The outgoing tenant will be archived (history kept) and this new tenant added. Continue?')) return await submitAddTenant(true);
       return;
     }
     $('#addErr').textContent = d.error || 'Could not save tenant.';
@@ -6127,7 +6359,7 @@ async function renderTenantDetail(idx) {
   const pendingBanner = t._pendingSync
     ? `<div class="pending-note">🕓 A change to this tenant is queued and will sync as soon as this PC is reachable again. Figures below are from the last sync.</div>`
     : '';
-  const chipClass = t.level === 'paid' ? 'chip-paid' : (t.level==='underpaid'?'chip-underpaid':'chip-pending');
+  const chipClass = chipClassFor(t.level);
 
   const depPct = t.rent>0 ? Math.min(100, Math.round((t.deposit_paid/t.rent)*100)) : 0;
   const depBlock = (t.level==='underpaid') ? `
@@ -6157,7 +6389,10 @@ async function renderTenantDetail(idx) {
           <h2 style="margin:0 0 2px;">${escapeHtml(t.name)}</h2>
           <div class="sub" style="color:var(--muted);font-size:13px;">${escapeHtml(t.unit)} · ${fmt(t.rent)}/mo</div>
         </div>
-        <span class="chip ${chipClass}">${t.label}</span>
+        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
+          <span class="chip ${chipClass}">${t.label}</span>
+          ${t.archived ? `<span class="chip" style="background:var(--card-2);color:var(--muted);">Moved out ${escapeHtml(t.vacated_date||'')}</span>` : ''}
+        </div>
       </div>
       <hr class="sep">
       <div style="font-size:13px;line-height:1.9;">
@@ -6169,7 +6404,13 @@ async function renderTenantDetail(idx) {
       </div>
       <div class="row" style="margin-top:10px;">
         <button class="btn btn-ghost" onclick="openEditTenant(${idx})">✎ Edit Tenant</button>
-        <button class="btn btn-danger" onclick="deleteTenant(${idx})">🗑 Delete Tenant</button>
+        ${!t.archived ? `<button class="btn btn-ghost" onclick="moveOutTenant(${idx})">🏚 Move Out</button>` : ''}
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn btn-danger btn-full" onclick="deleteTenant(${idx})">🗑 Delete Tenant</button>
+      </div>
+      <div style="text-align:right;margin-top:10px;">
+        <button onclick="openAddOldData(${idx})" style="background:none;border:none;color:var(--muted);font-size:12px;font-weight:600;font-family:var(--font-body);cursor:pointer;padding:0;">+ Add Old Data</button>
       </div>
     </div>
 
@@ -6233,11 +6474,23 @@ async function cancelTxn(idx, key, recIdx) {
 }
 
 function openEditTenant(idx) {
-  api('/api/tenants/'+idx).then(d => {
+  api('/api/tenants/'+idx).then(async d => {
     const t = d.tenant;
+    // Vacant units + this tenant's own current unit (so "keep the same
+    // unit" is always a valid option) -- mirrors the desktop app's edit
+    // dialog, which lets a tenant be reassigned to a different unit.
+    const u = await api('/api/units/vacant?exclude=' + encodeURIComponent(t.unit));
+    const unitOpts = u.units.map(x =>
+      `<option value="${escapeHtml(x.name)}" data-rent="${x.rent}" ${x.name===t.unit?'selected':''}>${escapeHtml(x.name)} — ${fmt(x.rent)}/mo</option>`
+    ).join('');
+    const archivedNote = t.archived
+      ? `<div class="pending-note">🏚 This tenant moved out on ${escapeHtml(t.vacated_date||'—')}. They're archived, so they won't show in active tenant lists — editing still works.</div>`
+      : '';
     openModal(`
       <h2>Edit Tenant</h2>
+      ${archivedNote}
       <label class="field">Full Name</label><input id="e_name" value="${escapeHtml(t.name)}">
+      <label class="field">Unit</label><select id="e_unit">${unitOpts}</select>
       <div class="row"><div><label class="field">Phone</label><input id="e_phone" value="${escapeHtml(t.phone)}"></div>
       <div><label class="field">Email</label><input id="e_email" value="${escapeHtml(t.email)}"></div></div>
       <label class="field">Occupation</label><input id="e_occupation" value="${escapeHtml(t.occupation)}">
@@ -6246,11 +6499,15 @@ function openEditTenant(idx) {
       <div class="row"><div><label class="field">Move-in Date</label><input id="e_entry_date" type="date" value="${t.entry_date}"></div>
       <div><label class="field">Due Date</label><input id="e_due_date" type="date" value="${t.due_date}"></div></div>
       <label class="field">Rent (UGX)</label><input id="e_rent" value="${t.rent}">
+      <div class="sub" style="font-size:11px;color:var(--muted);margin-top:2px;">Changing units auto-fills that unit's rent. If the tenant is still paid ahead, the old rent keeps billing until their due date, then the new rate kicks in.</div>
       <label class="field">Notes</label><textarea id="e_notes" rows="2">${escapeHtml(t.notes)}</textarea>
       <div class="err" id="editErr"></div>
       <button class="btn btn-primary btn-full" style="margin-top:12px;" onclick="submitEditTenant(${idx})">Save Changes</button>
-      <button class="btn btn-danger btn-full" style="margin-top:10px;" onclick="deleteTenant(${idx})">Delete Tenant</button>
     `);
+    $('#e_unit').addEventListener('change', e => {
+      const opt = e.target.selectedOptions[0];
+      if (opt && opt.dataset.rent) $('#e_rent').value = opt.dataset.rent;
+    });
   });
 }
 async function submitEditTenant(idx) {
@@ -6258,14 +6515,106 @@ async function submitEditTenant(idx) {
   if (!_beginAction(_k)) return;
   try {
     const body = {
-      name: $('#e_name').value, phone: $('#e_phone').value, email: $('#e_email').value,
+      name: $('#e_name').value, unit: $('#e_unit').value, phone: $('#e_phone').value, email: $('#e_email').value,
       occupation: $('#e_occupation').value, emergency_contact: $('#e_emergency_contact').value,
       emergency_phone: $('#e_emergency_phone').value, entry_date: $('#e_entry_date').value,
       due_date: $('#e_due_date').value, rent: $('#e_rent').value, notes: $('#e_notes').value,
     };
     const d = await api('/api/tenants/'+idx, {method:'PUT', body: JSON.stringify(body)});
     if (d.ok) { closeModal(); toast('Tenant updated.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
-    else $('#editErr').textContent = d.error || 'Could not save.';
+    else $('#editErr').textContent = d.message || d.error || 'Could not save.';
+  } finally {
+    _endAction(_k);
+  }
+}
+async function moveOutTenant(idx) {
+  const _k = `moveOutTenant:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    if (!confirm('Mark this tenant as moved out? Their unit becomes free and their history is kept, just archived.')) return;
+    const d = await api('/api/tenants/'+idx+'/move-out', {method:'POST'});
+    if (d.ok) { toast('Marked as moved out.'); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
+    else toast(d.error || 'Could not update.');
+  } finally {
+    _endAction(_k);
+  }
+}
+
+// ── ADD OLD DATA (backfill pre-existing history) ────────────────────
+// Ported from the desktop app's Add Old Data dialog: batch in one or
+// more historical payment/deposit records for a tenant who was already
+// renting before this data was tracked here, then optionally set their
+// current status/due date once every row is in.
+let _oldDataRows = [];
+function openAddOldData(idx) {
+  _oldDataRows = [];
+  openModal(`
+    <h2>Add Old Data</h2>
+    <div class="sub" style="font-size:12px;color:var(--muted);margin-top:-8px;margin-bottom:10px;">Backfill this tenant's pre-existing rental history — payments or instalments from before this app was tracking them. Every date must be in the past.</div>
+    <div class="row"><div><label class="field">Type</label>
+      <select id="od_type"><option value="payment">Full Payment</option><option value="deposit">Instalment / Deposit</option></select></div>
+      <div><label class="field">Amount (UGX)</label><input id="od_amount" inputmode="numeric"></div>
+    </div>
+    <div class="row"><div><label class="field">Date Paid</label><input id="od_date" type="date"></div>
+      <div><label class="field">Covers From</label><input id="od_from" type="date"></div>
+    </div>
+    <div class="row"><div><label class="field">Months Covered</label><input id="od_months" inputmode="numeric" value="1"></div>
+      <div><label class="field">Note</label><input id="od_note" placeholder="Optional"></div>
+    </div>
+    <button class="btn btn-ghost btn-full" style="margin-top:6px;" onclick="addOldDataRow()">＋ Add This Record</button>
+    <div id="od_rows" style="margin-top:12px;"></div>
+    <hr class="sep">
+    <div class="sub" style="font-size:11px;color:var(--muted);margin-bottom:6px;">Optional — set once every record above is in:</div>
+    <div class="row"><div><label class="field">Current Status</label>
+      <select id="od_status"><option value="">Leave as-is</option><option value="Confirmed">Confirmed</option><option value="Pending">Pending</option></select></div>
+      <div><label class="field">Current Due Date</label><input id="od_due_date" type="date"></div>
+    </div>
+    <div class="err" id="oldDataErr"></div>
+    <button class="btn btn-primary btn-full" style="margin-top:12px;" onclick="submitOldData(${idx})">Save All Records</button>
+  `);
+  renderOldDataRows();
+}
+function addOldDataRow() {
+  const type = $('#od_type').value;
+  const amount = $('#od_amount').value;
+  const date = $('#od_date').value;
+  const from = $('#od_from').value;
+  const months = $('#od_months').value;
+  const note = $('#od_note').value;
+  if (!date) { toast('Enter the date paid.'); return; }
+  if (!amount) { toast('Enter an amount.'); return; }
+  _oldDataRows.push({type, amount, date, from_date: from, months, note});
+  $('#od_amount').value = ''; $('#od_date').value = ''; $('#od_from').value = ''; $('#od_note').value = '';
+  renderOldDataRows();
+}
+function removeOldDataRow(i) { _oldDataRows.splice(i,1); renderOldDataRows(); }
+function renderOldDataRows() {
+  const el = $('#od_rows');
+  if (!el) return;
+  if (!_oldDataRows.length) { el.innerHTML = `<div class="sub" style="font-size:12px;color:var(--muted);">No records added yet.</div>`; return; }
+  el.innerHTML = _oldDataRows.map((r,i) => `
+    <div class="txn-item">
+      <div>
+        <div style="font-size:13px;">${r.type==='deposit'?'Instalment':'Full Payment'}</div>
+        <div class="sub" style="font-size:11.5px;color:var(--muted);">${escapeHtml(r.date)}${r.months?` · ${r.months} mo`:''}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="amt">${fmt(r.amount)}</span>
+        <button class="icon-btn" style="width:30px;height:30px;background:var(--card-2);color:var(--danger);font-size:13px;" onclick="removeOldDataRow(${i})">✕</button>
+      </div>
+    </div>`).join('');
+}
+async function submitOldData(idx) {
+  const _k = `submitOldData:${idx}`;
+  if (!_beginAction(_k)) return;
+  try {
+    if (!_oldDataRows.length) { $('#oldDataErr').textContent = 'Add at least one record first.'; return; }
+    const final_state = {};
+    if ($('#od_status').value) final_state.status = $('#od_status').value;
+    if ($('#od_due_date').value) final_state.due_date = $('#od_due_date').value;
+    const d = await api(`/api/tenants/${idx}/old-data`, {method:'POST', body: JSON.stringify({records: _oldDataRows, final_state})});
+    if (d.ok) { closeModal(); toast(`Added ${d.added} old record(s).`); state.selectedIdx=idx; state.tab='tenant-detail'; render(); }
+    else $('#oldDataErr').textContent = d.error || 'Could not save.';
   } finally {
     _endAction(_k);
   }
