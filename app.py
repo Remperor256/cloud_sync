@@ -2811,6 +2811,21 @@ def _pairing_ok(device_id=""):
     """True if this request may load the app shell -- see the module
     comment above. Consumes the active token on a successful match so it
     can never work a second time for anyone else it gets forwarded to."""
+    if (request.remote_addr in ("127.0.0.1", "::1")
+            or (request.remote_addr or "").startswith("::ffff:127.")):
+        # The desktop app's own machine, talking to its own server --
+        # e.g. the browser tab main() auto-opens via webbrowser.open() at
+        # startup (see __main__ below), or a developer running `python
+        # app.py` directly. Pairing exists to gate a *phone* connecting
+        # in over the LAN/QR; it was never meant to apply to the PC
+        # opening its own web app in its own browser, which has no QR
+        # to scan and no token to receive. Without this, that first-run
+        # local tab landed in the exact same "Waiting to connect... scan
+        # the QR code" holding page (with its own spinner icon) that a
+        # not-yet-paired phone gets -- indistinguishable from the app
+        # being stuck on a splash/loading screen forever, since nothing
+        # ever arrives to satisfy the gate for a plain local page load.
+        return True
     if session.get("paired"):
         return True
     if device_id and _device_known(device_id):
