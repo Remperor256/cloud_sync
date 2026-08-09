@@ -23,7 +23,6 @@ import copy
 import json
 import time
 import shutil
-import string
 import hashlib
 import secrets
 import calendar
@@ -1234,38 +1233,6 @@ def calculate_one_month_ahead(date_string):
 
 def hash_secret(secret):
     return hashlib.sha256(secret.encode()).hexdigest()
-
-
-# ── offline PIN/password recovery (ported from rental_manager_qt's
-# hash_answer / generate_recovery_code / normalize_recovery_code +
-# SECURITY_QUESTIONS) -- lets someone locked out reset the PIN via a
-# security question and/or a one-time recovery code, no email involved. ──
-def hash_answer(answer):
-    """Security-question answers are hashed case/whitespace-insensitively
-    so 'Blue', 'blue', and ' blue ' all match."""
-    return hashlib.sha256((answer or "").strip().lower().encode()).hexdigest()
-
-
-def generate_recovery_code():
-    """Generate a human-friendly recovery code like 'AB3D-7KQX-9PMC'.
-    Excludes visually ambiguous characters (0/O, 1/I/L)."""
-    alphabet = "".join(c for c in (string.ascii_uppercase + string.digits) if c not in "0O1IL")
-    groups = ["".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)]
-    return "-".join(groups)
-
-
-def normalize_recovery_code(code):
-    return (code or "").strip().upper().replace(" ", "")
-
-
-SECURITY_QUESTIONS = [
-    "What was the name of your first pet?",
-    "What city were you born in?",
-    "What is your mother's maiden name?",
-    "What was the name of your first school?",
-    "What is the name of your favorite teacher?",
-    "What was your childhood nickname?",
-]
 
 
 def _parse_date(s):
@@ -3185,13 +3152,6 @@ def _guard():
                              "max_devices": MAX_DEVICES}), 403
         if request.path == "/api/unlock":
             return None
-        if request.path == "/api/recovery/reset" or (
-                request.path == "/api/settings/recovery" and request.method == "GET"):
-            # Both must be reachable from the lock screen itself, before
-            # the device has unlocked -- that's the whole point of "Forgot
-            # PIN?". Setting up recovery (POST while logged in) still goes
-            # through the normal PIN gate below.
-            return None
         data = load_state()
         if _pin_required(data) and not _authed():
             return jsonify({"error": "locked"}), 401
@@ -3788,91 +3748,6 @@ def remove_pin():
     settings.pop("pin_hash", None)
     settings.pop("lock_mode", None)
     save_state(data)
-    return jsonify({"ok": True})
-
-
-# ── offline PIN recovery ("Forgot PIN?") ───────────────────────────────────
-# Ported from rental_manager_qt's SetupRecoveryDialog/PinRecoveryDialog:
-# two independent, optional recovery paths (a security question, and/or a
-# one-time recovery code) that can reset the lock PIN without any email.
-@app.route("/api/settings/recovery", methods=["GET"])
-def get_recovery_settings():
-    data = load_state()
-    settings = data.get("settings", {})
-    return jsonify({
-        "questions": SECURITY_QUESTIONS,
-        "security_question": settings.get("security_question", ""),
-        "has_question": bool(settings.get("security_answer_hash")),
-        "has_code": bool(settings.get("recovery_code_hash")),
-    })
-
-
-@app.route("/api/settings/recovery", methods=["POST"])
-def set_recovery_settings():
-    """Set/update the security question+answer and/or mint a new recovery
-    code. Both are optional and independent -- an empty `answer` leaves an
-    already-set answer untouched; `generate_code: true` mints (and
-    replaces) the recovery code, returned in plaintext ONCE."""
-    body = request.get_json(force=True) or {}
-    question = (body.get("question") or "").strip()
-    answer = (body.get("answer") or "").strip()
-    generate_code = bool(body.get("generate_code"))
-
-    data = load_state()
-    settings = data.setdefault("settings", {})
-
-    if answer:
-        if question not in SECURITY_QUESTIONS:
-            return jsonify({"ok": False, "error": "Unrecognized security question."}), 400
-        settings["security_question"] = question
-        settings["security_answer_hash"] = hash_answer(answer)
-    elif question and question in SECURITY_QUESTIONS:
-        settings["security_question"] = question
-
-    plain_code = None
-    if generate_code:
-        plain_code = generate_recovery_code()
-        settings["recovery_code_hash"] = hash_secret(plain_code)
-
-    save_state(data)
-    resp = {"ok": True}
-    if plain_code:
-        resp["recovery_code"] = plain_code
-    return jsonify(resp)
-
-
-@app.route("/api/recovery/reset", methods=["POST"])
-def recovery_reset():
-    """Resets the lock PIN using either recovery method. Verification and
-    reset happen atomically in one call (no separate 'verified' session
-    state to hold in between)."""
-    body = request.get_json(force=True) or {}
-    method = (body.get("method") or "").strip()
-    new_pin = (body.get("new_pin") or "").strip()
-
-    data = load_state()
-    settings = data.setdefault("settings", {})
-
-    if method == "question":
-        answer = body.get("answer") or ""
-        stored_hash = settings.get("security_answer_hash", "")
-        if not stored_hash or hash_answer(answer) != stored_hash:
-            return jsonify({"ok": False, "error": "That doesn't match."}), 400
-    elif method == "code":
-        code = normalize_recovery_code(body.get("code") or "")
-        stored_hash = settings.get("recovery_code_hash", "")
-        if not stored_hash or hash_secret(code) != stored_hash:
-            return jsonify({"ok": False, "error": "Incorrect recovery code."}), 400
-    else:
-        return jsonify({"ok": False, "error": "Choose a recovery method."}), 400
-
-    if not new_pin or not new_pin.isdigit() or len(new_pin) < 4:
-        return jsonify({"ok": False, "error": "PIN must be at least 4 digits."}), 400
-
-    settings["pin_hash"] = hash_secret(new_pin)
-    settings["lock_mode"] = "pin"
-    save_state(data)
-    session["unlocked"] = True
     return jsonify({"ok": True})
 
 
@@ -5156,20 +5031,6 @@ INDEX_HTML = """<!DOCTYPE html>
     font-size:19px;font-weight:600;cursor:pointer;transition:transform .1s ease,background .15s ease;font-family:var(--font-body);
   }
   .keypad button:active{background:rgba(255,255,255,.22);transform:scale(.94);}
-  .recovery-screen{
-    position:fixed;inset:0;background:radial-gradient(120% 100% at 50% 0%,#1B2225 0%,#14181A 55%,#0F1416 100%);
-    z-index:1050;display:flex;flex-direction:column;align-items:center;justify-content:center;
-    color:#fff;padding:28px;text-align:center;
-  }
-  .recovery-screen h1{margin:0 0 6px;font-size:19px;font-family:var(--font-display);}
-  .recovery-screen p.sub{margin:0 0 20px;font-size:13px;opacity:.72;max-width:320px;line-height:1.5;}
-  .recovery-screen .rc-body{width:100%;max-width:320px;}
-  .recovery-screen input{
-    width:100%;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16);color:#fff;
-    border-radius:10px;padding:12px 14px;font-size:15px;text-align:center;font-family:var(--font-body);margin-bottom:8px;
-  }
-  .recovery-screen .rc-err{color:#FFB4C0;font-size:12.5px;min-height:16px;margin-bottom:6px;}
-  .recovery-screen .btn{width:100%;margin-top:6px;}
   .disc-screen{
     position:fixed;inset:0;background:radial-gradient(120% 100% at 50% 0%,#1B2225 0%,#14181A 55%,#0F1416 100%);
     z-index:1100;display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -5238,10 +5099,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="pin-dots" id="pinDots"></div>
   <div class="err" id="lockErr" style="color:#FFB4C0;min-height:16px;"></div>
   <div class="keypad" id="keypad"></div>
-  <a href="javascript:void(0)" id="forgotPinLink" onclick="openPinRecovery()" style="margin-top:18px;color:rgba(255,255,255,.6);font-size:12.5px;font-weight:600;text-decoration:underline;">Forgot PIN?</a>
 </div>
-
-<div id="recoveryScreen" class="recovery-screen" style="display:none;"></div>
 
 <div id="discscreen" class="disc-screen" style="display:none;">
   <div class="icon" id="discIcon">🔌</div>
@@ -6227,140 +6085,6 @@ function hideLock() {
 }
 function lockNow() {
   fetchTimeout('/api/lock', {method:'POST'}, 3000).catch(()=>{}).then(()=>showLock());
-}
-
-// ── "Forgot PIN?" offline recovery ─────────────────────────────────────
-// Ported from rental_manager_qt's PinRecoveryDialog: two independent,
-// optional recovery paths -- a security question and/or a one-time
-// recovery code -- either of which is enough to reset the shared lock
-// PIN. Both are set up from the desktop app's Settings screen; this is
-// just the "consume it to get back in" side, reachable straight from the
-// lock screen since that's the whole point of a forgot-PIN flow. Renders
-// into its own #recoveryScreen (kept above the lock screen's z-index)
-// rather than the normal modal, since the modal stack sits below it.
-let _rc = { question: '', hasQuestion: false, hasCode: false };
-
-function _rcShow(html) {
-  const el = $('#recoveryScreen');
-  el.innerHTML = html;
-  el.style.display = 'flex';
-}
-function closePinRecovery() {
-  $('#recoveryScreen').style.display = 'none';
-  $('#recoveryScreen').innerHTML = '';
-}
-async function openPinRecovery() {
-  _rcShow(`<div class="rc-body"><h1>Checking recovery options…</h1></div>`);
-  try {
-    const res = await fetchTimeout('/api/settings/recovery', {}, 4000);
-    const d = await res.json();
-    _rc.question = d.security_question || '';
-    _rc.hasQuestion = !!d.has_question;
-    _rc.hasCode = !!d.has_code;
-  } catch (e) {
-    _rc.hasQuestion = false; _rc.hasCode = false;
-  }
-  _rcRenderChoice();
-}
-function _rcRenderChoice() {
-  let body = '';
-  if (_rc.hasQuestion) {
-    body += `<button class="btn btn-primary" onclick="_rcRenderQuestion()">❓ Answer Security Question</button>`;
-  }
-  if (_rc.hasCode) {
-    body += `<button class="btn ${_rc.hasQuestion ? 'btn-ghost' : 'btn-primary'}" onclick="_rcRenderCode()">🔑 Enter Recovery Code</button>`;
-  }
-  if (!_rc.hasQuestion && !_rc.hasCode) {
-    body = `<p class="sub">No recovery method was set up for this lock, so it can't be reset from here. Set a security question or recovery code from the desktop app's Settings screen first, or reset the PIN there directly.</p>`;
-  }
-  _rcShow(`
-    <div class="rc-body">
-      <h1>Reset Your PIN</h1>
-      <p class="sub">Choose how you'd like to verify it's you.</p>
-      ${body}
-      <button class="btn btn-ghost" onclick="closePinRecovery()">Cancel</button>
-    </div>
-  `);
-}
-function _rcRenderQuestion() {
-  _rcShow(`
-    <div class="rc-body">
-      <h1>Security Question</h1>
-      <p class="sub">${escapeHtml(_rc.question)}</p>
-      <input id="rcAnswer" placeholder="Your answer" autocomplete="off">
-      <div class="rc-err" id="rcQErr"></div>
-      <button class="btn btn-primary" onclick="_rcVerifyQuestion()">Verify Answer</button>
-      <button class="btn btn-ghost" onclick="_rcRenderChoice()">← Back</button>
-    </div>
-  `);
-  $('#rcAnswer').focus();
-}
-function _rcVerifyQuestion() {
-  const answer = $('#rcAnswer').value;
-  if (!answer.trim()) { $('#rcQErr').textContent = 'Enter an answer.'; return; }
-  _rcRenderNewPin({method: 'question', answer});
-}
-let _rcPendingCred = null;
-function _rcRenderCode() {
-  _rcShow(`
-    <div class="rc-body">
-      <h1>Enter Recovery Code</h1>
-      <p class="sub">Enter the recovery code shown when the PIN was first set.</p>
-      <input id="rcCode" placeholder="AB3D-7KQX-9PMC" autocomplete="off" style="text-transform:uppercase;letter-spacing:1px;">
-      <div class="rc-err" id="rcCErr"></div>
-      <button class="btn btn-primary" onclick="_rcVerifyCode()">Verify Code</button>
-      <button class="btn btn-ghost" onclick="_rcRenderChoice()">← Back</button>
-    </div>
-  `);
-  $('#rcCode').focus();
-}
-function _rcVerifyCode() {
-  const code = $('#rcCode').value;
-  if (!code.trim()) { $('#rcCErr').textContent = 'Enter a code.'; return; }
-  _rcRenderNewPin({method: 'code', code});
-}
-// Both recovery paths land here -- the security-question answer / code
-// isn't actually checked until the final "Reset PIN" submit below, so
-// this step just collects the new PIN; verification and reset happen
-// together in one atomic call to /api/recovery/reset.
-function _rcRenderNewPin(cred) {
-  _rcPendingCred = cred;
-  _rcShow(`
-    <div class="rc-body">
-      <h1>Set a New PIN</h1>
-      <p class="sub">4–8 digits.</p>
-      <input id="rcPin1" type="password" inputmode="numeric" placeholder="New PIN" autocomplete="off">
-      <input id="rcPin2" type="password" inputmode="numeric" placeholder="Confirm PIN" autocomplete="off">
-      <div class="rc-err" id="rcNErr"></div>
-      <button class="btn btn-primary" onclick="_rcSubmitReset()">Reset PIN</button>
-      <button class="btn btn-ghost" onclick="_rcRenderChoice()">← Back</button>
-    </div>
-  `);
-  $('#rcPin1').focus();
-}
-async function _rcSubmitReset() {
-  const cred = _rcPendingCred || {};
-  const p1 = $('#rcPin1').value.trim();
-  const p2 = $('#rcPin2').value.trim();
-  if (!/^\d{4,8}$/.test(p1)) { $('#rcNErr').textContent = 'PIN must be 4–8 digits.'; return; }
-  if (p1 !== p2) { $('#rcNErr').textContent = 'PINs do not match.'; return; }
-  try {
-    const res = await fetchTimeout('/api/recovery/reset', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({...cred, new_pin: p1}),
-    }, 5000);
-    const d = await res.json();
-    if (d.ok) {
-      closePinRecovery();
-      pinBuffer = ''; setOnline(true); hideLock(); boot();
-      toast('PIN reset. You\'re in.');
-    } else {
-      $('#rcNErr').textContent = d.error || "That didn't match — go back and try again.";
-    }
-  } catch (e) {
-    $('#rcNErr').textContent = "Can't reach the PC right now — try again once it's back online.";
-  }
 }
 
 // ── modal helper ─────────────────────────────────────────────────────
