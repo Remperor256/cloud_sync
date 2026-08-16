@@ -42,7 +42,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                  Table, TableStyle, HRFlowable)
 
-from flask import Flask, request, jsonify, session, send_file, Response, g
+from flask import Flask, request, jsonify, session, send_file, send_from_directory, Response, g
 import base64
 
 # Created here (rather than further down) because some decorators/routes
@@ -751,6 +751,52 @@ if CLOUD_MODE:
                     secret_key  TEXT NOT NULL
                 )
             """)
+            # Marketplace: public listings a landlord (= one cloud_sessions
+            # row) publishes for a vacant unit. Deliberately separate from
+            # the private cloud_sessions.data JSON blob above -- tenants
+            # browsing the marketplace need to filter/search across every
+            # landlord at once, which a per-household JSON snapshot can't
+            # do. landlord_id references cloud_sessions directly (no
+            # separate landlord/account table) since session_id already
+            # uniquely identifies a paired install.
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS marketplace_listings (
+                    listing_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    landlord_id     TEXT NOT NULL REFERENCES cloud_sessions(session_id) ON DELETE CASCADE,
+                    unit_name       TEXT NOT NULL,
+                    title           TEXT NOT NULL,
+                    description     TEXT,
+                    monthly_rent    NUMERIC(12,2) NOT NULL,
+                    currency        TEXT NOT NULL DEFAULT 'UGX',
+                    bedrooms        SMALLINT,
+                    bathrooms       SMALLINT,
+                    property_type   TEXT,
+                    location_text   TEXT NOT NULL,
+                    latitude        DOUBLE PRECISION,
+                    longitude       DOUBLE PRECISION,
+                    contact_phone     TEXT NOT NULL,
+                    contact_whatsapp  TEXT,
+                    status          TEXT NOT NULL DEFAULT 'vacant'
+                                        CHECK (status IN ('vacant','pending','occupied','delisted')),
+                    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (landlord_id, unit_name)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS marketplace_listing_photos (
+                    photo_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    listing_id   UUID NOT NULL REFERENCES marketplace_listings(listing_id) ON DELETE CASCADE,
+                    url          TEXT NOT NULL,
+                    sort_order   SMALLINT NOT NULL DEFAULT 0,
+                    is_cover     BOOLEAN NOT NULL DEFAULT false
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mkt_listings_status ON marketplace_listings(status) WHERE status = 'vacant'")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mkt_listings_landlord ON marketplace_listings(landlord_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mkt_listings_rent ON marketplace_listings(monthly_rent)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mkt_photos_listing ON marketplace_listing_photos(listing_id)")
             conn.commit()
 
     _cloud_ensure_schema()
@@ -1119,6 +1165,13 @@ def _cloud_gate():
         return None
 
     if not path.startswith("/api/"):
+        return None
+
+    if path.startswith("/api/marketplace/listings") and request.method == "GET":
+        # Public tenant-facing browse/detail -- no household to scope to,
+        # so these are the only /api/ routes that skip the session check
+        # entirely. Publishing/editing a listing still goes through the
+        # normal authenticated path below (landlord_id = g.session_id).
         return None
 
     session_id = request.headers.get("X-Session-Id", "")
@@ -4402,6 +4455,270 @@ def increase_rent(name):
     save_state(data)   # load_state (called next time) applies it immediately if due
     data = load_state()  # re-run migrations now so an immediate increase takes effect right away
     return jsonify({"ok": True})
+
+
+# ── marketplace ──────────────────────────────────────────────────────────
+# Landlord-side (authenticated via the same X-Session-Id/X-Secret-Key the
+# gate above already validates -- g.session_id is this landlord's id) and
+# tenant-side (public, no auth -- see the gate exemption above) routes for
+# the vacant-unit marketplace. Lives in its own relational tables
+# (marketplace_listings / marketplace_listing_photos), separate from the
+# private cloud_sessions JSON snapshot everything else here reads/writes.
+
+MARKETPLACE_PHOTO_DIR = os.environ.get("MARKETPLACE_PHOTO_DIR", "marketplace_photos")
+if CLOUD_MODE:
+    os.makedirs(MARKETPLACE_PHOTO_DIR, exist_ok=True)
+
+
+def _marketplace_require_cloud():
+    if not CLOUD_MODE:
+        return jsonify({"ok": False, "error": "Marketplace requires CLOUD_MODE."}), 503
+    return None
+
+
+@app.route("/api/marketplace/listings", methods=["POST"])
+def publish_listing():
+    """Create or update the calling landlord's listing for one unit.
+    Keyed by (landlord_id, unit_name) -- publishing the same unit twice
+    updates the existing row rather than duplicating it."""
+    unavailable = _marketplace_require_cloud()
+    if unavailable:
+        return unavailable
+
+    body = request.get_json(force=True) or {}
+    required = ["unit_name", "title", "monthly_rent", "location_text", "contact_phone"]
+    missing = [f for f in required if not body.get(f)]
+    if missing:
+        return jsonify({"ok": False, "error": f"missing fields: {', '.join(missing)}"}), 400
+
+    fields = {
+        "landlord_id": g.session_id,
+        "unit_name": body["unit_name"],
+        "title": body["title"],
+        "description": body.get("description", ""),
+        "monthly_rent": body["monthly_rent"],
+        "currency": body.get("currency", "UGX"),
+        "bedrooms": body.get("bedrooms"),
+        "bathrooms": body.get("bathrooms"),
+        "property_type": body.get("property_type"),
+        "location_text": body["location_text"],
+        "latitude": body.get("latitude"),
+        "longitude": body.get("longitude"),
+        "contact_phone": body["contact_phone"],
+        "contact_whatsapp": body.get("contact_whatsapp"),
+        "status": body.get("status", "vacant"),
+    }
+
+    with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            INSERT INTO marketplace_listings (
+                landlord_id, unit_name, title, description, monthly_rent, currency,
+                bedrooms, bathrooms, property_type, location_text, latitude, longitude,
+                contact_phone, contact_whatsapp, status
+            ) VALUES (
+                %(landlord_id)s, %(unit_name)s, %(title)s, %(description)s, %(monthly_rent)s, %(currency)s,
+                %(bedrooms)s, %(bathrooms)s, %(property_type)s, %(location_text)s, %(latitude)s, %(longitude)s,
+                %(contact_phone)s, %(contact_whatsapp)s, %(status)s
+            )
+            ON CONFLICT (landlord_id, unit_name) DO UPDATE SET
+                title = EXCLUDED.title, description = EXCLUDED.description,
+                monthly_rent = EXCLUDED.monthly_rent, currency = EXCLUDED.currency,
+                bedrooms = EXCLUDED.bedrooms, bathrooms = EXCLUDED.bathrooms,
+                property_type = EXCLUDED.property_type, location_text = EXCLUDED.location_text,
+                latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude,
+                contact_phone = EXCLUDED.contact_phone, contact_whatsapp = EXCLUDED.contact_whatsapp,
+                status = EXCLUDED.status, updated_at = now()
+            RETURNING *
+        """, fields)
+        listing = cur.fetchone()
+        conn.commit()
+
+    return jsonify(dict(listing, listing_id=str(listing["listing_id"]))), 201
+
+
+@app.route("/api/marketplace/listings/<listing_id>/status", methods=["PUT"])
+def set_listing_status(listing_id):
+    unavailable = _marketplace_require_cloud()
+    if unavailable:
+        return unavailable
+
+    status = (request.get_json(force=True) or {}).get("status")
+    if status not in ("vacant", "pending", "occupied", "delisted"):
+        return jsonify({"ok": False, "error": "invalid status"}), 400
+
+    with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            UPDATE marketplace_listings SET status = %s, updated_at = now()
+            WHERE listing_id = %s AND landlord_id = %s
+            RETURNING *
+        """, (status, listing_id, g.session_id))
+        listing = cur.fetchone()
+        conn.commit()
+
+    if not listing:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify(dict(listing, listing_id=str(listing["listing_id"])))
+
+
+@app.route("/api/marketplace/listings/<listing_id>", methods=["DELETE"])
+def delete_listing(listing_id):
+    unavailable = _marketplace_require_cloud()
+    if unavailable:
+        return unavailable
+
+    with _cloud_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM marketplace_listings WHERE listing_id = %s AND landlord_id = %s RETURNING listing_id",
+            (listing_id, g.session_id),
+        )
+        deleted = cur.fetchone()
+        conn.commit()
+
+    if not deleted:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/marketplace/listings/<listing_id>/photos", methods=["POST"])
+def upload_listing_photo(listing_id):
+    """Body: {"filename": "front.jpg", "data_base64": "...", "is_cover": true}
+    Stores to local disk under MARKETPLACE_PHOTO_DIR and serves it back via
+    /media/<filename> -- swap _save_marketplace_photo() for an S3/
+    Cloudinary upload when ready; nothing else here changes."""
+    unavailable = _marketplace_require_cloud()
+    if unavailable:
+        return unavailable
+
+    body = request.get_json(force=True) or {}
+    filename = body.get("filename", "photo.jpg")
+    data_b64 = body.get("data_base64")
+    if not data_b64:
+        return jsonify({"ok": False, "error": "data_base64 required"}), 400
+
+    with _cloud_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM marketplace_listings WHERE listing_id = %s AND landlord_id = %s",
+            (listing_id, g.session_id))
+        if not cur.fetchone():
+            return jsonify({"ok": False, "error": "listing not found"}), 404
+
+    url = _save_marketplace_photo(listing_id, filename, data_b64)
+
+    with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            INSERT INTO marketplace_listing_photos (listing_id, url, is_cover)
+            VALUES (%s, %s, %s) RETURNING *
+        """, (listing_id, url, bool(body.get("is_cover", False))))
+        photo = cur.fetchone()
+        conn.commit()
+
+    return jsonify(dict(photo, photo_id=str(photo["photo_id"]))), 201
+
+
+def _save_marketplace_photo(listing_id: str, filename: str, data_b64: str) -> str:
+    ext = os.path.splitext(filename)[1] or ".jpg"
+    stored_name = f"{listing_id}_{secrets.token_hex(8)}{ext}"
+    path = os.path.join(MARKETPLACE_PHOTO_DIR, stored_name)
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(data_b64))
+    return f"/media/{stored_name}"
+
+
+@app.route("/media/<path:filename>")
+def serve_marketplace_photo(filename):
+    if not CLOUD_MODE:
+        return Response("", status=404)
+    return send_from_directory(MARKETPLACE_PHOTO_DIR, filename)
+
+
+@app.route("/api/marketplace/listings", methods=["GET"])
+def browse_listings():
+    """Public tenant-facing feed -- no auth, filters across every
+    landlord's vacant units. Query params: location, min_rent, max_rent,
+    bedrooms, property_type, page, page_size."""
+    unavailable = _marketplace_require_cloud()
+    if unavailable:
+        return unavailable
+
+    location      = request.args.get("location", "").strip()
+    min_rent      = request.args.get("min_rent", type=float)
+    max_rent      = request.args.get("max_rent", type=float)
+    bedrooms      = request.args.get("bedrooms", type=int)
+    property_type = request.args.get("property_type", "").strip()
+    page          = max(request.args.get("page", 1, type=int), 1)
+    page_size     = min(request.args.get("page_size", 20, type=int), 50)
+    offset        = (page - 1) * page_size
+
+    where = ["status = 'vacant'"]
+    params = []
+    if location:
+        where.append("location_text ILIKE %s")
+        params.append(f"%{location}%")
+    if min_rent is not None:
+        where.append("monthly_rent >= %s")
+        params.append(min_rent)
+    if max_rent is not None:
+        where.append("monthly_rent <= %s")
+        params.append(max_rent)
+    if bedrooms is not None:
+        where.append("bedrooms = %s")
+        params.append(bedrooms)
+    if property_type:
+        where.append("property_type = %s")
+        params.append(property_type)
+    where_sql = " AND ".join(where)
+
+    query = f"""
+        SELECT
+            l.listing_id, l.title, l.description, l.monthly_rent, l.currency,
+            l.bedrooms, l.bathrooms, l.property_type,
+            l.location_text, l.latitude, l.longitude,
+            l.contact_phone, l.contact_whatsapp,
+            (SELECT url FROM marketplace_listing_photos p
+               WHERE p.listing_id = l.listing_id
+               ORDER BY p.is_cover DESC, p.sort_order ASC LIMIT 1) AS cover_photo
+        FROM marketplace_listings l
+        WHERE {where_sql}
+        ORDER BY l.created_at DESC
+        LIMIT %s OFFSET %s
+    """
+    params.extend([page_size, offset])
+
+    with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = [dict(r, listing_id=str(r["listing_id"])) for r in cur.fetchall()]
+
+    return jsonify({"page": page, "page_size": page_size, "results": rows})
+
+
+@app.route("/api/marketplace/listings/<listing_id>", methods=["GET"])
+def listing_detail(listing_id):
+    unavailable = _marketplace_require_cloud()
+    if unavailable:
+        return unavailable
+
+    with _cloud_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM marketplace_listings WHERE listing_id = %s", (listing_id,))
+        listing = cur.fetchone()
+        if not listing:
+            return jsonify({"ok": False, "error": "not found"}), 404
+        listing = dict(listing, listing_id=str(listing["listing_id"]))
+
+        cur.execute("""
+            SELECT photo_id, url, is_cover FROM marketplace_listing_photos
+            WHERE listing_id = %s ORDER BY sort_order
+        """, (listing_id,))
+        listing["photos"] = [dict(p, photo_id=str(p["photo_id"])) for p in cur.fetchall()]
+
+    return jsonify(listing)
+
+
+@app.route("/marketplace")
+def marketplace_page():
+    """The tenant-facing feed -- a separate public page from the landlord
+    companion's own "/" (which is gated to a paired household). No
+    session/pairing required to load this."""
+    return Response(TENANT_FEED_HTML, mimetype="text/html")
 
 
 # ── alerts ───────────────────────────────────────────────────────────────
@@ -7744,6 +8061,181 @@ async function init() {
   updateSyncBadge();
 }
 init();
+</script>
+</body>
+</html>
+"""
+
+
+# Tenant-facing marketplace feed -- separate, public, unauthenticated page
+# (mobile-first, matching the landlord companion's visual style above).
+# Browses /api/marketplace/listings across every landlord; contacts a
+# landlord directly via tel:/wa.me links, no messaging system involved.
+TENANT_FEED_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Find a Home — Marketplace</title>
+<style>
+  :root {
+    --bg: #F5F6F5; --card: #FFFFFF; --border: #E4E7E4; --text: #1F2A22;
+    --muted: #6B776E; --accent: #1E7A46; --accent-dark: #175C35;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { background: var(--card); border-bottom: 1px solid var(--border);
+           padding: 14px 16px; position: sticky; top: 0; z-index: 5; }
+  header h1 { margin: 0 0 10px; font-size: 17px; }
+  #filter-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+  #filter-bar input, #filter-bar select {
+    flex: 1 1 120px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 9px;
+    font-size: 13px; background: #FAFAF9; color: var(--text);
+  }
+  #f-apply { flex: 0 0 auto; background: var(--accent); color: #fff; border: none;
+             border-radius: 9px; padding: 10px 18px; font-size: 13px; font-weight: 700; }
+  #listing-feed { padding: 14px; display: grid; gap: 14px; max-width: 720px; margin: 0 auto; }
+  .listing-card { background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+                  overflow: hidden; cursor: pointer; }
+  .cover-photo { width: 100%; height: 180px; object-fit: cover; background: #E9ECE9; display: block; }
+  .card-body { padding: 12px 14px; }
+  .card-body h3 { margin: 0 0 4px; font-size: 15px; }
+  .rent { color: var(--accent); font-weight: 800; margin: 2px 0; font-size: 14px; }
+  .location { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+  .contact-row { display: flex; gap: 8px; }
+  .contact-row a { flex: 1; text-align: center; padding: 9px 0; border-radius: 8px;
+                   font-size: 12px; font-weight: 700; text-decoration: none; }
+  .btn-call { background: #EFF3EF; color: var(--text); border: 1px solid var(--border); }
+  .btn-whatsapp { background: var(--accent); color: #fff; }
+  #empty-state { text-align: center; color: var(--muted); padding: 40px 16px; font-size: 13px; }
+
+  #detail-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: none;
+                     align-items: flex-end; z-index: 10; }
+  #detail-sheet { background: var(--card); width: 100%; max-height: 88vh; overflow-y: auto;
+                  border-radius: 18px 18px 0 0; padding: 0 0 20px; }
+  #detail-sheet .gallery { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; }
+  #detail-sheet .gallery img { width: 100%; flex: 0 0 100%; scroll-snap-align: start;
+                               height: 220px; object-fit: cover; }
+  #detail-sheet .body { padding: 16px; }
+  #detail-close { position: sticky; top: 8px; margin-left: 8px; background: rgba(0,0,0,0.5);
+                  color: #fff; border: none; border-radius: 50%; width: 30px; height: 30px;
+                  font-size: 16px; float: right; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Find a Home</h1>
+  <div id="filter-bar">
+    <input id="f-location" placeholder="Search by area…" />
+    <input id="f-min-rent" type="number" placeholder="Min rent" />
+    <input id="f-max-rent" type="number" placeholder="Max rent" />
+    <select id="f-bedrooms">
+      <option value="">Any beds</option>
+      <option value="1">1 bed</option>
+      <option value="2">2 beds</option>
+      <option value="3">3+ beds</option>
+    </select>
+    <button id="f-apply">Search</button>
+  </div>
+</header>
+
+<div id="listing-feed"></div>
+<div id="empty-state" style="display:none;">No listings match your search yet.</div>
+
+<div id="detail-overlay">
+  <div id="detail-sheet">
+    <button id="detail-close">✕</button>
+    <div class="gallery" id="detail-gallery"></div>
+    <div class="body" id="detail-body"></div>
+  </div>
+</div>
+
+<script>
+async function loadListings(params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  const res = await fetch(`/api/marketplace/listings?${qs}`);
+  const data = await res.json();
+  renderFeed(data.results || []);
+}
+
+function money(l) { return `${l.currency} ${Number(l.monthly_rent).toLocaleString()}`; }
+
+function waLink(l) {
+  if (!l.contact_whatsapp) return null;
+  const digits = l.contact_whatsapp.replace(/\\D/g, "");
+  const text = encodeURIComponent("Hi, I'm interested in " + l.title);
+  return `https://wa.me/${digits}?text=${text}`;
+}
+
+function renderFeed(listings) {
+  const feed = document.getElementById("listing-feed");
+  const empty = document.getElementById("empty-state");
+  feed.innerHTML = listings.map(cardHTML).join("");
+  empty.style.display = listings.length ? "none" : "block";
+  feed.querySelectorAll(".listing-card").forEach(card => {
+    card.addEventListener("click", () => openListing(card.dataset.id));
+  });
+}
+
+function cardHTML(l) {
+  const wa = waLink(l);
+  return `
+    <div class="listing-card" data-id="${l.listing_id}">
+      <img class="cover-photo" src="${l.cover_photo || ''}" onerror="this.style.display='none'" />
+      <div class="card-body">
+        <h3>${l.title}</h3>
+        <p class="rent">${money(l)} / month</p>
+        <p class="location">${l.location_text}</p>
+        <div class="contact-row" onclick="event.stopPropagation()">
+          <a href="tel:${l.contact_phone}" class="btn-call">Call</a>
+          ${wa ? `<a href="${wa}" class="btn-whatsapp" target="_blank">WhatsApp</a>` : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+async function openListing(id) {
+  const res = await fetch(`/api/marketplace/listings/${id}`);
+  if (!res.ok) return;
+  const l = await res.json();
+
+  document.getElementById("detail-gallery").innerHTML =
+    (l.photos && l.photos.length ? l.photos : [{url: ""}])
+      .map(p => `<img src="${p.url}" onerror="this.style.display='none'" />`).join("");
+
+  const wa = waLink(l);
+  document.getElementById("detail-body").innerHTML = `
+    <h2 style="margin:4px 0 2px;">${l.title}</h2>
+    <p class="rent" style="font-size:16px;">${money(l)} / month</p>
+    <p class="location">${l.location_text}${l.bedrooms ? ` · ${l.bedrooms} bed` : ""}${l.bathrooms ? ` · ${l.bathrooms} bath` : ""}</p>
+    <p style="color:var(--text); font-size:13px; line-height:1.5;">${(l.description || "").replace(/\\n/g, "<br>")}</p>
+    <div class="contact-row" style="margin-top:14px;">
+      <a href="tel:${l.contact_phone}" class="btn-call">Call</a>
+      ${wa ? `<a href="${wa}" class="btn-whatsapp" target="_blank">WhatsApp</a>` : ""}
+    </div>
+  `;
+  document.getElementById("detail-overlay").style.display = "flex";
+}
+
+document.getElementById("detail-close").addEventListener("click", () => {
+  document.getElementById("detail-overlay").style.display = "none";
+});
+document.getElementById("detail-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "detail-overlay") e.target.style.display = "none";
+});
+
+document.getElementById("f-apply").addEventListener("click", () => {
+  loadListings({
+    location: document.getElementById("f-location").value,
+    min_rent: document.getElementById("f-min-rent").value,
+    max_rent: document.getElementById("f-max-rent").value,
+    bedrooms: document.getElementById("f-bedrooms").value,
+  });
+});
+
+loadListings();
 </script>
 </body>
 </html>
